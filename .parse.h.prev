@@ -1,0 +1,619 @@
+/* A Bison parser, made by GNU Bison 3.8.2.  */
+
+/* Bison interface for Yacc-like parsers in C
+
+   Copyright (C) 1984, 1989-1990, 2000-2015, 2018-2021 Free Software Foundation,
+   Inc.
+
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <https://www.gnu.org/licenses/>.  */
+
+/* As a special exception, you may create a larger work that contains
+   part or all of the Bison parser skeleton and distribute that work
+   under terms of your choice, so long as that work isn't itself a
+   parser generator using the skeleton or a modified version thereof
+   as a parser skeleton.  Alternatively, if you modify or redistribute
+   the parser skeleton itself, you may (at your option) remove this
+   special exception, which will cause the skeleton and the resulting
+   Bison output files to be licensed under the GNU General Public
+   License without this special exception.
+
+   This special exception was added by the Free Software Foundation in
+   version 2.2 of Bison.  */
+
+/* DO NOT RELY ON FEATURES THAT ARE NOT DOCUMENTED in the manual,
+   especially those whose name start with YY_ or yy_.  They are
+   private implementation details that can be changed or removed.  */
+
+#ifndef YY_VL_PARSE_H_INCLUDED
+# define YY_VL_PARSE_H_INCLUDED
+/* Debug traces.  */
+#ifndef YYDEBUG
+# define YYDEBUG 1
+#endif
+#if YYDEBUG
+extern int VLdebug;
+#endif
+
+/* Token kinds.  */
+#ifndef YYTOKENTYPE
+# define YYTOKENTYPE
+  enum yytokentype
+  {
+    YYEMPTY = -2,
+    YYEOF = 0,                     /* "end of file"  */
+    YYerror = 256,                 /* error  */
+    YYUNDEF = 257,                 /* "invalid token"  */
+    IDENTIFIER = 258,              /* IDENTIFIER  */
+    SYSTEM_IDENTIFIER = 259,       /* SYSTEM_IDENTIFIER  */
+    STRING = 260,                  /* STRING  */
+    TIME_LITERAL = 261,            /* TIME_LITERAL  */
+    TYPE_IDENTIFIER = 262,         /* TYPE_IDENTIFIER  */
+    PACKAGE_IDENTIFIER = 263,      /* PACKAGE_IDENTIFIER  */
+    DISCIPLINE_IDENTIFIER = 264,   /* DISCIPLINE_IDENTIFIER  */
+    PATHPULSE_IDENTIFIER = 265,    /* PATHPULSE_IDENTIFIER  */
+    BASED_NUMBER = 266,            /* BASED_NUMBER  */
+    DEC_NUMBER = 267,              /* DEC_NUMBER  */
+    UNBASED_NUMBER = 268,          /* UNBASED_NUMBER  */
+    REALTIME = 269,                /* REALTIME  */
+    K_PLUS_EQ = 270,               /* K_PLUS_EQ  */
+    K_MINUS_EQ = 271,              /* K_MINUS_EQ  */
+    K_INCR = 272,                  /* K_INCR  */
+    K_DECR = 273,                  /* K_DECR  */
+    K_LE = 274,                    /* K_LE  */
+    K_GE = 275,                    /* K_GE  */
+    K_EG = 276,                    /* K_EG  */
+    K_EQ = 277,                    /* K_EQ  */
+    K_NE = 278,                    /* K_NE  */
+    K_CEQ = 279,                   /* K_CEQ  */
+    K_CNE = 280,                   /* K_CNE  */
+    K_WEQ = 281,                   /* K_WEQ  */
+    K_WNE = 282,                   /* K_WNE  */
+    K_LP = 283,                    /* K_LP  */
+    K_LS = 284,                    /* K_LS  */
+    K_RS = 285,                    /* K_RS  */
+    K_RSS = 286,                   /* K_RSS  */
+    K_SG = 287,                    /* K_SG  */
+    K_CONTRIBUTE = 288,            /* K_CONTRIBUTE  */
+    K_PO_POS = 289,                /* K_PO_POS  */
+    K_PO_NEG = 290,                /* K_PO_NEG  */
+    K_POW = 291,                   /* K_POW  */
+    K_PSTAR = 292,                 /* K_PSTAR  */
+    K_STARP = 293,                 /* K_STARP  */
+    K_DOTSTAR = 294,               /* K_DOTSTAR  */
+    K_LOR = 295,                   /* K_LOR  */
+    K_LAND = 296,                  /* K_LAND  */
+    K_NAND = 297,                  /* K_NAND  */
+    K_NOR = 298,                   /* K_NOR  */
+    K_NXOR = 299,                  /* K_NXOR  */
+    K_TRIGGER = 300,               /* K_TRIGGER  */
+    K_NB_TRIGGER = 301,            /* K_NB_TRIGGER  */
+    K_LEQUIV = 302,                /* K_LEQUIV  */
+    K_SCOPE_RES = 303,             /* K_SCOPE_RES  */
+    K_edge_descriptor = 304,       /* K_edge_descriptor  */
+    K_CONSTRAINT_IMPL = 305,       /* K_CONSTRAINT_IMPL  */
+    K_always = 306,                /* K_always  */
+    K_and = 307,                   /* K_and  */
+    K_assign = 308,                /* K_assign  */
+    K_begin = 309,                 /* K_begin  */
+    K_buf = 310,                   /* K_buf  */
+    K_bufif0 = 311,                /* K_bufif0  */
+    K_bufif1 = 312,                /* K_bufif1  */
+    K_case = 313,                  /* K_case  */
+    K_casex = 314,                 /* K_casex  */
+    K_casez = 315,                 /* K_casez  */
+    K_cmos = 316,                  /* K_cmos  */
+    K_deassign = 317,              /* K_deassign  */
+    K_default = 318,               /* K_default  */
+    K_defparam = 319,              /* K_defparam  */
+    K_disable = 320,               /* K_disable  */
+    K_edge = 321,                  /* K_edge  */
+    K_else = 322,                  /* K_else  */
+    K_end = 323,                   /* K_end  */
+    K_endcase = 324,               /* K_endcase  */
+    K_endfunction = 325,           /* K_endfunction  */
+    K_endmodule = 326,             /* K_endmodule  */
+    K_endprimitive = 327,          /* K_endprimitive  */
+    K_endspecify = 328,            /* K_endspecify  */
+    K_endtable = 329,              /* K_endtable  */
+    K_endtask = 330,               /* K_endtask  */
+    K_event = 331,                 /* K_event  */
+    K_for = 332,                   /* K_for  */
+    K_force = 333,                 /* K_force  */
+    K_forever = 334,               /* K_forever  */
+    K_fork = 335,                  /* K_fork  */
+    K_function = 336,              /* K_function  */
+    K_highz0 = 337,                /* K_highz0  */
+    K_highz1 = 338,                /* K_highz1  */
+    K_if = 339,                    /* K_if  */
+    K_ifnone = 340,                /* K_ifnone  */
+    K_initial = 341,               /* K_initial  */
+    K_inout = 342,                 /* K_inout  */
+    K_input = 343,                 /* K_input  */
+    K_integer = 344,               /* K_integer  */
+    K_join = 345,                  /* K_join  */
+    K_large = 346,                 /* K_large  */
+    K_macromodule = 347,           /* K_macromodule  */
+    K_medium = 348,                /* K_medium  */
+    K_module = 349,                /* K_module  */
+    K_nand = 350,                  /* K_nand  */
+    K_negedge = 351,               /* K_negedge  */
+    K_nmos = 352,                  /* K_nmos  */
+    K_nor = 353,                   /* K_nor  */
+    K_not = 354,                   /* K_not  */
+    K_notif0 = 355,                /* K_notif0  */
+    K_notif1 = 356,                /* K_notif1  */
+    K_or = 357,                    /* K_or  */
+    K_output = 358,                /* K_output  */
+    K_parameter = 359,             /* K_parameter  */
+    K_pmos = 360,                  /* K_pmos  */
+    K_posedge = 361,               /* K_posedge  */
+    K_primitive = 362,             /* K_primitive  */
+    K_pull0 = 363,                 /* K_pull0  */
+    K_pull1 = 364,                 /* K_pull1  */
+    K_pulldown = 365,              /* K_pulldown  */
+    K_pullup = 366,                /* K_pullup  */
+    K_rcmos = 367,                 /* K_rcmos  */
+    K_real = 368,                  /* K_real  */
+    K_realtime = 369,              /* K_realtime  */
+    K_reg = 370,                   /* K_reg  */
+    K_release = 371,               /* K_release  */
+    K_repeat = 372,                /* K_repeat  */
+    K_rnmos = 373,                 /* K_rnmos  */
+    K_rpmos = 374,                 /* K_rpmos  */
+    K_rtran = 375,                 /* K_rtran  */
+    K_rtranif0 = 376,              /* K_rtranif0  */
+    K_rtranif1 = 377,              /* K_rtranif1  */
+    K_scalared = 378,              /* K_scalared  */
+    K_small = 379,                 /* K_small  */
+    K_specify = 380,               /* K_specify  */
+    K_specparam = 381,             /* K_specparam  */
+    K_strong0 = 382,               /* K_strong0  */
+    K_strong1 = 383,               /* K_strong1  */
+    K_supply0 = 384,               /* K_supply0  */
+    K_supply1 = 385,               /* K_supply1  */
+    K_table = 386,                 /* K_table  */
+    K_task = 387,                  /* K_task  */
+    K_time = 388,                  /* K_time  */
+    K_tran = 389,                  /* K_tran  */
+    K_tranif0 = 390,               /* K_tranif0  */
+    K_tranif1 = 391,               /* K_tranif1  */
+    K_tri = 392,                   /* K_tri  */
+    K_tri0 = 393,                  /* K_tri0  */
+    K_tri1 = 394,                  /* K_tri1  */
+    K_triand = 395,                /* K_triand  */
+    K_trior = 396,                 /* K_trior  */
+    K_trireg = 397,                /* K_trireg  */
+    K_vectored = 398,              /* K_vectored  */
+    K_wait = 399,                  /* K_wait  */
+    K_wand = 400,                  /* K_wand  */
+    K_weak0 = 401,                 /* K_weak0  */
+    K_weak1 = 402,                 /* K_weak1  */
+    K_while = 403,                 /* K_while  */
+    K_wire = 404,                  /* K_wire  */
+    K_wor = 405,                   /* K_wor  */
+    K_xnor = 406,                  /* K_xnor  */
+    K_xor = 407,                   /* K_xor  */
+    K_Shold = 408,                 /* K_Shold  */
+    K_Snochange = 409,             /* K_Snochange  */
+    K_Speriod = 410,               /* K_Speriod  */
+    K_Srecovery = 411,             /* K_Srecovery  */
+    K_Ssetup = 412,                /* K_Ssetup  */
+    K_Ssetuphold = 413,            /* K_Ssetuphold  */
+    K_Sskew = 414,                 /* K_Sskew  */
+    K_Swidth = 415,                /* K_Swidth  */
+    KK_attribute = 416,            /* KK_attribute  */
+    K_bool = 417,                  /* K_bool  */
+    K_logic = 418,                 /* K_logic  */
+    K_automatic = 419,             /* K_automatic  */
+    K_endgenerate = 420,           /* K_endgenerate  */
+    K_generate = 421,              /* K_generate  */
+    K_genvar = 422,                /* K_genvar  */
+    K_localparam = 423,            /* K_localparam  */
+    K_noshowcancelled = 424,       /* K_noshowcancelled  */
+    K_pulsestyle_onevent = 425,    /* K_pulsestyle_onevent  */
+    K_pulsestyle_ondetect = 426,   /* K_pulsestyle_ondetect  */
+    K_showcancelled = 427,         /* K_showcancelled  */
+    K_signed = 428,                /* K_signed  */
+    K_unsigned = 429,              /* K_unsigned  */
+    K_Sfullskew = 430,             /* K_Sfullskew  */
+    K_Srecrem = 431,               /* K_Srecrem  */
+    K_Sremoval = 432,              /* K_Sremoval  */
+    K_Stimeskew = 433,             /* K_Stimeskew  */
+    K_cell = 434,                  /* K_cell  */
+    K_config = 435,                /* K_config  */
+    K_design = 436,                /* K_design  */
+    K_endconfig = 437,             /* K_endconfig  */
+    K_incdir = 438,                /* K_incdir  */
+    K_include = 439,               /* K_include  */
+    K_instance = 440,              /* K_instance  */
+    K_liblist = 441,               /* K_liblist  */
+    K_library = 442,               /* K_library  */
+    K_use = 443,                   /* K_use  */
+    K_wone = 444,                  /* K_wone  */
+    K_uwire = 445,                 /* K_uwire  */
+    K_alias = 446,                 /* K_alias  */
+    K_always_comb = 447,           /* K_always_comb  */
+    K_always_ff = 448,             /* K_always_ff  */
+    K_always_latch = 449,          /* K_always_latch  */
+    K_assert = 450,                /* K_assert  */
+    K_assume = 451,                /* K_assume  */
+    K_before = 452,                /* K_before  */
+    K_bind = 453,                  /* K_bind  */
+    K_bins = 454,                  /* K_bins  */
+    K_binsof = 455,                /* K_binsof  */
+    K_bit = 456,                   /* K_bit  */
+    K_break = 457,                 /* K_break  */
+    K_byte = 458,                  /* K_byte  */
+    K_chandle = 459,               /* K_chandle  */
+    K_class = 460,                 /* K_class  */
+    K_clocking = 461,              /* K_clocking  */
+    K_const = 462,                 /* K_const  */
+    K_constraint = 463,            /* K_constraint  */
+    K_context = 464,               /* K_context  */
+    K_continue = 465,              /* K_continue  */
+    K_cover = 466,                 /* K_cover  */
+    K_covergroup = 467,            /* K_covergroup  */
+    K_coverpoint = 468,            /* K_coverpoint  */
+    K_cross = 469,                 /* K_cross  */
+    K_dist = 470,                  /* K_dist  */
+    K_do = 471,                    /* K_do  */
+    K_endclass = 472,              /* K_endclass  */
+    K_endclocking = 473,           /* K_endclocking  */
+    K_endgroup = 474,              /* K_endgroup  */
+    K_endinterface = 475,          /* K_endinterface  */
+    K_endpackage = 476,            /* K_endpackage  */
+    K_endprogram = 477,            /* K_endprogram  */
+    K_endproperty = 478,           /* K_endproperty  */
+    K_endsequence = 479,           /* K_endsequence  */
+    K_enum = 480,                  /* K_enum  */
+    K_expect = 481,                /* K_expect  */
+    K_export = 482,                /* K_export  */
+    K_extends = 483,               /* K_extends  */
+    K_extern = 484,                /* K_extern  */
+    K_final = 485,                 /* K_final  */
+    K_first_match = 486,           /* K_first_match  */
+    K_foreach = 487,               /* K_foreach  */
+    K_forkjoin = 488,              /* K_forkjoin  */
+    K_iff = 489,                   /* K_iff  */
+    K_ignore_bins = 490,           /* K_ignore_bins  */
+    K_illegal_bins = 491,          /* K_illegal_bins  */
+    K_import = 492,                /* K_import  */
+    K_inside = 493,                /* K_inside  */
+    K_int = 494,                   /* K_int  */
+    K_interface = 495,             /* K_interface  */
+    K_intersect = 496,             /* K_intersect  */
+    K_join_any = 497,              /* K_join_any  */
+    K_join_none = 498,             /* K_join_none  */
+    K_local = 499,                 /* K_local  */
+    K_longint = 500,               /* K_longint  */
+    K_matches = 501,               /* K_matches  */
+    K_modport = 502,               /* K_modport  */
+    K_new = 503,                   /* K_new  */
+    K_null = 504,                  /* K_null  */
+    K_package = 505,               /* K_package  */
+    K_packed = 506,                /* K_packed  */
+    K_priority = 507,              /* K_priority  */
+    K_program = 508,               /* K_program  */
+    K_property = 509,              /* K_property  */
+    K_protected = 510,             /* K_protected  */
+    K_pure = 511,                  /* K_pure  */
+    K_rand = 512,                  /* K_rand  */
+    K_randc = 513,                 /* K_randc  */
+    K_randcase = 514,              /* K_randcase  */
+    K_randsequence = 515,          /* K_randsequence  */
+    K_ref = 516,                   /* K_ref  */
+    K_return = 517,                /* K_return  */
+    K_sequence = 518,              /* K_sequence  */
+    K_shortint = 519,              /* K_shortint  */
+    K_shortreal = 520,             /* K_shortreal  */
+    K_solve = 521,                 /* K_solve  */
+    K_static = 522,                /* K_static  */
+    K_string = 523,                /* K_string  */
+    K_struct = 524,                /* K_struct  */
+    K_super = 525,                 /* K_super  */
+    K_tagged = 526,                /* K_tagged  */
+    K_this = 527,                  /* K_this  */
+    K_throughout = 528,            /* K_throughout  */
+    K_timeprecision = 529,         /* K_timeprecision  */
+    K_timeunit = 530,              /* K_timeunit  */
+    K_type = 531,                  /* K_type  */
+    K_typedef = 532,               /* K_typedef  */
+    K_union = 533,                 /* K_union  */
+    K_unique = 534,                /* K_unique  */
+    K_var = 535,                   /* K_var  */
+    K_virtual = 536,               /* K_virtual  */
+    K_void = 537,                  /* K_void  */
+    K_wait_order = 538,            /* K_wait_order  */
+    K_wildcard = 539,              /* K_wildcard  */
+    K_with = 540,                  /* K_with  */
+    K_within = 541,                /* K_within  */
+    K_accept_on = 542,             /* K_accept_on  */
+    K_checker = 543,               /* K_checker  */
+    K_endchecker = 544,            /* K_endchecker  */
+    K_eventually = 545,            /* K_eventually  */
+    K_global = 546,                /* K_global  */
+    K_implies = 547,               /* K_implies  */
+    K_let = 548,                   /* K_let  */
+    K_nexttime = 549,              /* K_nexttime  */
+    K_reject_on = 550,             /* K_reject_on  */
+    K_restrict = 551,              /* K_restrict  */
+    K_s_always = 552,              /* K_s_always  */
+    K_s_eventually = 553,          /* K_s_eventually  */
+    K_s_nexttime = 554,            /* K_s_nexttime  */
+    K_s_until = 555,               /* K_s_until  */
+    K_s_until_with = 556,          /* K_s_until_with  */
+    K_strong = 557,                /* K_strong  */
+    K_sync_accept_on = 558,        /* K_sync_accept_on  */
+    K_sync_reject_on = 559,        /* K_sync_reject_on  */
+    K_unique0 = 560,               /* K_unique0  */
+    K_until = 561,                 /* K_until  */
+    K_until_with = 562,            /* K_until_with  */
+    K_untyped = 563,               /* K_untyped  */
+    K_weak = 564,                  /* K_weak  */
+    K_implements = 565,            /* K_implements  */
+    K_interconnect = 566,          /* K_interconnect  */
+    K_nettype = 567,               /* K_nettype  */
+    K_soft = 568,                  /* K_soft  */
+    K_above = 569,                 /* K_above  */
+    K_abs = 570,                   /* K_abs  */
+    K_absdelay = 571,              /* K_absdelay  */
+    K_abstol = 572,                /* K_abstol  */
+    K_access = 573,                /* K_access  */
+    K_acos = 574,                  /* K_acos  */
+    K_acosh = 575,                 /* K_acosh  */
+    K_ac_stim = 576,               /* K_ac_stim  */
+    K_aliasparam = 577,            /* K_aliasparam  */
+    K_analog = 578,                /* K_analog  */
+    K_analysis = 579,              /* K_analysis  */
+    K_asin = 580,                  /* K_asin  */
+    K_asinh = 581,                 /* K_asinh  */
+    K_atan = 582,                  /* K_atan  */
+    K_atan2 = 583,                 /* K_atan2  */
+    K_atanh = 584,                 /* K_atanh  */
+    K_branch = 585,                /* K_branch  */
+    K_ceil = 586,                  /* K_ceil  */
+    K_connect = 587,               /* K_connect  */
+    K_connectmodule = 588,         /* K_connectmodule  */
+    K_connectrules = 589,          /* K_connectrules  */
+    K_continuous = 590,            /* K_continuous  */
+    K_cos = 591,                   /* K_cos  */
+    K_cosh = 592,                  /* K_cosh  */
+    K_ddt = 593,                   /* K_ddt  */
+    K_ddt_nature = 594,            /* K_ddt_nature  */
+    K_ddx = 595,                   /* K_ddx  */
+    K_discipline = 596,            /* K_discipline  */
+    K_discrete = 597,              /* K_discrete  */
+    K_domain = 598,                /* K_domain  */
+    K_driver_update = 599,         /* K_driver_update  */
+    K_endconnectrules = 600,       /* K_endconnectrules  */
+    K_enddiscipline = 601,         /* K_enddiscipline  */
+    K_endnature = 602,             /* K_endnature  */
+    K_endparamset = 603,           /* K_endparamset  */
+    K_exclude = 604,               /* K_exclude  */
+    K_exp = 605,                   /* K_exp  */
+    K_final_step = 606,            /* K_final_step  */
+    K_flicker_noise = 607,         /* K_flicker_noise  */
+    K_floor = 608,                 /* K_floor  */
+    K_flow = 609,                  /* K_flow  */
+    K_from = 610,                  /* K_from  */
+    K_ground = 611,                /* K_ground  */
+    K_hypot = 612,                 /* K_hypot  */
+    K_idt = 613,                   /* K_idt  */
+    K_idtmod = 614,                /* K_idtmod  */
+    K_idt_nature = 615,            /* K_idt_nature  */
+    K_inf = 616,                   /* K_inf  */
+    K_initial_step = 617,          /* K_initial_step  */
+    K_laplace_nd = 618,            /* K_laplace_nd  */
+    K_laplace_np = 619,            /* K_laplace_np  */
+    K_laplace_zd = 620,            /* K_laplace_zd  */
+    K_laplace_zp = 621,            /* K_laplace_zp  */
+    K_last_crossing = 622,         /* K_last_crossing  */
+    K_limexp = 623,                /* K_limexp  */
+    K_ln = 624,                    /* K_ln  */
+    K_log = 625,                   /* K_log  */
+    K_max = 626,                   /* K_max  */
+    K_merged = 627,                /* K_merged  */
+    K_min = 628,                   /* K_min  */
+    K_nature = 629,                /* K_nature  */
+    K_net_resolution = 630,        /* K_net_resolution  */
+    K_noise_table = 631,           /* K_noise_table  */
+    K_paramset = 632,              /* K_paramset  */
+    K_potential = 633,             /* K_potential  */
+    K_pow = 634,                   /* K_pow  */
+    K_resolveto = 635,             /* K_resolveto  */
+    K_sin = 636,                   /* K_sin  */
+    K_sinh = 637,                  /* K_sinh  */
+    K_slew = 638,                  /* K_slew  */
+    K_split = 639,                 /* K_split  */
+    K_sqrt = 640,                  /* K_sqrt  */
+    K_tan = 641,                   /* K_tan  */
+    K_tanh = 642,                  /* K_tanh  */
+    K_timer = 643,                 /* K_timer  */
+    K_transition = 644,            /* K_transition  */
+    K_units = 645,                 /* K_units  */
+    K_white_noise = 646,           /* K_white_noise  */
+    K_wreal = 647,                 /* K_wreal  */
+    K_zi_nd = 648,                 /* K_zi_nd  */
+    K_zi_np = 649,                 /* K_zi_np  */
+    K_zi_zd = 650,                 /* K_zi_zd  */
+    K_zi_zp = 651,                 /* K_zi_zp  */
+    K_TAND = 652,                  /* K_TAND  */
+    K_MUL_EQ = 653,                /* K_MUL_EQ  */
+    K_DIV_EQ = 654,                /* K_DIV_EQ  */
+    K_MOD_EQ = 655,                /* K_MOD_EQ  */
+    K_AND_EQ = 656,                /* K_AND_EQ  */
+    K_OR_EQ = 657,                 /* K_OR_EQ  */
+    K_XOR_EQ = 658,                /* K_XOR_EQ  */
+    K_LS_EQ = 659,                 /* K_LS_EQ  */
+    K_RS_EQ = 660,                 /* K_RS_EQ  */
+    K_RSS_EQ = 661,                /* K_RSS_EQ  */
+    UNARY_PREC = 662,              /* UNARY_PREC  */
+    less_than_K_else = 663,        /* less_than_K_else  */
+    no_timeunits_declaration = 664, /* no_timeunits_declaration  */
+    one_timeunits_declaration = 665 /* one_timeunits_declaration  */
+  };
+  typedef enum yytokentype yytoken_kind_t;
+#endif
+
+/* Value type.  */
+#if ! defined YYSTYPE && ! defined YYSTYPE_IS_DECLARED
+union YYSTYPE
+{
+#line 466 "./parse.y"
+
+      bool flag;
+
+      char letter;
+      int  int_val;
+
+      enum atom_type_t::type_code atom_type;
+
+	/* text items are C strings allocated by the lexor using
+	   strdup. They can be put into lists with the texts type. */
+      char*text;
+      std::list<perm_string>*perm_strings;
+
+      std::list<pform_ident_t>*identifiers;
+
+      std::list<pform_port_t>*port_list;
+
+      std::vector<pform_tf_port_t>* tf_ports;
+
+      pform_name_t*pform_name;
+
+      ivl_discipline_t discipline;
+
+      hname_t*hier;
+
+      std::list<std::string>*strings;
+
+      struct str_pair_t drive;
+
+      PCase::Item*citem;
+      std::vector<PCase::Item*>*citems;
+
+      lgate*gate;
+      std::vector<lgate>*gates;
+
+      Module::port_t *mport;
+      LexicalScope::range_t* value_range;
+      std::vector<Module::port_t*>*mports;
+
+      std::list<PLet::let_port_t*>*let_port_lst;
+      PLet::let_port_t*let_port_itm;
+
+      named_pexpr_t*named_pexpr;
+      std::list<named_pexpr_t>*named_pexprs;
+      struct parmvalue_t*parmvalue;
+      std::list<pform_range_t>*ranges;
+
+      PExpr*expr;
+      std::list<PExpr*>*exprs;
+
+      PEEvent*event_expr;
+      std::vector<PEEvent*>*event_exprs;
+
+      ivl_case_quality_t case_quality;
+      NetNet::Type nettype;
+      PGBuiltin::Type gatetype;
+      NetNet::PortType porttype;
+      ivl_variable_type_t vartype;
+      PBlock::BL_TYPE join_keyword;
+
+      PWire*wire;
+      std::vector<PWire*>*wires;
+
+      PCallTask *subroutine_call;
+
+      PEventStatement*event_statement;
+      Statement*statement;
+      std::vector<Statement*>*statement_list;
+
+      decl_assignment_t*decl_assignment;
+      std::list<decl_assignment_t*>*decl_assignments;
+
+      struct_member_t*struct_member;
+      std::list<struct_member_t*>*struct_members;
+      struct_type_t*struct_type;
+
+      data_type_t*data_type;
+      class_type_t*class_type;
+      real_type_t::type_t real_type;
+      property_qualifier_t property_qualifier;
+      PPackage*package;
+
+      struct {
+	    char*text;
+	    typedef_t*type;
+      } type_identifier;
+
+      struct {
+	    data_type_t*type;
+	    std::list<named_pexpr_t> *args;
+      } class_declaration_extends;
+
+      struct {
+	    char*text;
+	    PExpr*expr;
+      } genvar_iter;
+
+      struct {
+	    bool packed_flag;
+	    bool signed_flag;
+      } packed_signing;
+
+      verinum* number;
+
+      verireal* realtime;
+
+      PSpecPath* specpath;
+      std::list<index_component_t> *dimensions;
+
+      PTimingCheck::event_t* timing_check_event;
+      PTimingCheck::optional_args_t* spec_optional_args;
+
+      LexicalScope::lifetime_t lifetime;
+
+      enum typedef_t::basic_type typedef_basic_type;
+
+#line 591 "parse.h"
+
+};
+typedef union YYSTYPE YYSTYPE;
+# define YYSTYPE_IS_TRIVIAL 1
+# define YYSTYPE_IS_DECLARED 1
+#endif
+
+/* Location type.  */
+#if ! defined YYLTYPE && ! defined YYLTYPE_IS_DECLARED
+typedef struct YYLTYPE YYLTYPE;
+struct YYLTYPE
+{
+  int first_line;
+  int first_column;
+  int last_line;
+  int last_column;
+};
+# define YYLTYPE_IS_DECLARED 1
+# define YYLTYPE_IS_TRIVIAL 1
+#endif
+
+
+extern YYSTYPE VLlval;
+extern YYLTYPE VLlloc;
+
+int VLparse (void);
+
+
+#endif /* !YY_VL_PARSE_H_INCLUDED  */
