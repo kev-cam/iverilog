@@ -19,6 +19,7 @@ int draw_stmt(vhdl_procedural *proc, stmt_container *container,
               ivl_statement_t stmt, bool is_last = false);
 int draw_lpm(vhdl_arch *arch, ivl_lpm_t lpm);
 void draw_logic(vhdl_arch *arch, ivl_net_logic_t log);
+void draw_switches(vhdl_arch *arch, ivl_scope_t scope);
 
 vhdl_expr *translate_expr(ivl_expr_t e);
 vhdl_expr *translate_time_expr(ivl_expr_t e);

@@ -279,6 +279,42 @@ void draw_nexus(ivl_nexus_t nexus)
          // A constant is a sort of driver
          ndrivers++;
       }
+      else {
+         // Check for switch connections (tran, tranif, etc.)
+         ivl_switch_t sw = ivl_nexus_ptr_switch(nexus_ptr);
+         if (sw) {
+            ivl_scope_t sw_scope = ivl_switch_scope(sw);
+            if (!is_default_scope_instance(sw_scope))
+               continue;
+
+            vhdl_entity *ent = find_entity(sw_scope);
+            if (!ent) continue;
+
+            vhdl_scope *vhdl_scope = ent->get_arch()->get_scope();
+            if (!visible_nexus(priv, vhdl_scope)) {
+               // Create a temporary signal for this switch connection
+               const vhdl_type *type = vhdl_type::std_logic();
+
+               ostringstream ss;
+               ss << "SW" << ivl_switch_basename(sw);
+               if (nexus == ivl_switch_a(sw))
+                  ss << "_a";
+               else if (nexus == ivl_switch_b(sw))
+                  ss << "_b";
+               else
+                  ss << "_en";
+
+               if (!vhdl_scope->have_declared(ss.str()))
+                  vhdl_scope->add_decl(new vhdl_signal_decl(ss.str(), type));
+
+               link_scope_to_nexus_tmp(priv, vhdl_scope, ss.str());
+            }
+
+            // Switch ports are bidirectional drivers
+            if (ivl_switch_a(sw) == nexus || ivl_switch_b(sw) == nexus)
+               ndrivers++;
+         }
+      }
    }
 
    // Drive undriven nets with a constant
@@ -1149,6 +1185,7 @@ extern "C" int draw_all_logic_and_lpm(ivl_scope_t scope, void *)
       {
          declare_logic(ent->get_arch(), scope);
          declare_lpm(ent->get_arch(), scope);
+         draw_switches(ent->get_arch(), scope);
       }
       set_active_entity(NULL);
    }

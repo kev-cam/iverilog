@@ -762,6 +762,37 @@ private:
    port_map_list_t mapping_;
 };
 
+/*
+ * A generic map entry (name => value).
+ */
+struct generic_map_t {
+   std::string name;
+   vhdl_expr *expr;
+};
+
+typedef std::list<generic_map_t> generic_map_list_t;
+
+/*
+ * Direct entity instantiation (VHDL-93).
+ * Emits: label: entity lib.entity(arch)
+ *           generic map (...) port map (...);
+ */
+class vhdl_entity_inst : public vhdl_conc_stmt {
+public:
+   vhdl_entity_inst(const char *inst_name, const char *lib_name,
+                    const char *entity_name, const char *arch_name = NULL);
+
+   void emit(std::ostream &of, int level) const;
+   void map_port(const std::string& name, vhdl_expr *expr);
+   void map_generic(const std::string& name, vhdl_expr *expr);
+
+   const std::string &get_inst_name() const { return inst_name_; }
+private:
+   std::string inst_name_, lib_name_, entity_name_, arch_name_;
+   port_map_list_t mapping_;
+   generic_map_list_t generics_;
+};
+
 
 /*
  * Contains a list of declarations in a hierarchy.
