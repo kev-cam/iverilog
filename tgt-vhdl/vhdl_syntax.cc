@@ -139,6 +139,7 @@ void vhdl_entity::emit(std::ostream &of, int level) const
    if (get_sv2vhdl_mode()) {
       of << "library sv2vhdl;" << std::endl;
       of << "use sv2vhdl.sv_display_pkg.all;" << std::endl;
+      of << "use sv2vhdl.sv_analog_pkg.all;" << std::endl;
    }
    of << std::endl;
 
@@ -185,6 +186,24 @@ vhdl_arch::~vhdl_arch()
 
 }
 
+void vhdl_conc_pcall_stmt::emit(std::ostream &of, int level) const
+{
+   emit_comment(of, level);
+   of << name_;
+   if (!exprs_.empty())
+      exprs_.emit(of, level);
+   of << ";";
+}
+
+void vhdl_arch::add_attribute_spec(const std::string& attr,
+                                    const std::string& entity,
+                                    const std::string& cls,
+                                    const std::string& val)
+{
+   vhdl_attr_spec_t spec = { attr, entity, cls, val };
+   attr_specs_.push_back(spec);
+}
+
 void vhdl_arch::add_stmt(vhdl_process *proc)
 {
    proc->get_scope()->set_parent(&scope_);
@@ -202,6 +221,29 @@ void vhdl_arch::emit(std::ostream &of, int level) const
    of << "architecture " << name_ << " of " << entity_;
    of << " is";
    emit_children<vhdl_decl>(of, scope_.get_decls(), level);
+
+   // Emit attribute declarations and specifications
+   if (!attr_specs_.empty()) {
+      // Collect unique attribute names
+      std::set<std::string> seen_attrs;
+      for (std::list<vhdl_attr_spec_t>::const_iterator it = attr_specs_.begin();
+           it != attr_specs_.end(); ++it) {
+         if (seen_attrs.find(it->attr_name) == seen_attrs.end()) {
+            seen_attrs.insert(it->attr_name);
+            newline(of, indent(level));
+            of << "attribute " << it->attr_name << " : string;";
+         }
+      }
+      // Emit all specs
+      for (std::list<vhdl_attr_spec_t>::const_iterator it = attr_specs_.begin();
+           it != attr_specs_.end(); ++it) {
+         newline(of, indent(level));
+         of << "attribute " << it->attr_name << " of " << it->entity_name
+            << " : " << it->entity_class << " is \"" << it->value << "\";";
+      }
+      newline(of, level);
+   }
+
    of << "begin";
    emit_children<vhdl_conc_stmt>(of, stmts_, level);
    of << "end architecture;";

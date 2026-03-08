@@ -671,6 +671,21 @@ static void declare_one_signal(vhdl_entity *ent, ivl_signal_t sig,
    default:
       assert(false);
    }
+
+   // In sv2vhdl mode, emit discipline/nature attributes for analog signals
+   ivl_discipline_t disc = ivl_signal_discipline(sig);
+   if (disc && get_sv2vhdl_mode()) {
+      ent->get_arch()->add_attribute_spec("discipline", name, "signal",
+                                           ivl_discipline_name(disc));
+      ivl_nature_t pot = ivl_discipline_potential(disc);
+      if (pot)
+         ent->get_arch()->add_attribute_spec("va_nature_potential", name,
+                                              "signal", ivl_nature_name(pot));
+      ivl_nature_t flow = ivl_discipline_flow(disc);
+      if (flow)
+         ent->get_arch()->add_attribute_spec("va_nature_flow", name,
+                                              "signal", ivl_nature_name(flow));
+   }
 }
 
 // Declare all signals and ports for a scope.

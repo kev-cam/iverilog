@@ -2141,7 +2141,52 @@ NetExpr* PECallFunction::elaborate_access_func_(Design*des, NetScope*scope,
 	    }
 
       } else {
-	    ivl_assert(*this, 0);
+	      // 2-argument form: V(a, b) or I(a, b)
+	    PExpr *arg1 = parms_[0].parm;
+	    PExpr *arg2 = parms_[1].parm;
+	    const PEIdent*id1 = dynamic_cast<PEIdent*>(arg1);
+	    const PEIdent*id2 = dynamic_cast<PEIdent*>(arg2);
+	    ivl_assert(*this, id1);
+	    ivl_assert(*this, id2);
+
+	    perm_string name1 = peek_tail_name(id1->path().name);
+	    perm_string name2 = peek_tail_name(id2->path().name);
+
+	    NetNet*sig1 = scope->find_signal(name1);
+	    NetNet*sig2 = scope->find_signal(name2);
+	    ivl_assert(*this, sig1);
+	    ivl_assert(*this, sig2);
+
+	    ivl_discipline_t dis = sig1->get_discipline();
+	    ivl_assert(*this, dis);
+	    ivl_assert(*this, nature == dis->potential() || nature == dis->flow());
+
+	      // Look for existing branch between these two signals
+	    Nexus*nex = sig1->pin(0).nexus();
+	    for (Link*cur = nex->first_nlink(); cur; cur = cur->next_nlink()) {
+		  if (cur->is_equal(sig1->pin(0)))
+			continue;
+		  if (cur->get_pin() != 0)
+			continue;
+		  NetBranch*tmp = dynamic_cast<NetBranch*>(cur->get_obj());
+		  if (tmp == 0)
+			continue;
+		  if (tmp->name())
+			continue;
+		  if (tmp->pin(1).is_linked(sig2->pin(0))) {
+			branch = tmp;
+			break;
+		  }
+	    }
+
+	    if (branch == 0) {
+		  branch = new NetBranch(dis);
+		  branch->set_line(*this);
+		  connect(branch->pin(0), sig1->pin(0));
+		  connect(branch->pin(1), sig2->pin(0));
+		  des->add_branch(branch);
+		  join_island(branch);
+	    }
       }
 
       NetExpr*tmp = new NetEAccess(branch, nature);
@@ -2868,8 +2913,13 @@ NetExpr* PECallFunction::elaborate_expr_(Design*des, NetScope*scope,
 		 << "search_results.path_tail: " << search_results.path_tail << endl;
       }
 
-      // If the symbol is not found at all...
+      // If the symbol is not found at all, check if it is an access
+      // function for a nature (e.g. V, I) before giving up.
       if (!search_flag) {
+	    ivl_nature_t access_nature = find_access_function(path_);
+	    if (access_nature)
+		  return elaborate_access_func_(des, scope, access_nature);
+
 	    cerr << get_fileline() << ": error: No function named `" << path_
 		 << "' found in this context (" << scope_path(scope) << ")."
 		 << endl;

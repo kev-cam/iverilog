@@ -222,6 +222,19 @@ static PECallFunction*make_call_function(perm_string tn, PExpr*arg1, PExpr*arg2)
       return tmp;
 }
 
+static PECallFunction*make_call_function_list(perm_string tn, std::list<PExpr*>*args)
+{
+      std::vector<named_pexpr_t> parms(args->size());
+      unsigned idx = 0;
+      for (auto it = args->begin(); it != args->end(); ++it, ++idx) {
+            parms[idx].parm = *it;
+            parms[idx].set_line(**it);
+      }
+      delete args;
+      PECallFunction*tmp = new PECallFunction(tn, parms);
+      return tmp;
+}
+
 static std::list<named_pexpr_t>* make_named_numbers(const struct vlltype &loc,
 						    perm_string name,
 						    long first, long last,
@@ -810,6 +823,7 @@ Module::port_t *module_declare_port(const YYLTYPE&loc, char *id,
 %type <statement_list> statement_or_null_list statement_or_null_list_opt
 
 %type <statement> analog_statement
+%type <statement_list> analog_statement_list
 
 %type <subroutine_call> subroutine_call
 
@@ -4193,6 +4207,103 @@ expr_primary
 	$$ = tmp;
       }
 
+  /* Verilog-AMS analog operator functions. These are parsed as system
+     function calls ($ddt, $idt, etc.) so they pass through elaboration
+     and appear in the target API as IVL_EX_SFUNC expressions. */
+
+  | K_ddt '(' expression_list_proper ')'
+      { $$ = make_call_function_list(perm_string::literal("$ddt"), $3);
+        FILE_NAME($$,@1);
+      }
+  | K_idt '(' expression_list_proper ')'
+      { $$ = make_call_function_list(perm_string::literal("$idt"), $3);
+        FILE_NAME($$,@1);
+      }
+  | K_idtmod '(' expression_list_proper ')'
+      { $$ = make_call_function_list(perm_string::literal("$idtmod"), $3);
+        FILE_NAME($$,@1);
+      }
+  | K_ddx '(' expression_list_proper ')'
+      { $$ = make_call_function_list(perm_string::literal("$ddx"), $3);
+        FILE_NAME($$,@1);
+      }
+  | K_absdelay '(' expression_list_proper ')'
+      { $$ = make_call_function_list(perm_string::literal("$absdelay"), $3);
+        FILE_NAME($$,@1);
+      }
+  | K_transition '(' expression_list_proper ')'
+      { $$ = make_call_function_list(perm_string::literal("$transition"), $3);
+        FILE_NAME($$,@1);
+      }
+  | K_slew '(' expression_list_proper ')'
+      { $$ = make_call_function_list(perm_string::literal("$slew"), $3);
+        FILE_NAME($$,@1);
+      }
+  | K_cross '(' expression_list_proper ')'
+      { $$ = make_call_function_list(perm_string::literal("$cross"), $3);
+        FILE_NAME($$,@1);
+      }
+  | K_above '(' expression_list_proper ')'
+      { $$ = make_call_function_list(perm_string::literal("$above"), $3);
+        FILE_NAME($$,@1);
+      }
+  | K_limexp '(' expression_list_proper ')'
+      { $$ = make_call_function_list(perm_string::literal("$limexp"), $3);
+        FILE_NAME($$,@1);
+      }
+  | K_last_crossing '(' expression_list_proper ')'
+      { $$ = make_call_function_list(perm_string::literal("$last_crossing"), $3);
+        FILE_NAME($$,@1);
+      }
+  | K_laplace_nd '(' expression_list_proper ')'
+      { $$ = make_call_function_list(perm_string::literal("$laplace_nd"), $3);
+        FILE_NAME($$,@1);
+      }
+  | K_laplace_np '(' expression_list_proper ')'
+      { $$ = make_call_function_list(perm_string::literal("$laplace_np"), $3);
+        FILE_NAME($$,@1);
+      }
+  | K_laplace_zd '(' expression_list_proper ')'
+      { $$ = make_call_function_list(perm_string::literal("$laplace_zd"), $3);
+        FILE_NAME($$,@1);
+      }
+  | K_laplace_zp '(' expression_list_proper ')'
+      { $$ = make_call_function_list(perm_string::literal("$laplace_zp"), $3);
+        FILE_NAME($$,@1);
+      }
+  | K_zi_nd '(' expression_list_proper ')'
+      { $$ = make_call_function_list(perm_string::literal("$zi_nd"), $3);
+        FILE_NAME($$,@1);
+      }
+  | K_zi_np '(' expression_list_proper ')'
+      { $$ = make_call_function_list(perm_string::literal("$zi_np"), $3);
+        FILE_NAME($$,@1);
+      }
+  | K_zi_zd '(' expression_list_proper ')'
+      { $$ = make_call_function_list(perm_string::literal("$zi_zd"), $3);
+        FILE_NAME($$,@1);
+      }
+  | K_zi_zp '(' expression_list_proper ')'
+      { $$ = make_call_function_list(perm_string::literal("$zi_zp"), $3);
+        FILE_NAME($$,@1);
+      }
+  | K_white_noise '(' expression_list_proper ')'
+      { $$ = make_call_function_list(perm_string::literal("$white_noise"), $3);
+        FILE_NAME($$,@1);
+      }
+  | K_flicker_noise '(' expression_list_proper ')'
+      { $$ = make_call_function_list(perm_string::literal("$flicker_noise"), $3);
+        FILE_NAME($$,@1);
+      }
+  | K_noise_table '(' expression_list_proper ')'
+      { $$ = make_call_function_list(perm_string::literal("$noise_table"), $3);
+        FILE_NAME($$,@1);
+      }
+  | K_ac_stim '(' expression_list_proper ')'
+      { $$ = make_call_function_list(perm_string::literal("$ac_stim"), $3);
+        FILE_NAME($$,@1);
+      }
+
   /* Parenthesized expressions are primaries. */
 
   | '(' expr_mintypmax ')'
@@ -7134,6 +7245,42 @@ statement_or_null_list
 analog_statement
   : branch_probe_expression K_CONTRIBUTE expression ';'
       { $$ = pform_contribution_statement(@2, $1, $3); }
+  | K_begin analog_statement_list K_end
+      { PBlock*tmp = new PBlock(PBlock::BL_SEQ);
+	FILE_NAME(tmp, @1);
+	if ($2) { tmp->set_statement(*$2); delete $2; }
+	$$ = tmp;
+      }
+  | K_begin K_end
+      { PBlock*tmp = new PBlock(PBlock::BL_SEQ);
+	FILE_NAME(tmp, @1);
+	$$ = tmp;
+      }
+  | K_if '(' expression ')' analog_statement %prec less_than_K_else
+      { PCondit*tmp = new PCondit($3, $5, 0);
+	FILE_NAME(tmp, @1);
+	$$ = tmp;
+      }
+  | K_if '(' expression ')' analog_statement K_else analog_statement
+      { PCondit*tmp = new PCondit($3, $5, $7);
+	FILE_NAME(tmp, @1);
+	$$ = tmp;
+      }
+  | ';'
+      { $$ = 0; }
+  ;
+
+analog_statement_list
+  : analog_statement_list analog_statement
+      { std::vector<Statement*>*tmp = $1;
+	if ($2) tmp->push_back($2);
+	$$ = tmp;
+      }
+  | analog_statement
+      { std::vector<Statement*>*tmp = new std::vector<Statement*>(0);
+	if ($1) tmp->push_back($1);
+	$$ = tmp;
+      }
   ;
 
 tf_port_list_opt

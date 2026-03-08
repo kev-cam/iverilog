@@ -29,6 +29,7 @@
 #include <limits>
 #include <set>
 #include <algorithm>
+#include <iomanip>
 
 using namespace std;
 
@@ -1704,6 +1705,212 @@ int draw_utask(vhdl_procedural *proc, stmt_container *container,
    draw_stmt(proc, container, ivl_scope_def(tscope), false);
 
    return 0;
+}
+
+/*
+ * Walk a nexus and find the first signal connected to it.
+ * Returns the base name of that signal, or "?" if none found.
+ */
+string nexus_to_signal_basename(ivl_nexus_t nex)
+{
+   if (!nex) return "?";
+   unsigned nptrs = ivl_nexus_ptrs(nex);
+   for (unsigned i = 0; i < nptrs; i++) {
+      ivl_nexus_ptr_t ptr = ivl_nexus_ptr(nex, i);
+      ivl_signal_t sig = ivl_nexus_ptr_sig(ptr);
+      if (sig)
+         return ivl_signal_basename(sig);
+   }
+   return "?";
+}
+
+/*
+ * Map a nature to its Verilog-AMS access function name.
+ * "Voltage" -> "V", "Current" -> "I", etc.
+ */
+static string nature_to_access(ivl_nature_t nat)
+{
+   if (!nat) return "?";
+   const char *name = ivl_nature_name(nat);
+   if (!name) return "?";
+   if (strcasecmp(name, "Voltage") == 0 || strcasecmp(name, "potential") == 0)
+      return "V";
+   if (strcasecmp(name, "Current") == 0 || strcasecmp(name, "flow") == 0)
+      return "I";
+   // For unknown natures, use the name directly
+   return name;
+}
+
+/*
+ * Recursively unparse an iverilog expression back to Verilog-A text.
+ */
+string analog_expr_to_str(ivl_expr_t expr)
+{
+   if (!expr) return "?";
+
+   ostringstream ss;
+
+   switch (ivl_expr_type(expr)) {
+   case IVL_EX_BACCESS:
+      {
+         ivl_branch_t br = ivl_expr_branch(expr);
+         ivl_nature_t nat = ivl_expr_nature(expr);
+         string acc = nature_to_access(nat);
+         string ta = nexus_to_signal_basename(ivl_branch_terminal(br, 0));
+         string tb = nexus_to_signal_basename(ivl_branch_terminal(br, 1));
+         ss << acc << "(" << ta;
+         if (tb != ta)
+            ss << ", " << tb;
+         ss << ")";
+      }
+      break;
+
+   case IVL_EX_BINARY:
+      {
+         string lhs = analog_expr_to_str(ivl_expr_oper1(expr));
+         string rhs = analog_expr_to_str(ivl_expr_oper2(expr));
+         char op = ivl_expr_opcode(expr);
+         const char *op_str;
+         switch (op) {
+         case '+': op_str = " + "; break;
+         case '-': op_str = " - "; break;
+         case '*': op_str = " * "; break;
+         case '/': op_str = " / "; break;
+         case 'p': op_str = " ** "; break;
+         case 'e': op_str = " == "; break;
+         case 'n': op_str = " != "; break;
+         case '<': op_str = " < "; break;
+         case '>': op_str = " > "; break;
+         case 'L': op_str = " <= "; break;
+         case 'G': op_str = " >= "; break;
+         case '&': op_str = " & "; break;
+         case '|': op_str = " | "; break;
+         case '^': op_str = " ^ "; break;
+         default:
+            {
+               static char buf[8];
+               snprintf(buf, sizeof(buf), " %c ", op);
+               op_str = buf;
+            }
+            break;
+         }
+         ss << "(" << lhs << op_str << rhs << ")";
+      }
+      break;
+
+   case IVL_EX_UNARY:
+      {
+         string operand = analog_expr_to_str(ivl_expr_oper1(expr));
+         char op = ivl_expr_opcode(expr);
+         switch (op) {
+         case '-': ss << "-" << operand; break;
+         case '!': ss << "!" << operand; break;
+         case '~': ss << "~" << operand; break;
+         default:  ss << (char)op << operand; break;
+         }
+      }
+      break;
+
+   case IVL_EX_SIGNAL:
+      ss << ivl_signal_basename(ivl_expr_signal(expr));
+      break;
+
+   case IVL_EX_NUMBER:
+      ss << ivl_expr_uvalue(expr);
+      break;
+
+   case IVL_EX_REALNUM:
+      {
+         double val = ivl_expr_dvalue(expr);
+         // Use enough precision to avoid loss
+         ss << std::setprecision(15) << val;
+      }
+      break;
+
+   case IVL_EX_SFUNC:
+      {
+         const char *fname = ivl_expr_name(expr);
+         // Strip '$' prefix for Verilog-A analog operators
+         // ($ddt -> ddt, $idt -> idt, etc.)
+         if (fname[0] == '$') fname++;
+         ss << fname << "(";
+         unsigned nargs = ivl_expr_parms(expr);
+         for (unsigned i = 0; i < nargs; i++) {
+            if (i > 0) ss << ", ";
+            ss << analog_expr_to_str(ivl_expr_parm(expr, i));
+         }
+         ss << ")";
+      }
+      break;
+
+   case IVL_EX_TERNARY:
+      {
+         string cond = analog_expr_to_str(ivl_expr_oper1(expr));
+         string tv = analog_expr_to_str(ivl_expr_oper2(expr));
+         string fv = analog_expr_to_str(ivl_expr_oper3(expr));
+         ss << "(" << cond << " ? " << tv << " : " << fv << ")";
+      }
+      break;
+
+   default:
+      ss << "/* unsupported expr type " << ivl_expr_type(expr) << " */";
+      break;
+   }
+
+   return ss.str();
+}
+
+/*
+ * Recursively unparse an iverilog statement back to Verilog-A text.
+ */
+string analog_stmt_to_str(ivl_statement_t stmt)
+{
+   if (!stmt) return "";
+
+   ostringstream ss;
+
+   switch (ivl_statement_type(stmt)) {
+   case IVL_ST_CONTRIB:
+      {
+         string lval = analog_expr_to_str(ivl_stmt_lexp(stmt));
+         string rval = analog_expr_to_str(ivl_stmt_rval(stmt));
+         ss << lval << " <+ " << rval << ";";
+      }
+      break;
+
+   case IVL_ST_BLOCK:
+      {
+         unsigned count = ivl_stmt_block_count(stmt);
+         for (unsigned i = 0; i < count; i++) {
+            if (i > 0) ss << " ";
+            ss << analog_stmt_to_str(ivl_stmt_block_stmt(stmt, i));
+         }
+      }
+      break;
+
+   case IVL_ST_CONDIT:
+      {
+         string cond = analog_expr_to_str(ivl_stmt_cond_expr(stmt));
+         ss << "if (" << cond << ") begin ";
+         ivl_statement_t t = ivl_stmt_cond_true(stmt);
+         if (t) ss << analog_stmt_to_str(t);
+         ss << " end";
+         ivl_statement_t f = ivl_stmt_cond_false(stmt);
+         if (f) {
+            ss << " else begin " << analog_stmt_to_str(f) << " end";
+         }
+      }
+      break;
+
+   case IVL_ST_NOOP:
+      break;
+
+   default:
+      ss << "/* unsupported stmt type " << ivl_statement_type(stmt) << " */";
+      break;
+   }
+
+   return ss.str();
 }
 
 /*

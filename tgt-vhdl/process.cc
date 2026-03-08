@@ -25,6 +25,7 @@
 #include <iostream>
 #include <cassert>
 #include <sstream>
+#include <algorithm>
 
 /*
  * Check to see if the process should have a name.
@@ -101,6 +102,46 @@ static int generate_vhdl_process(vhdl_entity *ent, ivl_process_t proc)
    return 0;
 }
 
+/*
+ * Escape a string for use inside a VHDL string literal.
+ * Doubles any embedded quote characters.
+ */
+static std::string vhdl_escape_string(const std::string &s)
+{
+   std::string result;
+   result.reserve(s.size());
+   for (size_t i = 0; i < s.size(); i++) {
+      result += s[i];
+      if (s[i] == '"')
+         result += '"';
+   }
+   return result;
+}
+
+/*
+ * Generate a concurrent sv_analog() procedure call for an
+ * analog process. The analog block body is reconstructed as
+ * a Verilog-A string and passed as a string argument.
+ */
+static int generate_analog_call(vhdl_entity *ent, ivl_process_t proc)
+{
+   ivl_statement_t stmt = ivl_process_stmt(proc);
+   std::string body = analog_stmt_to_str(stmt);
+   std::string escaped = vhdl_escape_string(body);
+
+   vhdl_conc_pcall_stmt *pcall = new vhdl_conc_pcall_stmt("sv_analog");
+   pcall->add_expr(new vhdl_const_string(escaped));
+
+   // Add source location comment
+   std::ostringstream ss;
+   ss << "Analog block from " << ivl_process_file(proc) << ":"
+      << ivl_process_lineno(proc);
+   pcall->set_comment(ss.str());
+
+   ent->get_arch()->add_stmt(pcall);
+   return 0;
+}
+
 extern "C" int draw_process(ivl_process_t proc, void *)
 {
    ivl_scope_t scope = ivl_process_scope(proc);
@@ -123,6 +164,13 @@ extern "C" int draw_process(ivl_process_t proc, void *)
    assert(ivl_scope_type(scope) == IVL_SCT_MODULE);
    vhdl_entity *ent = find_entity(scope);
    assert(ent != NULL);
+
+   // Analog processes become concurrent sv_analog() calls
+   if (ivl_process_analog(proc)) {
+      if (!get_sv2vhdl_mode())
+         return 0;  // Skip analog outside sv2vhdl mode
+      return generate_analog_call(ent, proc);
+   }
 
    return generate_vhdl_process(ent, proc);
 }

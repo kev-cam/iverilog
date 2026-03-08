@@ -24,6 +24,7 @@
 #include <inttypes.h>
 #include <set>
 #include <cassert>
+#include <map>
 #include "vhdl_element.hh"
 #include "vhdl_type.hh"
 
@@ -291,6 +292,20 @@ public:
 };
 
 typedef std::list<vhdl_conc_stmt*> conc_stmt_list_t;
+
+/*
+ * A concurrent procedure call statement (e.g. sv_analog("...")).
+ */
+class vhdl_conc_pcall_stmt : public vhdl_conc_stmt {
+public:
+   explicit vhdl_conc_pcall_stmt(const char *name) : name_(name) {}
+
+   void emit(std::ostream &of, int level) const;
+   void add_expr(vhdl_expr *e) { exprs_.add_expr(e); }
+private:
+   std::string name_;
+   vhdl_expr_list exprs_;
+};
 
 /*
  * A '<value> when <cond>' clause that appears in several
@@ -905,6 +920,13 @@ private:
 /*
  * An architecture which implements an entity.
  */
+/*
+ * Attribute specification for signals/ports in architecture.
+ */
+struct vhdl_attr_spec_t {
+   std::string attr_name, entity_name, entity_class, value;
+};
+
 class vhdl_arch : public vhdl_element {
 public:
    vhdl_arch(const std::string& entity, const std::string& name)
@@ -915,10 +937,13 @@ public:
    void add_stmt(vhdl_process *proc);
    void add_stmt(vhdl_conc_stmt *stmt);
    vhdl_scope *get_scope() { return &scope_; }
+   void add_attribute_spec(const std::string& attr, const std::string& entity,
+                           const std::string& cls, const std::string& val);
 private:
    conc_stmt_list_t stmts_;
    vhdl_scope scope_;
    std::string name_, entity_;
+   std::list<vhdl_attr_spec_t> attr_specs_;
 };
 
 /*
