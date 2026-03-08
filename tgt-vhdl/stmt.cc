@@ -122,6 +122,58 @@ static int draw_stask_display(vhdl_procedural *proc,
                   cerr << "Warning: no VHDL translation for %m format code"
                        << endl;
                   break;
+               case 'h': case 'H': case 'x': case 'X':
+               case 'b': case 'B':
+               case 'o': case 'O':
+                  {
+                     assert(i < count);
+                     ivl_expr_t netp = ivl_stmt_parm(stmt, i++);
+                     assert(netp);
+
+                     vhdl_expr *base = translate_expr(netp);
+                     if (NULL == base)
+                        return 1;
+
+                     emit_wait_for_0(proc, container, stmt, base);
+
+                     // Pick the sv_display_pkg function for this format
+                     const char *func;
+                     switch (*p) {
+                     case 'h': case 'H': case 'x': case 'X':
+                        func = "sv_hstr"; break;
+                     case 'b': case 'B':
+                        func = "sv_bstr"; break;
+                     default:
+                        func = "sv_ostr"; break;
+                     }
+
+                     // Wrap in std_logic_vector() if needed
+                     if (base->get_type()) {
+                        vhdl_type_name_t tn = base->get_type()->get_name();
+                        if ((tn == VHDL_TYPE_UNSIGNED || tn == VHDL_TYPE_SIGNED)
+                            && !base->constant()) {
+                           vhdl_fcall *conv = new vhdl_fcall("std_logic_vector",
+                              vhdl_type::std_logic_vector(
+                                 base->get_type()->get_msb(),
+                                 base->get_type()->get_lsb()));
+                           conv->add_expr(base);
+                           base = conv;
+                        } else if (tn == VHDL_TYPE_STD_LOGIC_VECTOR
+                                   && !base->constant()) {
+                           // Already std_logic_vector: use directly
+                        } else {
+                           // Integer, single-bit, constant, etc.: fall back
+                           text->add_expr(base->cast(text->get_type()));
+                           break;
+                        }
+                     }
+
+                     vhdl_fcall *f = new vhdl_fcall(func,
+                                                    vhdl_type::string());
+                     f->add_expr(base);
+                     text->add_expr(f);
+                  }
+                  break;
                default:
                   {
                      assert(i < count);
