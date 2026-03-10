@@ -123,11 +123,36 @@ static std::string vhdl_escape_string(const std::string &s)
  * analog process. The analog block body is reconstructed as
  * a Verilog-A string and passed as a string argument.
  */
-static int generate_analog_call(vhdl_entity *ent, ivl_process_t proc)
+static int generate_analog_call(vhdl_entity *ent, ivl_process_t proc,
+                                ivl_scope_t scope)
 {
+   // Build metadata prefix: MODULE:<name>|PORT:<name>:<dir>:<disc>|...||<body>
+   std::ostringstream meta;
+   meta << "MODULE:" << ivl_scope_tname(scope);
+
+   unsigned nsigs = ivl_scope_sigs(scope);
+   for (unsigned i = 0; i < nsigs; i++) {
+      ivl_signal_t sig = ivl_scope_sig(scope, i);
+      ivl_signal_port_t pt = ivl_signal_port(sig);
+      if (pt == IVL_SIP_NONE) continue;
+
+      const char *dir = (pt == IVL_SIP_INPUT) ? "input"
+                      : (pt == IVL_SIP_OUTPUT) ? "output" : "inout";
+      const char *disc = "";
+      ivl_discipline_t d = ivl_signal_discipline(sig);
+      if (d) disc = ivl_discipline_name(d);
+
+      meta << "|PORT:" << ivl_signal_basename(sig) << ":" << dir << ":" << disc;
+   }
+   meta << "||";
+
+   // Build body from analog statement
    ivl_statement_t stmt = ivl_process_stmt(proc);
    std::string body = analog_stmt_to_str(stmt);
-   std::string escaped = vhdl_escape_string(body);
+
+   // Combine metadata + body, escape for VHDL string
+   std::string full = meta.str() + body;
+   std::string escaped = vhdl_escape_string(full);
 
    vhdl_conc_pcall_stmt *pcall = new vhdl_conc_pcall_stmt("sv_analog");
    pcall->add_expr(new vhdl_const_string(escaped));
@@ -169,7 +194,7 @@ extern "C" int draw_process(ivl_process_t proc, void *)
    if (ivl_process_analog(proc)) {
       if (!get_sv2vhdl_mode())
          return 0;  // Skip analog outside sv2vhdl mode
-      return generate_analog_call(ent, proc);
+      return generate_analog_call(ent, proc, scope);
    }
 
    return generate_vhdl_process(ent, proc);
