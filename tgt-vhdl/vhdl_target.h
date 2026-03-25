@@ -19,9 +19,14 @@ int draw_stmt(vhdl_procedural *proc, stmt_container *container,
               ivl_statement_t stmt, bool is_last = false);
 int draw_lpm(vhdl_arch *arch, ivl_lpm_t lpm);
 void draw_logic(vhdl_arch *arch, ivl_net_logic_t log);
+void draw_switches(vhdl_arch *arch, ivl_scope_t scope);
 
 vhdl_expr *translate_expr(ivl_expr_t e);
 vhdl_expr *translate_time_expr(ivl_expr_t e);
+
+std::string nexus_to_signal_basename(ivl_nexus_t nex);
+std::string analog_expr_to_str(ivl_expr_t expr);
+std::string analog_stmt_to_str(ivl_statement_t stmt);
 
 ivl_design_t get_vhdl_design();
 vhdl_var_ref *nexus_to_var_ref(vhdl_scope *arch_scope, ivl_nexus_t nexus);

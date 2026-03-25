@@ -24,6 +24,7 @@
 #include <inttypes.h>
 #include <set>
 #include <cassert>
+#include <map>
 #include "vhdl_element.hh"
 #include "vhdl_type.hh"
 
@@ -291,6 +292,20 @@ public:
 };
 
 typedef std::list<vhdl_conc_stmt*> conc_stmt_list_t;
+
+/*
+ * A concurrent procedure call statement (e.g. sv_analog("...")).
+ */
+class vhdl_conc_pcall_stmt : public vhdl_conc_stmt {
+public:
+   explicit vhdl_conc_pcall_stmt(const char *name) : name_(name) {}
+
+   void emit(std::ostream &of, int level) const;
+   void add_expr(vhdl_expr *e) { exprs_.add_expr(e); }
+private:
+   std::string name_;
+   vhdl_expr_list exprs_;
+};
 
 /*
  * A '<value> when <cond>' clause that appears in several
@@ -762,6 +777,37 @@ private:
    port_map_list_t mapping_;
 };
 
+/*
+ * A generic map entry (name => value).
+ */
+struct generic_map_t {
+   std::string name;
+   vhdl_expr *expr;
+};
+
+typedef std::list<generic_map_t> generic_map_list_t;
+
+/*
+ * Direct entity instantiation (VHDL-93).
+ * Emits: label: entity lib.entity(arch)
+ *           generic map (...) port map (...);
+ */
+class vhdl_entity_inst : public vhdl_conc_stmt {
+public:
+   vhdl_entity_inst(const char *inst_name, const char *lib_name,
+                    const char *entity_name, const char *arch_name = NULL);
+
+   void emit(std::ostream &of, int level) const;
+   void map_port(const std::string& name, vhdl_expr *expr);
+   void map_generic(const std::string& name, vhdl_expr *expr);
+
+   const std::string &get_inst_name() const { return inst_name_; }
+private:
+   std::string inst_name_, lib_name_, entity_name_, arch_name_;
+   port_map_list_t mapping_;
+   generic_map_list_t generics_;
+};
+
 
 /*
  * Contains a list of declarations in a hierarchy.
@@ -874,6 +920,13 @@ private:
 /*
  * An architecture which implements an entity.
  */
+/*
+ * Attribute specification for signals/ports in architecture.
+ */
+struct vhdl_attr_spec_t {
+   std::string attr_name, entity_name, entity_class, value;
+};
+
 class vhdl_arch : public vhdl_element {
 public:
    vhdl_arch(const std::string& entity, const std::string& name)
@@ -884,10 +937,13 @@ public:
    void add_stmt(vhdl_process *proc);
    void add_stmt(vhdl_conc_stmt *stmt);
    vhdl_scope *get_scope() { return &scope_; }
+   void add_attribute_spec(const std::string& attr, const std::string& entity,
+                           const std::string& cls, const std::string& val);
 private:
    conc_stmt_list_t stmts_;
    vhdl_scope scope_;
    std::string name_, entity_;
+   std::list<vhdl_attr_spec_t> attr_specs_;
 };
 
 /*

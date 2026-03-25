@@ -20,6 +20,7 @@
 
 #include "vhdl_syntax.hh"
 #include "vhdl_helper.hh"
+#include "state.hh"
 
 #include <cassert>
 #include <cstring>
@@ -135,6 +136,11 @@ void vhdl_entity::emit(std::ostream &of, int level) const
    of << "library ieee;" << std::endl;
    of << "use ieee.std_logic_1164.all;" << std::endl;
    of << "use ieee.numeric_std.all;" << std::endl;
+   if (get_sv2vhdl_mode()) {
+      of << "library sv2vhdl;" << std::endl;
+      of << "use sv2vhdl.sv_display_pkg.all;" << std::endl;
+      of << "use sv2vhdl.sv_analog_pkg.all;" << std::endl;
+   }
    of << std::endl;
 
    emit_comment(of, level);
@@ -180,6 +186,24 @@ vhdl_arch::~vhdl_arch()
 
 }
 
+void vhdl_conc_pcall_stmt::emit(std::ostream &of, int level) const
+{
+   emit_comment(of, level);
+   of << name_;
+   if (!exprs_.empty())
+      exprs_.emit(of, level);
+   of << ";";
+}
+
+void vhdl_arch::add_attribute_spec(const std::string& attr,
+                                    const std::string& entity,
+                                    const std::string& cls,
+                                    const std::string& val)
+{
+   vhdl_attr_spec_t spec = { attr, entity, cls, val };
+   attr_specs_.push_back(spec);
+}
+
 void vhdl_arch::add_stmt(vhdl_process *proc)
 {
    proc->get_scope()->set_parent(&scope_);
@@ -197,6 +221,29 @@ void vhdl_arch::emit(std::ostream &of, int level) const
    of << "architecture " << name_ << " of " << entity_;
    of << " is";
    emit_children<vhdl_decl>(of, scope_.get_decls(), level);
+
+   // Emit attribute declarations and specifications
+   if (!attr_specs_.empty()) {
+      // Collect unique attribute names
+      std::set<std::string> seen_attrs;
+      for (std::list<vhdl_attr_spec_t>::const_iterator it = attr_specs_.begin();
+           it != attr_specs_.end(); ++it) {
+         if (seen_attrs.find(it->attr_name) == seen_attrs.end()) {
+            seen_attrs.insert(it->attr_name);
+            newline(of, indent(level));
+            of << "attribute " << it->attr_name << " : string;";
+         }
+      }
+      // Emit all specs
+      for (std::list<vhdl_attr_spec_t>::const_iterator it = attr_specs_.begin();
+           it != attr_specs_.end(); ++it) {
+         newline(of, indent(level));
+         of << "attribute " << it->attr_name << " of " << it->entity_name
+            << " : " << it->entity_class << " is \"" << it->value << "\";";
+      }
+      newline(of, level);
+   }
+
    of << "begin";
    emit_children<vhdl_conc_stmt>(of, stmts_, level);
    of << "end architecture;";
@@ -316,6 +363,71 @@ void vhdl_comp_inst::emit(std::ostream &of, int level) const
 
    // If there are no ports or generics we don't need to mention them...
    if (! mapping_.empty()) {
+      newline(of, indent(level));
+      of << "port map (";
+
+      int sz = mapping_.size();
+      port_map_list_t::const_iterator it;
+      for (it = mapping_.begin(); it != mapping_.end(); ++it) {
+         newline(of, indent(indent(level)));
+         of << (*it).name << " => ";
+         (*it).expr->emit(of, level);
+         if (--sz > 0)
+            of << ",";
+      }
+      newline(of, indent(level));
+      of << ")";
+   }
+
+   of << ";";
+}
+
+vhdl_entity_inst::vhdl_entity_inst(const char *inst_name, const char *lib_name,
+                                   const char *entity_name, const char *arch_name)
+   : inst_name_(inst_name), lib_name_(lib_name),
+     entity_name_(entity_name), arch_name_(arch_name ? arch_name : "")
+{
+
+}
+
+void vhdl_entity_inst::map_port(const string& name, vhdl_expr *expr)
+{
+   port_map_t pmap = { name, expr };
+   mapping_.push_back(pmap);
+}
+
+void vhdl_entity_inst::map_generic(const string& name, vhdl_expr *expr)
+{
+   generic_map_t gmap = { name, expr };
+   generics_.push_back(gmap);
+}
+
+void vhdl_entity_inst::emit(std::ostream &of, int level) const
+{
+   newline(of, level);
+   emit_comment(of, level);
+   of << inst_name_ << ": entity " << lib_name_ << "." << entity_name_;
+   if (!arch_name_.empty())
+      of << "(" << arch_name_ << ")";
+
+   if (!generics_.empty()) {
+      newline(of, indent(level));
+      of << "generic map (";
+
+      int sz = generics_.size();
+      generic_map_list_t::const_iterator it;
+      for (it = generics_.begin(); it != generics_.end(); ++it) {
+         newline(of, indent(indent(level)));
+         of << (*it).name << " => ";
+         (*it).expr->emit(of, level);
+         if (--sz > 0)
+            of << ",";
+      }
+      newline(of, indent(level));
+      of << ")";
+   }
+
+   if (!mapping_.empty()) {
       newline(of, indent(level));
       of << "port map (";
 

@@ -52,4 +52,8 @@ void set_active_entity(vhdl_entity *ent);
 bool is_default_scope_instance(ivl_scope_t s);
 bool seen_this_scope_type(ivl_scope_t s);
 
+// sv2vhdl mode flag
+void set_sv2vhdl_mode(bool mode);
+bool get_sv2vhdl_mode();
+
 #endif  // #ifndef INC_VHDL_STATE_HH

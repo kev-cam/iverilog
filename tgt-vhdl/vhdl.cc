@@ -103,6 +103,9 @@ extern "C" int target_design(ivl_design_t des)
 
    g_design = des;
 
+   // Check for sv2vhdl mode flag
+   set_sv2vhdl_mode(std::strcmp(ivl_design_flag(des, "sv2vhdl"), "") != 0);
+
    for (unsigned int i = 0; i < nroots; i++)
       draw_scope(roots[i], NULL);
 

@@ -23,10 +23,62 @@
 #include "state.hh"
 
 #include <cassert>
+#include <cstring>
 #include <sstream>
 #include <iostream>
 
 using namespace std;
+
+static const char *drive_names[] = {
+   "highz", "small", "medium", "weak", "large", "pull", "strong", "supply"
+};
+
+static bool is_sv2vhdl_mode()
+{
+   return get_sv2vhdl_mode();
+}
+
+// Forward declaration
+static void default_logic(vhdl_arch *arch, ivl_net_logic_t log);
+
+/*
+ * Build a safe VHDL instance name from a base name and prefix.
+ */
+static string make_inst_name(const char *basename, const char *prefix)
+{
+   ostringstream ss;
+   ss << prefix << "_" << basename;
+   string name = ss.str();
+   // Replace characters not valid in VHDL identifiers
+   for (size_t i = 0; i < name.size(); i++) {
+      char c = name[i];
+      if (!isalnum(c) && c != '_')
+         name[i] = '_';
+   }
+   if (name[0] == '_') name = "inst" + name;
+   if (*name.rbegin() == '_') name += "inst";
+   // Can't have two consecutive underscores
+   size_t pos = name.find("__");
+   while (pos != string::npos) {
+      name.replace(pos, 2, "_");
+      pos = name.find("__");
+   }
+   return name;
+}
+
+/*
+ * Add a strength comment to a statement if drive values are non-standard.
+ */
+static void add_strength_comment(vhdl_element *stmt, ivl_net_logic_t log)
+{
+   ivl_drive_t d1 = ivl_logic_drive1(log);
+   ivl_drive_t d0 = ivl_logic_drive0(log);
+   if (d0 != IVL_DR_STRONG || d1 != IVL_DR_STRONG) {
+      ostringstream ss;
+      ss << "sv_strength: " << drive_names[d1] << "1 " << drive_names[d0] << "0";
+      stmt->set_comment(ss.str());
+   }
+}
 
 /*
  * Convert the inputs of a logic gate to a binary expression.
@@ -262,32 +314,332 @@ static vhdl_expr *translate_logic_inputs(vhdl_scope *scope, ivl_net_logic_t log)
    }
 }
 
+/*
+ * Emit a sv2vhdl entity instantiation for MOS, tristate, and pull gates.
+ * These have fixed port names matching the sv2vhdl library.
+ */
+static void sv_prim_logic(vhdl_arch *arch, ivl_net_logic_t log)
+{
+   const char *entity_name = NULL;
+   bool has_pgate = false;  // CMOS has ngate + pgate
+
+   switch (ivl_logic_type(log)) {
+   case IVL_LO_NMOS:     entity_name = "sv_nmos";     break;
+   case IVL_LO_PMOS:     entity_name = "sv_pmos";     break;
+   case IVL_LO_RNMOS:    entity_name = "sv_rnmos";    break;
+   case IVL_LO_RPMOS:    entity_name = "sv_rpmos";    break;
+   case IVL_LO_CMOS:     entity_name = "sv_cmos";     has_pgate = true; break;
+   case IVL_LO_RCMOS:    entity_name = "sv_rcmos";    has_pgate = true; break;
+   case IVL_LO_BUFIF0:   entity_name = "sv_bufif0";   break;
+   case IVL_LO_BUFIF1:   entity_name = "sv_bufif1";   break;
+   case IVL_LO_NOTIF0:   entity_name = "sv_notif0";   break;
+   case IVL_LO_NOTIF1:   entity_name = "sv_notif1";   break;
+   case IVL_LO_PULLUP:   entity_name = "sv_pullup";   break;
+   case IVL_LO_PULLDOWN: entity_name = "sv_pulldown";  break;
+   default:
+      error("Unsupported logic type %d for sv_prim_logic", ivl_logic_type(log));
+      return;
+   }
+
+   string inst_name = make_inst_name(ivl_logic_basename(log), entity_name);
+
+   vhdl_entity_inst *inst = new vhdl_entity_inst(
+      inst_name.c_str(), "sv2vhdl", entity_name, "behavioral");
+
+   vhdl_scope *scope = arch->get_scope();
+
+   // Pin 0 is always output (y)
+   inst->map_port("y", nexus_to_var_ref(scope, ivl_logic_pin(log, 0)));
+
+   if (ivl_logic_type(log) == IVL_LO_PULLUP
+       || ivl_logic_type(log) == IVL_LO_PULLDOWN) {
+      // Pull gates: only output port
+   }
+   else if (has_pgate) {
+      // CMOS: pin1=data, pin2=ngate, pin3=pgate
+      inst->map_port("data", readable_ref(scope, ivl_logic_pin(log, 1)));
+      inst->map_port("ngate", readable_ref(scope, ivl_logic_pin(log, 2)));
+      inst->map_port("pgate", readable_ref(scope, ivl_logic_pin(log, 3)));
+   }
+   else {
+      // MOS/tristate: pin1=data, pin2=gate or ctrl
+      const char *pin2_name;
+      switch (ivl_logic_type(log)) {
+      case IVL_LO_BUFIF0: case IVL_LO_BUFIF1:
+      case IVL_LO_NOTIF0: case IVL_LO_NOTIF1:
+         pin2_name = "ctrl";
+         break;
+      default:
+         pin2_name = "gate";
+         break;
+      }
+      inst->map_port("data", readable_ref(scope, ivl_logic_pin(log, 1)));
+      inst->map_port(pin2_name, readable_ref(scope, ivl_logic_pin(log, 2)));
+   }
+
+   add_strength_comment(inst, log);
+   arch->add_stmt(inst);
+}
+
+/*
+ * Emit a sv2vhdl entity instantiation for multi-input gates
+ * (AND, NAND, OR, NOR, XOR, XNOR) with generic map for input count.
+ */
+static void sv_multi_input_logic(vhdl_arch *arch, ivl_net_logic_t log)
+{
+   const char *entity_name = NULL;
+   switch (ivl_logic_type(log)) {
+   case IVL_LO_AND:  entity_name = "sv_and";  break;
+   case IVL_LO_NAND: entity_name = "sv_nand"; break;
+   case IVL_LO_OR:   entity_name = "sv_or";   break;
+   case IVL_LO_NOR:  entity_name = "sv_nor";  break;
+   case IVL_LO_XOR:  entity_name = "sv_xor";  break;
+   case IVL_LO_XNOR: entity_name = "sv_xnor"; break;
+   default: assert(false);
+   }
+
+   vhdl_scope *scope = arch->get_scope();
+   int npins = ivl_logic_pins(log);
+   int ninputs = npins - 1;
+
+   string inst_name = make_inst_name(ivl_logic_basename(log), entity_name);
+   vhdl_entity_inst *inst = new vhdl_entity_inst(
+      inst_name.c_str(), "sv2vhdl", entity_name, "behavioral");
+
+   inst->map_generic("n", new vhdl_const_int(ninputs));
+
+   // Output: y (pin 0)
+   inst->map_port("y", nexus_to_var_ref(scope, ivl_logic_pin(log, 0)));
+
+   // Input: a => concatenation of all input pins
+   if (ninputs == 1) {
+      // Single input: cast to std_logic_vector(0 to 0) via concatenation
+      vhdl_binop_expr *concat =
+         new vhdl_binop_expr(VHDL_BINOP_CONCAT, NULL);
+      concat->add_expr(readable_ref(scope, ivl_logic_pin(log, 1)));
+      inst->map_port("a", concat);
+   }
+   else {
+      vhdl_binop_expr *concat =
+         new vhdl_binop_expr(VHDL_BINOP_CONCAT, NULL);
+      for (int i = 1; i < npins; i++)
+         concat->add_expr(readable_ref(scope, ivl_logic_pin(log, i)));
+      inst->map_port("a", concat);
+   }
+
+   add_strength_comment(inst, log);
+   arch->add_stmt(inst);
+}
+
+/*
+ * Emit a sv2vhdl entity instantiation for BUF/NOT.
+ * These have a single input and potentially multiple outputs.
+ */
+static void sv_buf_not_logic(vhdl_arch *arch, ivl_net_logic_t log)
+{
+   vhdl_scope *scope = arch->get_scope();
+   int npins = ivl_logic_pins(log);
+   // For BUF/NOT: pin 0..npins-2 are outputs, pin npins-1 is input
+   int noutputs = npins - 1;
+
+   // For single-output BUF/NOT, use inline assignment (avoids vector port mismatch)
+   if (noutputs == 1) {
+      default_logic(arch, log);
+      return;
+   }
+
+   // Multi-output: use entity instantiation with temp vector signal
+   const char *entity_name = (ivl_logic_type(log) == IVL_LO_NOT)
+      ? "sv_not" : "sv_buf";
+
+   string inst_name = make_inst_name(ivl_logic_basename(log), entity_name);
+
+   // Create a temporary std_logic_vector signal for the output
+   string tmp_name = inst_name + "_y";
+   vhdl_type *vec_type = vhdl_type::std_logic_vector(0, noutputs - 1);
+   scope->add_decl(new vhdl_signal_decl(tmp_name.c_str(), vec_type));
+
+   vhdl_entity_inst *inst = new vhdl_entity_inst(
+      inst_name.c_str(), "sv2vhdl", entity_name, "behavioral");
+
+   inst->map_generic("n", new vhdl_const_int(noutputs));
+
+   // Input: a (last pin)
+   inst->map_port("a", readable_ref(scope, ivl_logic_pin(log, npins - 1)));
+
+   // Output: y (temp vector)
+   inst->map_port("y", new vhdl_var_ref(tmp_name.c_str(), vec_type));
+
+   add_strength_comment(inst, log);
+   arch->add_stmt(inst);
+
+   // Wire temp vector bits to individual output signals
+   for (int i = 0; i < noutputs; i++) {
+      vhdl_var_ref *lhs = nexus_to_var_ref(scope, ivl_logic_pin(log, i));
+      vhdl_var_ref *rhs = new vhdl_var_ref(tmp_name.c_str(), vhdl_type::std_logic());
+      rhs->set_slice(new vhdl_const_int(i), 0);
+      arch->add_stmt(new vhdl_cassign_stmt(lhs, rhs));
+   }
+}
+
+/*
+ * Emit a concurrent signal assignment with optional strength comment.
+ */
+static void default_logic(vhdl_arch *arch, ivl_net_logic_t log)
+{
+   ivl_nexus_t output = ivl_logic_pin(log, 0);
+   vhdl_var_ref *lhs = nexus_to_var_ref(arch->get_scope(), output);
+
+   vhdl_expr *rhs = translate_logic_inputs(arch->get_scope(), log);
+   vhdl_cassign_stmt *ass = new vhdl_cassign_stmt(lhs, rhs);
+
+   ivl_expr_t delay = ivl_logic_delay(log, 1);
+   if (delay)
+      ass->set_after(translate_time_expr(delay));
+
+   // Add strength comment for continuous assigns with non-standard strength
+   if (ivl_logic_is_cassign(log))
+      add_strength_comment(ass, log);
+
+   arch->add_stmt(ass);
+}
+
 void draw_logic(vhdl_arch *arch, ivl_net_logic_t log)
 {
+   bool sv2vhdl = is_sv2vhdl_mode();
+
    switch (ivl_logic_type(log)) {
+   // MOS gates: always use entity instantiation (had no support before)
+   case IVL_LO_NMOS:
+   case IVL_LO_PMOS:
+   case IVL_LO_RNMOS:
+   case IVL_LO_RPMOS:
+   case IVL_LO_CMOS:
+   case IVL_LO_RCMOS:
+      sv_prim_logic(arch, log);
+      break;
+
+   // NOTIF: always use entity instantiation (had no support before)
+   case IVL_LO_NOTIF0:
+   case IVL_LO_NOTIF1:
+      sv_prim_logic(arch, log);
+      break;
+
+   // Tristate buffers
    case IVL_LO_BUFIF0:
-      bufif_logic(arch, log, true);
+      if (sv2vhdl)
+         sv_prim_logic(arch, log);
+      else
+         bufif_logic(arch, log, true);
       break;
    case IVL_LO_BUFIF1:
-      bufif_logic(arch, log, false);
+      if (sv2vhdl)
+         sv_prim_logic(arch, log);
+      else
+         bufif_logic(arch, log, false);
       break;
+
+   // Pull gates
+   case IVL_LO_PULLUP:
+   case IVL_LO_PULLDOWN:
+      if (sv2vhdl)
+         sv_prim_logic(arch, log);
+      else
+         default_logic(arch, log);
+      break;
+
+   // Multi-input logic gates
+   case IVL_LO_AND:
+   case IVL_LO_NAND:
+   case IVL_LO_OR:
+   case IVL_LO_NOR:
+   case IVL_LO_XOR:
+   case IVL_LO_XNOR:
+      if (sv2vhdl)
+         sv_multi_input_logic(arch, log);
+      else
+         default_logic(arch, log);
+      break;
+
+   // BUF/NOT
+   case IVL_LO_BUF:
+   case IVL_LO_NOT:
+      if (sv2vhdl)
+         sv_buf_not_logic(arch, log);
+      else
+         default_logic(arch, log);
+      break;
+
+   // Transparent buffers / continuous assigns: always keep as signal assignment
+   case IVL_LO_BUFT:
+   case IVL_LO_BUFZ:
+      default_logic(arch, log);
+      break;
+
    case IVL_LO_UDP:
       udp_logic(arch, log);
       break;
+
    default:
-      {
-         // The output is always pin zero
-         ivl_nexus_t output = ivl_logic_pin(log, 0);
-         vhdl_var_ref *lhs = nexus_to_var_ref(arch->get_scope(), output);
-
-         vhdl_expr *rhs = translate_logic_inputs(arch->get_scope(), log);
-         vhdl_cassign_stmt *ass = new vhdl_cassign_stmt(lhs, rhs);
-
-         ivl_expr_t delay = ivl_logic_delay(log, 1);
-         if (delay)
-            ass->set_after(translate_time_expr(delay));
-
-         arch->add_stmt(ass);
-      }
+      error("Don't know how to translate logic type = %d",
+            ivl_logic_type(log));
    }
+}
+
+/*
+ * Emit a sv2vhdl entity instantiation for a single switch.
+ */
+static void draw_one_switch(vhdl_arch *arch, ivl_switch_t sw)
+{
+   const char *entity_name = NULL;
+   const char *arch_name = "strength";
+   bool has_enable = false;
+
+   switch (ivl_switch_type(sw)) {
+   case IVL_SW_TRAN:     entity_name = "sv_tran";     break;
+   case IVL_SW_TRANIF0:  entity_name = "sv_tranif0";  has_enable = true; break;
+   case IVL_SW_TRANIF1:  entity_name = "sv_tranif1";  has_enable = true; break;
+   case IVL_SW_RTRAN:    entity_name = "sv_rtran";    break;
+   case IVL_SW_RTRANIF0: entity_name = "sv_rtranif0"; has_enable = true; break;
+   case IVL_SW_RTRANIF1: entity_name = "sv_rtranif1"; has_enable = true; break;
+   case IVL_SW_TRAN_VP:
+      debug_msg("Skipping TRAN_VP switch %s (part-select tran not supported)",
+                ivl_switch_basename(sw));
+      return;
+   default:
+      error("Unknown switch type %d", ivl_switch_type(sw));
+      return;
+   }
+
+   string inst_name = make_inst_name(ivl_switch_basename(sw), entity_name);
+   vhdl_entity_inst *inst = new vhdl_entity_inst(
+      inst_name.c_str(), "sv2vhdl", entity_name, arch_name);
+
+   vhdl_scope *scope = arch->get_scope();
+
+   // Port A
+   inst->map_port("a", nexus_to_var_ref(scope, ivl_switch_a(sw)));
+
+   // Port B
+   inst->map_port("b", nexus_to_var_ref(scope, ivl_switch_b(sw)));
+
+   // Enable (ctrl) for conditional tran
+   if (has_enable) {
+      inst->map_port("ctrl", readable_ref(scope, ivl_switch_enable(sw)));
+   }
+
+   // Source location comment
+   ostringstream ss;
+   ss << "Generated from " << entity_name << " at "
+      << ivl_switch_file(sw) << ":" << ivl_switch_lineno(sw);
+   inst->set_comment(ss.str());
+
+   arch->add_stmt(inst);
+}
+
+void draw_switches(vhdl_arch *arch, ivl_scope_t scope)
+{
+   unsigned nswitches = ivl_scope_switches(scope);
+   for (unsigned i = 0; i < nswitches; i++)
+      draw_one_switch(arch, ivl_scope_switch(scope, i));
 }

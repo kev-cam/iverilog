@@ -178,7 +178,8 @@ static void sig_check_port_type(Design*des, const NetScope*scope,
       }
 
       if (sig->port_type() == NetNet::PINOUT &&
-	  sig->data_type() == IVL_VT_REAL) {
+	  sig->data_type() == IVL_VT_REAL &&
+	  sig->get_discipline() == 0) {
 	    cerr << wire->get_fileline() << ": error: Port `"
 		 << wire->basename() << "` of module `"
 		 << scope->module_name()

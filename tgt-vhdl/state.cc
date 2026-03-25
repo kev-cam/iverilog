@@ -75,6 +75,7 @@ typedef std::map<ivl_signal_t, signal_defn_t> signal_defn_map_t;
 static signal_defn_map_t g_known_signals;
 
 static vhdl_entity *g_active_entity = NULL;
+static bool g_sv2vhdl_mode = false;
 
 // Set of scopes that are treated as the default examples of
 // that type. Any other scopes of the same type are ignored.
@@ -240,6 +241,16 @@ vhdl_entity *get_active_entity()
 void set_active_entity(vhdl_entity *ent)
 {
    g_active_entity = ent;
+}
+
+void set_sv2vhdl_mode(bool mode)
+{
+   g_sv2vhdl_mode = mode;
+}
+
+bool get_sv2vhdl_mode()
+{
+   return g_sv2vhdl_mode;
 }
 
 /*
