@@ -169,8 +169,28 @@ vhdl_expr *vhdl_expr::to_boolean()
       conv->add_expr(this);
       return conv;
    }
-   assert(false);
-   return NULL;
+   else if (type_->get_name() == VHDL_TYPE_BOOLEAN) {
+      // Already boolean — no conversion needed
+      return this;
+   }
+   else if (type_->get_name() == VHDL_TYPE_STD_LOGIC_VECTOR) {
+      // Compare against zero-length vector: vec /= (others => '0')
+      // Use or_reduce: '1' if any bit set
+      vhdl_const_string *zero = new vhdl_const_string("");
+      return new vhdl_binop_expr
+         (this, VHDL_BINOP_NEQ, zero, vhdl_type::boolean());
+   }
+   else if (type_->get_name() == VHDL_TYPE_INTEGER) {
+      // integer /= 0
+      vhdl_const_int *zero = new vhdl_const_int(0);
+      return new vhdl_binop_expr
+         (this, VHDL_BINOP_NEQ, zero, vhdl_type::boolean());
+   }
+   // Fallback: treat as std_logic comparison to '1'
+   fprintf(stderr, "ivl: to_boolean: unhandled type %d, using '1' comparison\n",
+           type_->get_name());
+   vhdl_const_bit *one = new vhdl_const_bit('1');
+   return new vhdl_binop_expr(this, VHDL_BINOP_EQ, one, vhdl_type::boolean());
 }
 
 /*
