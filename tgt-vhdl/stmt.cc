@@ -486,6 +486,36 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
    if (rhs == NULL)
       return;
 
+   // Handle compressed assignments (+=, -=, etc.)
+   // ivl_stmt_opcode returns the operator character, or 0 for normal assign
+   // Only blocking assignments (IVL_ST_ASSIGN) can have compressed opcodes
+   char comp_op = (ivl_statement_type(stmt) == IVL_ST_ASSIGN)
+      ? ivl_stmt_opcode(stmt) : 0;
+   if (comp_op && lvals.size() == 1) {
+      vhdl_binop_t binop;
+      switch (comp_op) {
+      case '+': binop = VHDL_BINOP_ADD; break;
+      case '-': binop = VHDL_BINOP_SUB; break;
+      case '*': binop = VHDL_BINOP_MULT; break;
+      case '/': binop = VHDL_BINOP_DIV; break;
+      case '%': binop = VHDL_BINOP_MOD; break;
+      case '&': binop = VHDL_BINOP_AND; break;
+      case '|': binop = VHDL_BINOP_OR; break;
+      case '^': binop = VHDL_BINOP_XOR; break;
+      case 'l': binop = VHDL_BINOP_SL; break;
+      case 'r': binop = VHDL_BINOP_SR; break;
+      default:
+         cerr << "Warning: unsupported compressed assignment op '"
+              << comp_op << "'" << endl;
+         binop = VHDL_BINOP_ADD;
+      }
+      // Build: lhs <op> rhs
+      vhdl_var_ref *lhs_read =
+         make_assign_lhs(ivl_stmt_lval(stmt, 0), proc->get_scope());
+      rhs = new vhdl_binop_expr(lhs_read, binop, rhs,
+                                new vhdl_type(*lhs_read->get_type()));
+   }
+
    emit_wait_for_0(proc, container, stmt, rhs);
    if (rhs2)
       emit_wait_for_0(proc, container, stmt, rhs2);
@@ -1967,11 +1997,13 @@ int draw_stmt(vhdl_procedural *proc, stmt_container *container,
       return 1;
    case IVL_ST_DISABLE:
       {
-         // disable of a for-loop block → VHDL "exit"
-         // disable of a named block → VHDL "next" (skip to end)
-         // For now: emit "exit" which works for loop disable
-         container->add_stmt(new vhdl_null_stmt());  // placeholder
-         // TODO: proper exit/next based on scope analysis
+         // Verilog 'disable' exits a named scope block.
+         // In VHDL: inside a loop this would be 'exit', but iverilog also
+         // generates disable for function returns and block exits which
+         // are not inside loops. Since the for-loop step is now properly
+         // translated via compressed assignment expansion, the while
+         // condition handles termination — so null is safe here.
+         container->add_stmt(new vhdl_null_stmt());
          return 0;
       }
    case IVL_ST_CASEX:

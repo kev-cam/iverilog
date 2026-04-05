@@ -467,6 +467,12 @@ public:
    void find_vars(vhdl_var_set_t&, vhdl_var_set_t&) {}
 };
 
+class vhdl_exit_stmt : public vhdl_seq_stmt {
+public:
+   void emit(std::ostream &of, int level) const;
+   void find_vars(vhdl_var_set_t&, vhdl_var_set_t&) {}
+};
+
 
 enum vhdl_severity_t {
    SEVERITY_NOTE,

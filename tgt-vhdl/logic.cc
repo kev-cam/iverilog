@@ -555,7 +555,7 @@ void draw_logic(vhdl_arch *arch, ivl_net_logic_t log)
    case IVL_LO_NOR:
    case IVL_LO_XOR:
    case IVL_LO_XNOR:
-      if (sv2vhdl)
+      if (sv2vhdl && ivl_logic_width(log) == 1)
          sv_multi_input_logic(arch, log);
       else
          default_logic(arch, log);

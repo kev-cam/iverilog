@@ -740,6 +740,12 @@ void vhdl_null_stmt::emit(std::ostream &of, int level) const
    emit_comment(of, level, true);
 }
 
+void vhdl_exit_stmt::emit(std::ostream &of, int level) const
+{
+   of << "exit;";
+   emit_comment(of, level, true);
+}
+
 void vhdl_fcall::find_vars(vhdl_var_set_t& read)
 {
    exprs_.find_vars(read);
