@@ -78,7 +78,8 @@ vhdl_expr *vhdl_expr::cast(const vhdl_type *to)
  */
 vhdl_expr *vhdl_expr::to_vector(vhdl_type_name_t name, int w)
 {
-   if (type_->get_name() == VHDL_TYPE_STD_LOGIC) {
+   if (type_->get_name() == VHDL_TYPE_STD_LOGIC
+       || type_->get_name() == VHDL_TYPE_STD_ULOGIC) {
       vhdl_expr *others = w == 1 ? NULL : new vhdl_const_bit('0');
       vhdl_bit_spec_expr *bs =
          new vhdl_bit_spec_expr(new vhdl_type(name, w - 1, 0), others);
@@ -107,7 +108,8 @@ vhdl_expr *vhdl_expr::to_vector(vhdl_type_name_t name, int w)
 vhdl_expr *vhdl_expr::to_integer()
 {
    vhdl_fcall *conv;
-   if (type_->get_name() == VHDL_TYPE_STD_LOGIC) {
+   if (type_->get_name() == VHDL_TYPE_STD_LOGIC
+       || type_->get_name() == VHDL_TYPE_STD_ULOGIC) {
       require_support_function(SF_LOGIC_TO_INTEGER);
       conv = new vhdl_fcall(support_function::function_name(SF_LOGIC_TO_INTEGER),
                             vhdl_type::integer());
@@ -144,7 +146,8 @@ vhdl_expr *vhdl_expr::to_string()
  */
 vhdl_expr *vhdl_expr::to_boolean()
 {
-   if (type_->get_name() == VHDL_TYPE_STD_LOGIC) {
+   if (type_->get_name() == VHDL_TYPE_STD_LOGIC
+       || type_->get_name() == VHDL_TYPE_STD_ULOGIC) {
       // '1' is true all else are false
       vhdl_const_bit *one = new vhdl_const_bit('1');
       return new vhdl_binop_expr
@@ -170,15 +173,8 @@ vhdl_expr *vhdl_expr::to_boolean()
       return conv;
    }
    else if (type_->get_name() == VHDL_TYPE_BOOLEAN) {
-      // Already boolean — no conversion needed
+      // Already boolean
       return this;
-   }
-   else if (type_->get_name() == VHDL_TYPE_STD_LOGIC_VECTOR) {
-      // Compare against zero-length vector: vec /= (others => '0')
-      // Use or_reduce: '1' if any bit set
-      vhdl_const_string *zero = new vhdl_const_string("");
-      return new vhdl_binop_expr
-         (this, VHDL_BINOP_NEQ, zero, vhdl_type::boolean());
    }
    else if (type_->get_name() == VHDL_TYPE_INTEGER) {
       // integer /= 0
@@ -186,11 +182,22 @@ vhdl_expr *vhdl_expr::to_boolean()
       return new vhdl_binop_expr
          (this, VHDL_BINOP_NEQ, zero, vhdl_type::boolean());
    }
-   // Fallback: treat as std_logic comparison to '1'
-   fprintf(stderr, "ivl: to_boolean: unhandled type %d, using '1' comparison\n",
-           type_->get_name());
-   vhdl_const_bit *one = new vhdl_const_bit('1');
-   return new vhdl_binop_expr(this, VHDL_BINOP_EQ, one, vhdl_type::boolean());
+   else if (type_->get_name() == VHDL_TYPE_STD_LOGIC_VECTOR) {
+      // Treat like unsigned: use support function
+      require_support_function(SF_UNSIGNED_TO_BOOLEAN);
+
+      vhdl_fcall *conv =
+         new vhdl_fcall(support_function::function_name(SF_UNSIGNED_TO_BOOLEAN),
+                        vhdl_type::boolean());
+      conv->add_expr(this->cast(vhdl_type::nunsigned(type_->get_width())));
+      return conv;
+   }
+   // Fallback: compare against zero (works for most numeric types)
+   cerr << "Warning: to_boolean() for unknown type "
+        << type_->get_string() << ", using /= 0" << endl;
+   vhdl_const_int *zero = new vhdl_const_int(0);
+   return new vhdl_binop_expr
+      (this, VHDL_BINOP_NEQ, zero, vhdl_type::boolean());
 }
 
 /*
@@ -228,20 +235,47 @@ vhdl_expr *vhdl_expr::to_std_logic()
 
       return ah;
    }
-   assert(false);
-   return NULL;
+   else if (type_->get_name() == VHDL_TYPE_STD_LOGIC
+            || type_->get_name() == VHDL_TYPE_STD_ULOGIC) {
+      // Already std_logic / std_ulogic (compatible)
+      return this;
+   }
+   else if (type_->get_name() == VHDL_TYPE_INTEGER) {
+      // integer -> std_logic: '1' if /= 0
+      vhdl_const_int *zero = new vhdl_const_int(0);
+      vhdl_expr *cmp = new vhdl_binop_expr
+         (this, VHDL_BINOP_NEQ, zero, vhdl_type::boolean());
+
+      require_support_function(SF_BOOLEAN_TO_LOGIC);
+      vhdl_fcall *conv =
+         new vhdl_fcall(support_function::function_name(SF_BOOLEAN_TO_LOGIC),
+                        vhdl_type::std_logic());
+      conv->add_expr(cmp);
+      return conv;
+   }
+   // Fallback: treat as unsigned and convert
+   cerr << "Warning: to_std_logic() for type " << type_->get_string()
+        << ", treating as unsigned" << endl;
+   return this->cast(vhdl_type::nunsigned(1))->to_std_logic();
 }
 
 vhdl_expr *vhdl_expr::to_std_ulogic()
 {
    if (type_->get_name() == VHDL_TYPE_STD_LOGIC) {
-      vhdl_fcall *f = new vhdl_fcall("std_logic", vhdl_type::std_logic());
-      f->add_expr(this);
-      return f;
+      // std_logic is compatible with std_ulogic — no conversion needed
+      return this;
    }
-   else
-      assert(false);
-   return NULL;
+   else if (type_->get_name() == VHDL_TYPE_BOOLEAN) {
+      // boolean -> std_ulogic via std_logic
+      return to_std_logic();
+   }
+   else if (type_->get_name() == VHDL_TYPE_UNSIGNED
+            || type_->get_name() == VHDL_TYPE_SIGNED) {
+      return to_std_logic();
+   }
+   // Fallback
+   cerr << "Warning: to_std_ulogic() for type " << type_->get_string() << endl;
+   return to_std_logic();
 }
 
 /*
@@ -255,7 +289,8 @@ vhdl_expr *vhdl_expr::resize(int newwidth)
       rtype = vhdl_type::nsigned(newwidth);
    else if (type_->get_name() == VHDL_TYPE_UNSIGNED)
       rtype = vhdl_type::nunsigned(newwidth);
-   else if (type_->get_name() == VHDL_TYPE_STD_LOGIC) {
+   else if (type_->get_name() == VHDL_TYPE_STD_LOGIC
+            || type_->get_name() == VHDL_TYPE_STD_ULOGIC) {
       // Pad it with zeros
       vhdl_expr* zeros = new vhdl_const_bits(string(newwidth - 1, '0').c_str(),
                                              newwidth - 1, false, true);

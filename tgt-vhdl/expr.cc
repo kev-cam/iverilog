@@ -197,6 +197,10 @@ static vhdl_expr *translate_unary(ivl_expr_t e)
       return translate_reduction(SF_REDUCE_XOR, false, operand);
    case 'X':   // XNOR
       return translate_reduction(SF_REDUCE_XNOR, false, operand);
+   case '2':   // Cast to bool (4-state -> 2-state)
+   case 'v':   // Cast to vec4
+      // In VHDL these are no-ops — just pass through the operand
+      return operand;
    default:
       error("No translation for unary opcode '%c'\n",
             ivl_expr_opcode(e));
@@ -620,8 +624,22 @@ static vhdl_expr *translate_concat(ivl_expr_t e)
    vhdl_binop_expr *concat = new vhdl_binop_expr(VHDL_BINOP_CONCAT, rtype);
 
    int nrepeat = ivl_expr_repeat(e);
-   while (nrepeat--)
-      translate_parms<vhdl_binop_expr>(concat, e);
+   while (nrepeat--) {
+      int nparams = ivl_expr_parms(e);
+      for (int i = 0; i < nparams; i++) {
+         vhdl_expr *param = translate_expr(ivl_expr_parm(e, i));
+         if (NULL == param)
+            return NULL;
+
+         // Concatenation elements must be std_logic compatible;
+         // cast boolean comparison results to std_logic
+         if (param->get_type()
+             && param->get_type()->get_name() == VHDL_TYPE_BOOLEAN) {
+            param = param->cast(vhdl_type::std_logic());
+         }
+         concat->add_expr(param);
+      }
+   }
 
    return concat;
 }

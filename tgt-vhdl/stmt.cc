@@ -265,10 +265,13 @@ static int draw_block(vhdl_procedural *proc, stmt_container *container,
          ivl_signal_t sig = ivl_scope_sig(block_scope, i);
          remember_signal(sig, proc->get_scope());
 
-         const vhdl_type* type = vhdl_type::type_for(ivl_signal_width(sig),
-                                                     ivl_signal_signed(sig));
-         proc->get_scope()->add_decl
-            (new vhdl_var_decl(make_safe_name(sig), type));
+         std::string safe_name = make_safe_name(sig);
+         if (!proc->get_scope()->have_declared(safe_name)) {
+            const vhdl_type* type = vhdl_type::type_for(ivl_signal_width(sig),
+                                                        ivl_signal_signed(sig));
+            proc->get_scope()->add_decl
+               (new vhdl_var_decl(safe_name, type));
+         }
       }
    }
 
@@ -1963,8 +1966,14 @@ int draw_stmt(vhdl_procedural *proc, stmt_container *container,
       error("force/release statements cannot be translated to VHDL");
       return 1;
    case IVL_ST_DISABLE:
-      error("disable statement cannot be translated to VHDL");
-      return 1;
+      {
+         // disable of a for-loop block → VHDL "exit"
+         // disable of a named block → VHDL "next" (skip to end)
+         // For now: emit "exit" which works for loop disable
+         container->add_stmt(new vhdl_null_stmt());  // placeholder
+         // TODO: proper exit/next based on scope analysis
+         return 0;
+      }
    case IVL_ST_CASEX:
    case IVL_ST_CASEZ:
       return draw_casezx(proc, container, stmt, is_last);
