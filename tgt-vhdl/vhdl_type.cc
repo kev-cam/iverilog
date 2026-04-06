@@ -84,7 +84,7 @@ std::string vhdl_type::get_string() const
    case VHDL_TYPE_STD_LOGIC:
       return std::string("std_logic");
    case VHDL_TYPE_STD_ULOGIC:
-      return std::string("std_ulogic");
+      return std::string("std_logic");  // Use resolved type to support multiple drivers
    case VHDL_TYPE_STD_LOGIC_VECTOR:
       return std::string("std_logic_vector");
    case VHDL_TYPE_STRING:
