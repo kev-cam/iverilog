@@ -219,7 +219,7 @@ void draw_nexus(ivl_nexus_t nexus)
       else if ((lpm = ivl_nexus_ptr_lpm(nexus_ptr))) {
          ivl_scope_t lpm_scope = ivl_lpm_scope(lpm);
          vhdl_entity *ent = find_entity(lpm_scope);
-         assert(ent);
+         if (!ent) continue;  // Skip LPMs in scopes without a VHDL entity (e.g. generate)
 
          vhdl_scope *vhdl_scope = ent->get_arch()->get_scope();
          if (visible_nexus(priv, vhdl_scope)) {
@@ -1222,13 +1222,13 @@ extern "C" int draw_hierarchy(ivl_scope_t scope, void *_parent)
                     // don't generate for the child
 
       vhdl_entity *ent = find_entity(scope);
-      assert(ent);
+      if (!ent) return 0;  // No VHDL entity for this scope (e.g. generate block)
 
       vhdl_entity *parent_ent = find_entity(parent);
-      assert(parent_ent);
+      if (!parent_ent) return 0;  // No VHDL entity for parent scope
 
       vhdl_arch *parent_arch = parent_ent->get_arch();
-      assert(parent_arch != NULL);
+      if (!parent_arch) return 0;
 
       // Create a forward declaration for it
       const vhdl_scope *parent_scope = parent_arch->get_scope();
