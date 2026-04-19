@@ -164,9 +164,16 @@ NetExpr* elaborate_rval_expr(Design*des, NetScope*scope, ivl_type_t lv_net_type,
       if (lval_enum) {
 	    const netenum_t *rval_enum = rval->enumeration();
 	    if (!rval_enum) {
-	      cerr << expr->get_fileline() << ": error: "
-			      "This assignment requires an explicit cast." << endl;
-	      des->errors += 1;
+	      // In SystemVerilog, enum base types are assignment-compatible
+	      // with enum values. Ternary expressions and other compound
+	      // expressions may lose enum type information during elaboration
+	      // (e.g. via eval_expr width adjustment). Allow these as long
+	      // as the bit widths match.
+	      if (rval->expr_width() != lval_enum->packed_width()) {
+		cerr << expr->get_fileline() << ": error: "
+			"This assignment requires an explicit cast." << endl;
+		des->errors += 1;
+	      }
 	    } else if (!lval_enum->matches(rval_enum)) {
 	      cerr << expr->get_fileline() << ": error: "
 			      "Enumeration type mismatch in assignment." << endl;

@@ -2514,11 +2514,11 @@ NetETernary::~NetETernary()
 
 const netenum_t* NetETernary::enumeration() const
 {
-	// If the condition can evaluate to an ambiguous value,
-	// the result may be blended, and so is not guaranteed
-	// to be a valid enumeration value.
-      if (cond_->expr_type() != IVL_VT_BOOL)
-	    return 0;
+	// If both branches of the ternary are the same enumeration type,
+	// the result is that enumeration type. If the condition is an
+	// ambiguous (X/Z) value, the result may blend to an X/Z value --
+	// but the enumeration type itself is still preserved, just as it
+	// is for non-ternary enum expressions that evaluate to X/Z.
 
       if (true_val_->enumeration() != false_val_->enumeration())
 	    return 0;

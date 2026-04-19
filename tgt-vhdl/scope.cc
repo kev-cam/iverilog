@@ -1074,7 +1074,7 @@ extern "C" int draw_all_signals(ivl_scope_t scope, void *)
 
       ivl_scope_t parent = ivl_scope_parent(scope);
       while (ivl_scope_type(parent) == IVL_SCT_GENERATE)
-         parent = ivl_scope_parent(scope);
+         parent = ivl_scope_parent(parent);
 
       vhdl_entity* ent = find_entity(parent);
       assert(ent);
@@ -1143,7 +1143,8 @@ extern "C" int draw_constant_drivers(ivl_scope_t scope, void *)
 
             if (priv->const_driver
                 && ivl_signal_port(sig) != IVL_SIP_INPUT) { // Don't drive inputs
-               assert(j == 0);   // TODO: Make work for more words
+               // TODO: Make work for more words (multi-element arrays)
+               if (j != 0) continue;
 
                vhdl_var_ref *ref = nexus_to_var_ref(arch_scope, nex);
 
@@ -1312,6 +1313,5 @@ int draw_scope(ivl_scope_t scope, void *_parent)
    rc = draw_constant_drivers(scope, _parent);
    if (rc != 0)
       return rc;
-
    return 0;
 }
