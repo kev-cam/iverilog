@@ -44,6 +44,14 @@ sub diff {
             elsif ($lline =~ /@\d+\w+:\(report note\): passed\s*$/i) {
                 $diff = 0;
             }
+            # NVC format: ** Note: <time>: PASSED
+            elsif ($lline =~ /\*\* Note:.*:\s*passed\s*$/i) {
+                $diff = 0;
+            }
+            # NVC severity failure used as SIMULATION FINISHED marker
+            elsif ($lline =~ /\*\* Failure:.*SIMULATION FINISHED/i) {
+                $diff = 0;
+            }
         }
 
         close (LOG);

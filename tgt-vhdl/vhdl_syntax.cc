@@ -136,9 +136,9 @@ void vhdl_entity::emit(std::ostream &of, int level) const
    of << "library ieee;" << std::endl;
    of << "use ieee.std_logic_1164.all;" << std::endl;
    of << "use ieee.numeric_std.all;" << std::endl;
+   of << "library sv2vhdl;" << std::endl;
+   of << "use sv2vhdl.sv_display_pkg.all;" << std::endl;
    if (get_sv2vhdl_mode()) {
-      of << "library sv2vhdl;" << std::endl;
-      of << "use sv2vhdl.sv_display_pkg.all;" << std::endl;
       of << "use sv2vhdl.sv_analog_pkg.all;" << std::endl;
    }
    of << std::endl;
