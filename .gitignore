@@ -98,3 +98,4 @@ btree*.html
 Makefile.builtin-test
 Makefile.smak
 subdir[0-9]*/
+build-lib/

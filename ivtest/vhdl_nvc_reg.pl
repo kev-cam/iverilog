@@ -14,6 +14,12 @@ use Environment;
 my $NVC = $ENV{NVC} || "/usr/local/src/nvc/build/bin/nvc";
 my $NVC_LIBDIR = $ENV{NVC_LIBDIR} || "/usr/local/src/nvc/build/lib";
 
+# Support running from the build tree: if ../build-lib exists, use it
+my $IVL_BUILD_LIB = $ENV{IVL_BUILD_LIB} || "";
+if (!$IVL_BUILD_LIB && -d "../build-lib") {
+    $IVL_BUILD_LIB = "../build-lib";
+}
+
 #
 #  Main script
 #
@@ -74,7 +80,8 @@ sub execute_regression {
         $outfile = "vhdl/$tname.vhd";
 
         # Run iverilog to generate VHDL
-        $cmd = "iverilog$sfx -t vhdl -o $outfile $args{$tname}";
+        my $bflag = $IVL_BUILD_LIB ? "-B$IVL_BUILD_LIB " : "";
+        $cmd = "iverilog$sfx ${bflag}-t vhdl -o $outfile $args{$tname}";
         $cmd .= " -s $testmod{$tname}" if ($testmod{$tname} ne "");
         $cmd .= " ./$srcpath{$tname}/$tname.v > log/$tname.log 2>&1";
         if (system("$cmd")) {

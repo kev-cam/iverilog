@@ -587,39 +587,12 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
          return;
       }
 
-      // Where possible, move constant assignments into the
-      // declaration as initialisers. This optimisation is only
-      // performed on assignments of constant values to prevent
-      // ordering problems.
-
-      // This also has another application: If this is an `initial'
-      // process and we haven't yet generated a `wait' statement then
-      // moving the assignment to the initialization preserves the
-      // expected Verilog behaviour: VHDL does not distinguish
-      // `initial' and `always' processes so an `always' process might
-      // be activated before an `initial' process at time 0. The
-      // `always' process may then use the uninitialised signal value.
-      // The second test ensures that we only try to initialise
-      // internal signals not ports
-      ivl_lval_t lval = ivl_stmt_lval(stmt, 0);
-      if (proc->get_scope()->initializing()
-          && ivl_signal_port(ivl_lval_sig(lval)) == IVL_SIP_NONE
-          && !decl->has_initial()
-          && rhs->constant()
-          && decl->get_type()->get_name() != VHDL_TYPE_ARRAY) {
-
-         // If this assignment is not in the top-level container
-         // it will not be made on all paths through the code
-         // This precludes any future extraction of an initialiser
-         if (container != proc->get_container())
-            decl->set_initial(NULL);   // Default initial value
-         else {
-            decl->set_initial(rhs);
-            proc->get_scope()->hoisted_initialiser(true);
-            delete lhs;
-            return;
-         }
-      }
+      // Note: an earlier version of this code hoisted constant initial
+      // assignments into signal declaration initialisers. This is incorrect
+      // for NVC (and per strict VHDL semantics) because a process creates
+      // a driver whose initial value is the type default ('U'), regardless
+      // of the signal declaration default. The assignment must remain in
+      // the process to initialize the driver correctly.
 
       if (!check_valid_assignment(decl->assignment_type(), proc, stmt))
          return;
