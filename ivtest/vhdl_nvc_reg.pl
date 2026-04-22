@@ -126,8 +126,9 @@ sub execute_regression {
             next;
         }
 
-        # Find the primary entity from the VHDL file
-        ($unit) = `grep -m1 -oP '^entity\\s+\\K\\w+' $outfile`;
+        # Find the primary (top-level) entity from the VHDL file.
+        # Entities are emitted leaves-first, so the top entity is last.
+        ($unit) = `grep -oP '^entity\\s+\\K\\w+' $outfile | tail -1`;
         chomp $unit if $unit;
         unless ($unit) {
             &print_rpt("==> Failed -- cannot determine primary VHDL unit.\n");

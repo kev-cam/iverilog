@@ -207,15 +207,25 @@ void remember_entity(vhdl_entity* ent, ivl_scope_t scope)
    g_scope_names[scope] = ent->get_name();
 }
 
-// Print all VHDL entities, in order, to the specified output stream.
+// Print all VHDL entities to the specified output stream.
+// Emit deepest entities first so that entity instantiations
+// can resolve during single-pass NVC analysis.
 void emit_all_entities(std::ostream& os, int max_depth)
 {
+   // Collect entities, sort by depth descending (leaves first)
+   std::vector<vhdl_entity*> sorted;
    for (entity_list_t::iterator it = g_entities.begin();
         it != g_entities.end();
         ++it) {
       if ((max_depth == 0 || (*it)->depth < max_depth))
-         (*it)->emit(os);
+         sorted.push_back(*it);
    }
+   std::sort(sorted.begin(), sorted.end(),
+             [](const vhdl_entity *a, const vhdl_entity *b) {
+                return a->depth > b->depth;
+             });
+   for (auto *ent : sorted)
+      ent->emit(os);
 }
 
 // Release all memory for the VHDL objects. No vhdl_element pointers
