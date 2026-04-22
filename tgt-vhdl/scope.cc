@@ -1257,12 +1257,8 @@ extern "C" int draw_hierarchy(ivl_scope_t scope, void *_parent)
       vhdl_arch *parent_arch = parent_ent->get_arch();
       if (!parent_arch) return 0;
 
-      // Create a forward declaration for it
+      // Entity instantiation (no component declaration needed)
       const vhdl_scope *parent_scope = parent_arch->get_scope();
-      if (!parent_scope->have_declared(ent->get_name())) {
-         vhdl_decl *comp_decl = vhdl_component_decl::component_decl_for(ent);
-         parent_arch->get_scope()->add_decl(comp_decl);
-      }
 
       // And an instantiation statement
       string inst_name = ivl_scope_basename(scope);

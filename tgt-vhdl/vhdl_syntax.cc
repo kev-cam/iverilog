@@ -359,7 +359,7 @@ void vhdl_comp_inst::emit(std::ostream &of, int level) const
 {
    newline(of, level);
    emit_comment(of, level);
-   of << inst_name_ << ": " << comp_name_;
+   of << inst_name_ << ": entity work." << comp_name_;
 
    // If there are no ports or generics we don't need to mention them...
    if (! mapping_.empty()) {
