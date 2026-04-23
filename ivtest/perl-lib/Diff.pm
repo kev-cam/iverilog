@@ -100,34 +100,60 @@ sub diff {
             }
             $diff = 1 if $lindex < @llines;
         } else {
+            # Normalize a VHDL report line to just the message content.
+            # Strips GHDL format: file:line:col:@time:(report note): MSG
+            # Strips NVC format:  ** Note: time: MSG\n   Process ...
+            sub normalize_vhdl_line {
+                my $line = shift;
+                $line =~ s/\r\n$/\n/;
+                # GHDL: file.vhd:42:5:@0ms:(report note): MESSAGE
+                if ($line =~ /:\(report \w+\):\s*(.*)/) {
+                    return "$1\n";
+                }
+                # NVC: ** Note: 0ms+0: MESSAGE
+                if ($line =~ /\*\* (?:Note|Warning|Error|Failure):\s*\S+:\s*(.*)/) {
+                    return "$1\n";
+                }
+                return $line;
+            }
+
+            # Read all log lines, filter out NVC "Process" context lines
+            # and valgrind noise
+            my @log_lines;
+            while (my $l = <LOG>) {
+                next if $l =~ m/^\s+Process\s/;  # NVC context line
+                next if $l =~ m/^\s+Function\s/; # NVC warning context
+                next if $l =~ m/^(==|\*\*)\d+(==|\*\*)/; # valgrind
+                push @log_lines, $l;
+            }
+
+            my $lindex = 0;
             # Loop on the gold file lines.
             foreach $gline (<GOLD>) {
-                if (eof LOG) {
+                if ($lindex >= @log_lines) {
                     $diff = 1;
                     last;
                 }
-                $lline = <LOG>;
-                # Skip lines from valgrind ^==\d+== or ^**\d+**
-                while ($lline =~ m/^(==|\*\*)\d+(==|\*\*)/) {
-                    $lline = <LOG>;
-                }
+                $lline = $log_lines[$lindex++];
                 # Skip initial lines if needed.
                 if ($skip > 0) {
                     $skip--;
                     next;
                 }
-                $gline =~ s/\r\n$/\n/;  # Strip <CR> at the end of line.
-                $lline =~ s/\r\n$/\n/;  # Strip <CR> at the end of line.
-                if ($gline ne $lline) {
+                my $gnorm = normalize_vhdl_line($gline);
+                my $lnorm = normalize_vhdl_line($lline);
+                if ($gnorm ne $lnorm) {
                     $diff = 1;
                     last;
                 }
             }
 
             # Check to see if the log file has extra lines.
-            while (!eof LOG and !$diff) {
-                $lline = <LOG>;
-                $diff = 1 if ($lline !~ m/^(==|\*\*)\d+(==|\*\*)/);
+            while ($lindex < @log_lines and !$diff) {
+                $lline = $log_lines[$lindex++];
+                # Remaining lines should be noise
+                $diff = 1 if ($lline !~ m/^(==|\*\*)\d+(==|\*\*)/
+                              && $lline !~ m/^\s*$/);
             }
         }
         close (LOG);
