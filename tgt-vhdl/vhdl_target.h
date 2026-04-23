@@ -34,4 +34,7 @@ vhdl_var_ref* readable_ref(vhdl_scope* scope, ivl_nexus_t nex);
 std::string make_safe_name(ivl_signal_t sig);
 void require_support_function(support_function_t f);
 
+bool is_hoisted_signal(ivl_signal_t sig);
+void clear_hoisted_signal(ivl_signal_t sig);
+
 #endif /* #ifndef INC_VHDL_TARGET_H */

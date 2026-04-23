@@ -26,6 +26,88 @@
 #include <cassert>
 #include <sstream>
 #include <algorithm>
+#include <vector>
+#include <set>
+#include <utility>
+
+// Signals whose initial value was hoisted to a declaration default.
+// These signals should have their first assignment skipped in the
+// initial process to avoid creating a second driver.
+static std::set<ivl_signal_t> g_hoisted_signals;
+
+bool is_hoisted_signal(ivl_signal_t sig)
+{
+   return g_hoisted_signals.count(sig) > 0;
+}
+
+void clear_hoisted_signal(ivl_signal_t sig)
+{
+   g_hoisted_signals.erase(sig);
+}
+
+/*
+ * Check if an initial process consists only of immediate assignments
+ * with no delays, waits, loops, or conditionals -- i.e. it only
+ * assigns values at time zero and then terminates.
+ *
+ * If so, collect the signal/value pairs so they can be applied as
+ * signal declaration defaults instead of being emitted as a separate
+ * process (which would create an extra driver and cause 'U' due to
+ * resolution).
+ */
+struct init_assign_t {
+   ivl_signal_t sig;
+   ivl_expr_t value;
+};
+
+static bool is_time_zero_only(ivl_statement_t stmt,
+                              std::vector<init_assign_t> &assigns)
+{
+   if (!stmt) return true;
+
+   switch (ivl_statement_type(stmt)) {
+   case IVL_ST_NOOP:
+   case IVL_ST_NONE:
+      return true;
+
+   case IVL_ST_ASSIGN:
+   case IVL_ST_ASSIGN_NB: {
+      // Must be a simple assignment with no delay
+      if (ivl_stmt_delay_expr(stmt))
+         return false;
+      unsigned nlvals = ivl_stmt_lvals(stmt);
+      if (nlvals != 1)
+         return false;
+      ivl_lval_t lval = ivl_stmt_lval(stmt, 0);
+      ivl_signal_t sig = ivl_lval_sig(lval);
+      if (!sig)
+         return false;
+      // Only handle simple whole-signal assignments
+      if (ivl_lval_part_off(lval) || ivl_lval_idx(lval))
+         return false;
+      ivl_expr_t rval = ivl_stmt_rval(stmt);
+      if (!rval)
+         return false;
+      init_assign_t ia = { sig, rval };
+      assigns.push_back(ia);
+      return true;
+   }
+
+   case IVL_ST_BLOCK: {
+      unsigned count = ivl_stmt_block_count(stmt);
+      for (unsigned i = 0; i < count; i++) {
+         if (!is_time_zero_only(ivl_stmt_block_stmt(stmt, i), assigns))
+            return false;
+      }
+      return true;
+   }
+
+   default:
+      // Any other statement type (delay, wait, loop, conditional, etc.)
+      // means this initial persists beyond time zero
+      return false;
+   }
+}
 
 /*
  * Check to see if the process should have a name.
@@ -216,6 +298,48 @@ extern "C" int draw_process(ivl_process_t proc, void *)
       if (!get_sv2vhdl_mode())
          return 0;  // Skip analog outside sv2vhdl mode
       return generate_analog_call(ent, proc, scope);
+   }
+
+   // For initial processes, extract any leading assignments that occur
+   // before the first delay/wait/event and apply them as signal
+   // declaration defaults. This avoids creating an extra VHDL driver
+   // that would conflict with always processes driving the same
+   // signals (causing 'U' due to resolution).
+   //
+   // The remaining statements (after the first wait) are still
+   // generated as a process. If the initial only has prefix
+   // assignments and nothing else, the process is suppressed entirely.
+   if (ivl_process_type(proc) == IVL_PR_INITIAL) {
+      ivl_statement_t stmt = ivl_process_stmt(proc);
+      std::vector<init_assign_t> assigns;
+      // Check for time-zero-only case first
+      if (is_time_zero_only(stmt, assigns) && !assigns.empty()) {
+         vhdl_scope *arch_scope = ent->get_arch()->get_scope();
+         bool all_ok = true;
+         for (auto &ia : assigns) {
+            std::string name = make_safe_name(ia.sig);
+            vhdl_decl *decl = arch_scope->get_decl(name);
+            if (!decl) {
+               all_ok = false;
+               break;
+            }
+            if (!decl->has_initial()) {
+               vhdl_expr *init = translate_expr(ia.value);
+               if (init) {
+                  decl->set_initial(init);
+                  g_hoisted_signals.insert(ia.sig);
+               }
+            }
+         }
+         if (all_ok) {
+            debug_msg("Converted time-zero initial to signal defaults (%s:%d)",
+                      ivl_process_file(proc), ivl_process_lineno(proc));
+            return 0;
+         }
+      }
+      // For initial blocks that persist beyond time zero, we don't
+      // extract prefix assignments — the process needs to remain as-is
+      // since it creates drivers for signals it assigns later.
    }
 
    return generate_vhdl_process(ent, proc);
