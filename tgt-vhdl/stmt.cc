@@ -56,6 +56,9 @@ static int draw_stask_finish(vhdl_procedural *, stmt_container *container,
       //get_active_entity()->requires_package("work.Verilog_Support");
       container->add_stmt(new vhdl_pcall_stmt("work.Verilog_Support.Finish"));
    }
+   else if (get_sv2vhdl_mode()) {
+      container->add_stmt(new vhdl_pcall_stmt("std.env.finish"));
+   }
    else {
       container->add_stmt(
          new vhdl_report_stmt(new vhdl_const_string("SIMULATION FINISHED"),
