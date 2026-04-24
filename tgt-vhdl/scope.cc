@@ -702,11 +702,32 @@ static void declare_signals(vhdl_entity *ent, ivl_scope_t scope)
    debug_msg("Declaring signals in scope type %s", ivl_scope_tname(scope));
 
    int nsigs = ivl_scope_sigs(scope);
-   for (int i = 0; i < nsigs; i++) {
-      ivl_signal_t sig = ivl_scope_sig(scope, i);
 
-      if (ivl_signal_port(sig) != IVL_SIP_NONE)
-         declare_one_signal(ent, sig, scope);
+   // Emit ports in module-declaration order (not the iverilog internal
+   // signal-table order, which is effectively alphabetical) so that VHDL
+   // testbenches using positional port maps — `port map (a, b, c, d)` —
+   // bind to the same ports as the Verilog module declares.
+   if (ivl_scope_type(scope) == IVL_SCT_MODULE) {
+      const unsigned nports = ivl_scope_mod_module_ports(scope);
+      for (unsigned p = 0; p < nports; p++) {
+         const char *pname = ivl_scope_mod_module_port_name(scope, p);
+         for (int i = 0; i < nsigs; i++) {
+            ivl_signal_t sig = ivl_scope_sig(scope, i);
+            if (ivl_signal_port(sig) != IVL_SIP_NONE
+                && strcmp(ivl_signal_basename(sig), pname) == 0) {
+               declare_one_signal(ent, sig, scope);
+               break;
+            }
+         }
+      }
+   }
+   else {
+      for (int i = 0; i < nsigs; i++) {
+         ivl_signal_t sig = ivl_scope_sig(scope, i);
+
+         if (ivl_signal_port(sig) != IVL_SIP_NONE)
+            declare_one_signal(ent, sig, scope);
+      }
    }
 
    for (int i = 0; i < nsigs; i++) {
