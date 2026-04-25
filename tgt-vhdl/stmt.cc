@@ -587,18 +587,21 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
          return;
       }
 
-      // Note: an earlier version of this code hoisted constant initial
-      // assignments into signal declaration initialisers. This is incorrect
-      // for NVC (and per strict VHDL semantics) because a process creates
-      // a driver whose initial value is the type default ('U'), regardless
-      // of the signal declaration default. The assignment must remain in
-      // the process to initialize the driver correctly.
+      // In initial processes, use deposit (:=) instead of signal
+      // assignment (<=) for signals. This avoids creating a VHDL driver
+      // that would conflict with always processes driving the same
+      // signal. Deposit writes the effective value without a driver,
+      // matching Verilog's shared-driver reg semantics.
+      // NVC --std=2040 supports := on signals (T_DEPOSIT).
+      vhdl_decl::assign_type_t atype = decl->assignment_type();
+      if (proc->get_scope()->initializing()
+          && atype == vhdl_decl::ASSIGN_NONBLOCK)
+         atype = vhdl_decl::ASSIGN_BLOCK;
 
-      if (!check_valid_assignment(decl->assignment_type(), proc, stmt))
+      if (!check_valid_assignment(atype, proc, stmt))
          return;
 
-      vhdl_abstract_assign_stmt *a =
-         assign_for(decl->assignment_type(), lhs, rhs);
+      vhdl_abstract_assign_stmt *a = assign_for(atype, lhs, rhs);
       container->add_stmt(a);
 
       a->set_after(after);
