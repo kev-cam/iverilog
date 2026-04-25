@@ -87,6 +87,27 @@ static int generate_vhdl_process(vhdl_entity *ent, ivl_process_t proc)
       vhdl_proc->get_container()->add_stmt(wait);
    }
 
+   // An always-process whose body collapsed to only null statements
+   // (e.g. `always @* q <= 1;` where iverilog elided the assignment
+   // because the sensitivity list is empty and the RHS has no sources)
+   // would loop forever in VHDL.  The Verilog intent is "this never
+   // executes": add an unconditional wait so the process suspends
+   // permanently after one entry.
+   if (!is_initial && !is_empty) {
+      stmt_container::stmt_list_t &stmts =
+         vhdl_proc->get_container()->get_stmts();
+      bool only_null = true;
+      for (stmt_container::stmt_list_t::const_iterator it = stmts.begin();
+           it != stmts.end(); ++it) {
+         if (dynamic_cast<vhdl_null_stmt*>(*it) == NULL) {
+            only_null = false;
+            break;
+         }
+      }
+      if (only_null)
+         vhdl_proc->get_container()->add_stmt(new vhdl_wait_stmt());
+   }
+
    // Add a comment indicating where it came from
    ivl_scope_t scope = ivl_process_scope(proc);
    const char *type = ivl_process_type(proc) == IVL_PR_INITIAL
