@@ -208,23 +208,22 @@ void remember_entity(vhdl_entity* ent, ivl_scope_t scope)
 }
 
 // Print all VHDL entities to the specified output stream.
-// Emit deepest entities first so that entity instantiations
-// can resolve during single-pass NVC analysis.
+// Emit in reverse discovery order: the skeleton walker uses DFS which
+// visits parents before children, so reversing gives children first.
+// This ensures entity instantiation targets are analyzed before the
+// entities that instantiate them.
 void emit_all_entities(std::ostream& os, int max_depth)
 {
-   // Collect entities, sort by depth descending (leaves first)
-   std::vector<vhdl_entity*> sorted;
+   std::vector<vhdl_entity*> all;
    for (entity_list_t::iterator it = g_entities.begin();
         it != g_entities.end();
         ++it) {
       if ((max_depth == 0 || (*it)->depth < max_depth))
-         sorted.push_back(*it);
+         all.push_back(*it);
    }
-   std::sort(sorted.begin(), sorted.end(),
-             [](const vhdl_entity *a, const vhdl_entity *b) {
-                return a->depth > b->depth;
-             });
-   for (auto *ent : sorted)
+   // Reverse: DFS discovery order is parent-first, we need child-first
+   std::reverse(all.begin(), all.end());
+   for (auto *ent : all)
       ent->emit(os);
 }
 
