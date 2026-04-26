@@ -176,11 +176,6 @@ void draw_nexus(ivl_nexus_t nexus)
          }
 
          nexus_signal_width = ivl_signal_width(sig);
-
-         // Count output ports of child module instances as drivers
-         if (ivl_signal_port(sig) == IVL_SIP_OUTPUT
-             || ivl_signal_port(sig) == IVL_SIP_INOUT)
-            ndrivers++;
       }
    }
 
@@ -702,29 +697,38 @@ static void declare_signals(vhdl_entity *ent, ivl_scope_t scope)
    debug_msg("Declaring signals in scope type %s", ivl_scope_tname(scope));
 
    int nsigs = ivl_scope_sigs(scope);
-
-   // Emit ports in module-declaration order (not the iverilog internal
-   // signal-table order, which is effectively alphabetical) so that VHDL
-   // testbenches using positional port maps — `port map (a, b, c, d)` —
-   // bind to the same ports as the Verilog module declares.
+   // Emit ports in module-declaration order so that positional port
+   // maps bind correctly.  Fall back to signal-table order for
+   // non-module scopes or unusual port declarations.
+   // Try to emit ports in module-declaration order for correct positional
+   // port map binding.  Fall back to signal-table order if anything goes
+   // wrong (unusual port declarations, concatenated ports, etc.)
+   bool used_port_order = false;
    if (ivl_scope_type(scope) == IVL_SCT_MODULE) {
       const unsigned nports = ivl_scope_mod_module_ports(scope);
-      for (unsigned p = 0; p < nports; p++) {
-         const char *pname = ivl_scope_mod_module_port_name(scope, p);
-         for (int i = 0; i < nsigs; i++) {
-            ivl_signal_t sig = ivl_scope_sig(scope, i);
-            if (ivl_signal_port(sig) != IVL_SIP_NONE
-                && strcmp(ivl_signal_basename(sig), pname) == 0) {
-               declare_one_signal(ent, sig, scope);
-               break;
+      if (nports > 0) {
+         unsigned matched = 0;
+         std::set<std::string> seen_ports;
+         for (unsigned p = 0; p < nports; p++) {
+            const char *pname = ivl_scope_mod_module_port_name(scope, p);
+            if (!pname || !seen_ports.insert(pname).second)
+               continue;
+            for (int i = 0; i < nsigs; i++) {
+               ivl_signal_t sig = ivl_scope_sig(scope, i);
+               if (ivl_signal_port(sig) != IVL_SIP_NONE
+                   && strcmp(ivl_signal_basename(sig), pname) == 0) {
+                  declare_one_signal(ent, sig, scope);
+                  matched++;
+                  break;
+               }
             }
          }
+         used_port_order = (matched > 0);
       }
    }
-   else {
+   if (!used_port_order) {
       for (int i = 0; i < nsigs; i++) {
          ivl_signal_t sig = ivl_scope_sig(scope, i);
-
          if (ivl_signal_port(sig) != IVL_SIP_NONE)
             declare_one_signal(ent, sig, scope);
       }
@@ -1257,8 +1261,12 @@ extern "C" int draw_hierarchy(ivl_scope_t scope, void *_parent)
       vhdl_arch *parent_arch = parent_ent->get_arch();
       if (!parent_arch) return 0;
 
-      // Entity instantiation (no component declaration needed)
+      // Create a forward declaration for it
       const vhdl_scope *parent_scope = parent_arch->get_scope();
+      if (!parent_scope->have_declared(ent->get_name())) {
+         vhdl_decl *comp_decl = vhdl_component_decl::component_decl_for(ent);
+         parent_arch->get_scope()->add_decl(comp_decl);
+      }
 
       // And an instantiation statement
       string inst_name = ivl_scope_basename(scope);
