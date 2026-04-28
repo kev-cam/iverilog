@@ -19,6 +19,7 @@
  */
 
 #include "vhdl_type.hh"
+#include "state.hh"
 
 #include <cassert>
 #include <sstream>
@@ -104,6 +105,10 @@ std::string vhdl_type::get_string() const
    case VHDL_TYPE_ARRAY:
       // Each array has its own type declaration
       return array_name_;
+   case VHDL_TYPE_LOGIC3D:
+      return std::string("logic3d");
+   case VHDL_TYPE_LOGIC3D_VECTOR:
+      return std::string("logic3d_vector");
    default:
       return std::string("BadType");
    }
@@ -118,6 +123,7 @@ std::string vhdl_type::get_decl_string() const
    case VHDL_TYPE_STD_LOGIC_VECTOR:
    case VHDL_TYPE_UNSIGNED:
    case VHDL_TYPE_SIGNED:
+   case VHDL_TYPE_LOGIC3D_VECTOR:
       {
          std::ostringstream ss;
          ss << get_string() << "(" << msb_;
@@ -173,9 +179,27 @@ vhdl_type *vhdl_type::std_logic_vector(int msb, int lsb)
    return new vhdl_type(VHDL_TYPE_STD_LOGIC_VECTOR, msb, lsb);
 }
 
+vhdl_type *vhdl_type::logic3d()
+{
+   return new vhdl_type(VHDL_TYPE_LOGIC3D);
+}
+
+vhdl_type *vhdl_type::logic3d_vector(int msb, int lsb)
+{
+   return new vhdl_type(VHDL_TYPE_LOGIC3D_VECTOR, msb, lsb);
+}
+
 vhdl_type *vhdl_type::type_for(int width, bool issigned,
                                int lsb, bool unresolved)
 {
+   if (get_sv2vhdl_mode()) {
+      // sv2vhdl mode: use logic3d types for Verilog-compatible X semantics
+      if (width == 1)
+         return vhdl_type::logic3d();
+      else
+         return vhdl_type::logic3d_vector(width-1+lsb, lsb);
+   }
+
    if (width == 1) {
       if (unresolved)
          return vhdl_type::std_ulogic();

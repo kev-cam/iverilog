@@ -35,7 +35,9 @@ enum vhdl_type_name_t {
    VHDL_TYPE_SIGNED,
    VHDL_TYPE_UNSIGNED,
    VHDL_TYPE_TIME,
-   VHDL_TYPE_ARRAY
+   VHDL_TYPE_ARRAY,
+   VHDL_TYPE_LOGIC3D,          // sv2vhdl: logic3d (natural range 0 to 7)
+   VHDL_TYPE_LOGIC3D_VECTOR    // sv2vhdl: logic3d_vector(N-1 downto 0)
 };
 
 /*
@@ -81,6 +83,9 @@ public:
    static vhdl_type *integer();
    static vhdl_type *boolean();
    static vhdl_type *time();
+
+   static vhdl_type *logic3d();
+   static vhdl_type *logic3d_vector(int msb, int lsb);
 
    static vhdl_type *type_for(int width, bool issigned,
                               int lsb=0, bool unresolved=false);

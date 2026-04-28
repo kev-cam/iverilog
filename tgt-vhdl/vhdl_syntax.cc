@@ -139,6 +139,7 @@ void vhdl_entity::emit(std::ostream &of, int level) const
    of << "library sv2vhdl;" << std::endl;
    of << "use sv2vhdl.sv_display_pkg.all;" << std::endl;
    if (get_sv2vhdl_mode()) {
+      of << "use sv2vhdl.logic3d_types_pkg.all;" << std::endl;
       of << "use sv2vhdl.sv_analog_pkg.all;" << std::endl;
    }
    of << std::endl;
