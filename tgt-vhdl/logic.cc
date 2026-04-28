@@ -86,10 +86,10 @@ static void add_strength_comment(vhdl_element *stmt, ivl_net_logic_t log)
 static vhdl_expr *inputs_to_expr(vhdl_scope *scope, vhdl_binop_t op,
                                  ivl_net_logic_t log)
 {
-   // Not always std_logic but this is probably OK since
-   // the program has already been type checked
+   vhdl_type *result_type = get_sv2vhdl_mode()
+      ? vhdl_type::logic3d() : vhdl_type::std_logic();
    vhdl_binop_expr *gate =
-      new vhdl_binop_expr(op, vhdl_type::std_logic());
+      new vhdl_binop_expr(op, result_type);
 
    int npins = ivl_logic_pins(log);
    for (int i = 1; i < npins; i++) {
@@ -111,7 +111,9 @@ static vhdl_expr *input_to_expr(vhdl_scope *scope, vhdl_unaryop_t op,
    assert(input);
 
    vhdl_expr *operand = readable_ref(scope, input);
-   return new vhdl_unaryop_expr(op, operand, vhdl_type::std_logic());
+   vhdl_type *result_type = get_sv2vhdl_mode()
+      ? vhdl_type::logic3d() : vhdl_type::std_logic();
+   return new vhdl_unaryop_expr(op, operand, result_type);
 }
 
 static void bufif_logic(vhdl_arch *arch, ivl_net_logic_t log, bool if0)

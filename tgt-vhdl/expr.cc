@@ -146,23 +146,34 @@ static vhdl_expr *translate_reduction(support_function_t f, bool neg,
                                       vhdl_expr *operand)
 {
    vhdl_expr *result;
-   if (operand->get_type()->get_name() == VHDL_TYPE_STD_LOGIC)
+   vhdl_type_name_t scalar_type = operand->get_type()->get_name();
+
+   if (scalar_type == VHDL_TYPE_STD_LOGIC || scalar_type == VHDL_TYPE_LOGIC3D)
       result = operand;
    else {
       require_support_function(f);
-      vhdl_fcall *fcall =
-         new vhdl_fcall(support_function::function_name(f),
-                        vhdl_type::std_logic());
 
-      vhdl_type std_logic_vector(VHDL_TYPE_STD_LOGIC_VECTOR);
-      fcall->add_expr(operand->cast(&std_logic_vector));
+      vhdl_type *ret_type = get_sv2vhdl_mode()
+         ? vhdl_type::logic3d() : vhdl_type::std_logic();
+      vhdl_fcall *fcall =
+         new vhdl_fcall(support_function::function_name(f), ret_type);
+
+      if (get_sv2vhdl_mode()) {
+         // logic3d_vector: pass directly, no cast needed
+         fcall->add_expr(operand);
+      } else {
+         vhdl_type std_logic_vector(VHDL_TYPE_STD_LOGIC_VECTOR);
+         fcall->add_expr(operand->cast(&std_logic_vector));
+      }
 
       result = fcall;
    }
 
-   if (neg)
-      return new vhdl_unaryop_expr(VHDL_UNARYOP_NOT, result,
-                                   vhdl_type::std_logic());
+   if (neg) {
+      vhdl_type *neg_type = get_sv2vhdl_mode()
+         ? vhdl_type::logic3d() : vhdl_type::std_logic();
+      return new vhdl_unaryop_expr(VHDL_UNARYOP_NOT, result, neg_type);
+   }
    else
       return result;
 }

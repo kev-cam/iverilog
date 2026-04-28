@@ -23,6 +23,7 @@
 #include "state.hh"
 
 #include <cassert>
+#include <cstring>
 #include <iostream>
 
 void require_support_function(support_function_t f)
@@ -89,18 +90,34 @@ void support_function::emit_ternary(std::ostream &of, int level) const
 void support_function::emit_reduction(std::ostream &of, int level,
                                       const char *op, char unit) const
 {
-   // Emit a VHDL function emulating a Verilog reduction operator
-   // Where op is the corresponding VHDL operator and unit is the
-   // right-unit of the operator
+   if (get_sv2vhdl_mode()) {
+      // logic3d version: use l3d_* functions instead of VHDL operators
+      const char *l3d_fn;
+      const char *l3d_unit;
+      if (strcmp(op, "or") == 0)   { l3d_fn = "l3d_or";  l3d_unit = "L3D_0"; }
+      else if (strcmp(op, "and") == 0) { l3d_fn = "l3d_and"; l3d_unit = "L3D_1"; }
+      else if (strcmp(op, "xor") == 0) { l3d_fn = "l3d_xor"; l3d_unit = "L3D_0"; }
+      else { l3d_fn = "l3d_xor"; l3d_unit = "L3D_1"; } // xnor
 
-   of << "(X : std_logic_vector) return std_logic is"
-      << nl_string(indent(level))
-      << "variable R : std_logic := '" << unit << "';" << nl_string(level)
-      << "begin" << nl_string(indent(level))
-      << "for I in X'Range loop" << nl_string(indent(indent(level)))
-      << "R := X(I) " << op << " R;" << nl_string(indent(level))
-      << "end loop;" << nl_string(indent(level))
-      << "return R;";
+      of << "(X : logic3d_vector) return logic3d is"
+         << nl_string(indent(level))
+         << "variable R : logic3d := " << l3d_unit << ";" << nl_string(level)
+         << "begin" << nl_string(indent(level))
+         << "for I in X'Range loop" << nl_string(indent(indent(level)))
+         << "R := " << l3d_fn << "(X(I), R);" << nl_string(indent(level))
+         << "end loop;" << nl_string(indent(level))
+         << "return R;";
+   }
+   else {
+      of << "(X : std_logic_vector) return std_logic is"
+         << nl_string(indent(level))
+         << "variable R : std_logic := '" << unit << "';" << nl_string(level)
+         << "begin" << nl_string(indent(level))
+         << "for I in X'Range loop" << nl_string(indent(indent(level)))
+         << "R := X(I) " << op << " R;" << nl_string(indent(level))
+         << "end loop;" << nl_string(indent(level))
+         << "return R;";
+   }
 }
 
 void support_function::emit(std::ostream &of, int level) const

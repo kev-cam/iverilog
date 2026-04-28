@@ -152,22 +152,31 @@ static vhdl_expr *reduction_lpm_to_expr(vhdl_scope *scope, ivl_lpm_t lpm,
       return NULL;
 
    vhdl_expr *result;
-   if (ref->get_type()->get_name() == VHDL_TYPE_STD_LOGIC)
+   vhdl_type_name_t ref_type = ref->get_type()->get_name();
+   if (ref_type == VHDL_TYPE_STD_LOGIC || ref_type == VHDL_TYPE_LOGIC3D)
       result = ref;
    else {
       require_support_function(f);
+      vhdl_type *ret_type = get_sv2vhdl_mode()
+         ? vhdl_type::logic3d() : vhdl_type::std_logic();
       vhdl_fcall *fcall = new vhdl_fcall(support_function::function_name(f),
-                                         vhdl_type::std_logic());
+                                         ret_type);
 
-      vhdl_type std_logic_vector(VHDL_TYPE_STD_LOGIC_VECTOR);
-      fcall->add_expr(ref->cast(&std_logic_vector));
+      if (get_sv2vhdl_mode()) {
+         fcall->add_expr(ref);
+      } else {
+         vhdl_type std_logic_vector(VHDL_TYPE_STD_LOGIC_VECTOR);
+         fcall->add_expr(ref->cast(&std_logic_vector));
+      }
 
       result = fcall;
    }
 
-   if (invert)
-      return new vhdl_unaryop_expr
-         (VHDL_UNARYOP_NOT, result, vhdl_type::std_logic());
+   if (invert) {
+      vhdl_type *inv_type = get_sv2vhdl_mode()
+         ? vhdl_type::logic3d() : vhdl_type::std_logic();
+      return new vhdl_unaryop_expr(VHDL_UNARYOP_NOT, result, inv_type);
+   }
    else
       return result;
 }

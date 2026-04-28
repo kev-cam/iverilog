@@ -1066,10 +1066,16 @@ void vhdl_unaryop_expr::find_vars(vhdl_var_set_t& read)
 void vhdl_unaryop_expr::emit(std::ostream &of, int level) const
 {
    if (get_sv2vhdl_mode() && op_ == VHDL_UNARYOP_NOT) {
-      of << "l3d_not(";
-      operand_->emit(of, level);
-      of << ")";
-      return;
+      // Check if operand or result is logic3d type
+      const vhdl_type *chk = type_;
+      if (!chk && operand_) chk = operand_->get_type();
+      if (chk && (chk->get_name() == VHDL_TYPE_LOGIC3D
+                  || chk->get_name() == VHDL_TYPE_LOGIC3D_VECTOR)) {
+         of << "l3d_not(";
+         operand_->emit(of, level);
+         of << ")";
+         return;
+      }
    }
 
    open_parens(of);
@@ -1119,10 +1125,16 @@ void vhdl_binop_expr::find_vars(vhdl_var_set_t& read)
 
 void vhdl_binop_expr::emit(std::ostream &of, int level) const
 {
-   // In sv2vhdl mode, bitwise logic operators on logic3d scalars use
+   // In sv2vhdl mode, bitwise logic operators on logic3d types use
    // function calls instead of VHDL operators (integers don't have
-   // and/or/not/xor operators).
+   // and/or/not/xor operators). Only apply when the result type is
+   // logic3d; boolean and/or stay as VHDL operators.
    if (get_sv2vhdl_mode() && operands_.size() == 2) {
+      // Check if result or first operand is logic3d type
+      const vhdl_type *chk = type_;
+      if (!chk && !operands_.empty()) chk = operands_.front()->get_type();
+      if (chk && (chk->get_name() == VHDL_TYPE_LOGIC3D
+                  || chk->get_name() == VHDL_TYPE_LOGIC3D_VECTOR)) {
       const char *l3d_fn = NULL;
       switch (op_) {
       case VHDL_BINOP_AND:  l3d_fn = "l3d_and"; break;
@@ -1142,6 +1154,7 @@ void vhdl_binop_expr::emit(std::ostream &of, int level) const
          of << ")";
          return;
       }
+      }  // end logic3d type check
    }
 
    open_parens(of);
