@@ -701,6 +701,12 @@ void vhdl_var_ref::set_slice(vhdl_expr *s, int w)
    if (tname == VHDL_TYPE_ARRAY) {
       type_ = type_->get_base();
    }
+   else if (tname == VHDL_TYPE_LOGIC3D_VECTOR) {
+      if (w > 0)
+         type_ = vhdl_type::logic3d_vector(w - 1, 0);
+      else
+         type_ = vhdl_type::logic3d();
+   }
    else {
       assert(tname == VHDL_TYPE_UNSIGNED || tname == VHDL_TYPE_SIGNED);
 

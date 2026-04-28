@@ -65,6 +65,12 @@ vhdl_expr *vhdl_expr::cast(const vhdl_type *to)
          return to_std_ulogic();
       case VHDL_TYPE_STRING:
          return to_string();
+      case VHDL_TYPE_LOGIC3D:
+         return to_std_logic();  // logic3d is the sv2vhdl equivalent
+      case VHDL_TYPE_LOGIC3D_VECTOR:
+         // Cast to logic3d vector — for now just return self and hope
+         // the widths match. TODO: proper resize for logic3d_vector.
+         return this;
       default:
          assert(false);
       }
