@@ -119,13 +119,23 @@ void support_function::emit(std::ostream &of, int level) const
          << "return X /= To_Signed(0, X'Length);";
       break;
    case SF_BOOLEAN_TO_LOGIC:
-      of << "(B : Boolean) return std_logic is" << nl_string(level)
-         << "begin" << nl_string(indent(level))
-         << "if B then" << nl_string(indent(indent(level)))
-         << "return '1';" << nl_string(indent(level))
-         << "else" << nl_string(indent(indent(level)))
-         << "return '0';" << nl_string(indent(level))
-         << "end if;";
+      if (get_sv2vhdl_mode()) {
+         of << "(B : Boolean) return logic3d is" << nl_string(level)
+            << "begin" << nl_string(indent(level))
+            << "if B then" << nl_string(indent(indent(level)))
+            << "return L3D_1;" << nl_string(indent(level))
+            << "else" << nl_string(indent(indent(level)))
+            << "return L3D_0;" << nl_string(indent(level))
+            << "end if;";
+      } else {
+         of << "(B : Boolean) return std_logic is" << nl_string(level)
+            << "begin" << nl_string(indent(level))
+            << "if B then" << nl_string(indent(indent(level)))
+            << "return '1';" << nl_string(indent(level))
+            << "else" << nl_string(indent(indent(level)))
+            << "return '0';" << nl_string(indent(level))
+            << "end if;";
+      }
       break;
    case SF_UNSIGNED_TO_LOGIC:
       of << "(X : unsigned) return std_logic is" << nl_string(level)

@@ -206,8 +206,7 @@ private:
 
 class vhdl_const_bit : public vhdl_expr {
 public:
-   explicit vhdl_const_bit(char bit)
-      : vhdl_expr(vhdl_type::std_logic(), true), bit_(bit) {}
+   explicit vhdl_const_bit(char bit);  // Defined in vhdl_syntax.cc
    void emit(std::ostream &of, int level) const;
    vhdl_expr *to_boolean();
    vhdl_expr *to_integer();

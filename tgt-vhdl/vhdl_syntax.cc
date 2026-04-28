@@ -794,14 +794,27 @@ void vhdl_assign_stmt::emit(std::ostream &of, int level) const
 
 vhdl_const_bits::vhdl_const_bits(const char *value, int width, bool issigned,
                                  bool qualify)
-   : vhdl_expr(issigned ? vhdl_type::nsigned(width)
-               : vhdl_type::nunsigned(width), true),
+   : vhdl_expr(get_sv2vhdl_mode()
+               ? vhdl_type::logic3d_vector(width-1, 0)
+               : (issigned ? vhdl_type::nsigned(width)
+                  : vhdl_type::nunsigned(width)), true),
      qualified_(qualify),
      signed_(issigned)
 {
    // Can't rely on value being NULL-terminated
    while (width--)
       value_.push_back(*value++);
+}
+
+static const char *logic3d_const_name(char bit)
+{
+   switch (bit) {
+   case '0': return "L3D_0";
+   case '1': return "L3D_1";
+   case 'x': case 'X': return "L3D_X";
+   case 'z': case 'Z': return "L3D_Z";
+   default: return "L3D_X";
+   }
 }
 
 // True if char is not '1' or '0'
@@ -818,6 +831,19 @@ bool vhdl_const_bits::has_meta_bits() const
 
 void vhdl_const_bits::emit(std::ostream &of, int) const
 {
+   if (get_sv2vhdl_mode()) {
+      // Emit as logic3d_vector aggregate: (L3D_0, L3D_1, ...)
+      // MSB first (reverse of internal storage which is LSB-first)
+      of << "(";
+      size_t bits = value_.size();
+      for (size_t i = 0; i < bits; i++) {
+         if (i > 0) of << ", ";
+         of << logic3d_const_name(value_[bits - 1 - i]);
+      }
+      of << ")";
+      return;
+   }
+
    if (qualified_)
       of << (signed_ ? "signed" : "unsigned") << "'(";
 
@@ -839,9 +865,16 @@ void vhdl_const_bits::emit(std::ostream &of, int) const
    of << (qualified_ ? "\")" : "\"");
 }
 
+vhdl_const_bit::vhdl_const_bit(char bit)
+   : vhdl_expr(get_sv2vhdl_mode() ? vhdl_type::logic3d()
+               : vhdl_type::std_logic(), true), bit_(bit) {}
+
 void vhdl_const_bit::emit(std::ostream &of, int) const
 {
-   of << "'" << vl_to_vhdl_bit(bit_) << "'";
+   if (get_sv2vhdl_mode())
+      of << logic3d_const_name(bit_);
+   else
+      of << "'" << vl_to_vhdl_bit(bit_) << "'";
 }
 
 void vhdl_const_int::emit(std::ostream &of, int) const
@@ -1026,6 +1059,13 @@ void vhdl_unaryop_expr::find_vars(vhdl_var_set_t& read)
 
 void vhdl_unaryop_expr::emit(std::ostream &of, int level) const
 {
+   if (get_sv2vhdl_mode() && op_ == VHDL_UNARYOP_NOT) {
+      of << "l3d_not(";
+      operand_->emit(of, level);
+      of << ")";
+      return;
+   }
+
    open_parens(of);
 
    switch (op_) {
@@ -1073,6 +1113,31 @@ void vhdl_binop_expr::find_vars(vhdl_var_set_t& read)
 
 void vhdl_binop_expr::emit(std::ostream &of, int level) const
 {
+   // In sv2vhdl mode, bitwise logic operators on logic3d scalars use
+   // function calls instead of VHDL operators (integers don't have
+   // and/or/not/xor operators).
+   if (get_sv2vhdl_mode() && operands_.size() == 2) {
+      const char *l3d_fn = NULL;
+      switch (op_) {
+      case VHDL_BINOP_AND:  l3d_fn = "l3d_and"; break;
+      case VHDL_BINOP_OR:   l3d_fn = "l3d_or"; break;
+      case VHDL_BINOP_XOR:  l3d_fn = "l3d_xor"; break;
+      case VHDL_BINOP_NAND: l3d_fn = "l3d_nand"; break;
+      case VHDL_BINOP_NOR:  l3d_fn = "l3d_nor"; break;
+      case VHDL_BINOP_XNOR: l3d_fn = "l3d_xnor"; break;
+      default: break;
+      }
+      if (l3d_fn) {
+         of << l3d_fn << "(";
+         auto it = operands_.begin();
+         (*it)->emit(of, level);
+         of << ", ";
+         (*(++it))->emit(of, level);
+         of << ")";
+         return;
+      }
+   }
+
    open_parens(of);
 
    assert(! operands_.empty());

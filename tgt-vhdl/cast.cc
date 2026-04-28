@@ -22,6 +22,7 @@
 
 #include "vhdl_target.h"
 #include "support.hh"
+#include "state.hh"
 
 #include <cassert>
 #include <iostream>
@@ -172,6 +173,12 @@ vhdl_expr *vhdl_expr::to_boolean()
       conv->add_expr(this);
       return conv;
    }
+   else if (type_->get_name() == VHDL_TYPE_LOGIC3D) {
+      // logic3d: is_one(x) returns true for L3D_1, L3D_H, L3D_W
+      vhdl_fcall *conv = new vhdl_fcall("is_one", vhdl_type::boolean());
+      conv->add_expr(this);
+      return conv;
+   }
    else if (type_->get_name() == VHDL_TYPE_BOOLEAN) {
       // Already boolean
       return this;
@@ -205,12 +212,18 @@ vhdl_expr *vhdl_expr::to_boolean()
  */
 vhdl_expr *vhdl_expr::to_std_logic()
 {
+   if (type_->get_name() == VHDL_TYPE_LOGIC3D) {
+      // Already logic3d (the sv2vhdl equivalent of std_logic)
+      return this;
+   }
    if (type_->get_name() == VHDL_TYPE_BOOLEAN) {
       require_support_function(SF_BOOLEAN_TO_LOGIC);
 
+      vhdl_type *ret_type = get_sv2vhdl_mode()
+         ? vhdl_type::logic3d() : vhdl_type::std_logic();
       vhdl_fcall *ah =
          new vhdl_fcall(support_function::function_name(SF_BOOLEAN_TO_LOGIC),
-                        vhdl_type::std_logic());
+                        ret_type);
       ah->add_expr(this);
 
       return ah;
