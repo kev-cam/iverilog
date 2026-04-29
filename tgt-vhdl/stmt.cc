@@ -1134,18 +1134,26 @@ static vhdl_var_ref *draw_case_test(vhdl_procedural *proc, stmt_container *conta
    // references or slices. So we may need to create a temporary
    // variable to hold the result of the expression evaluation
    if (typeid(*test) != typeid(vhdl_var_ref)) {
-      const char *tmp_name = "Verilog_Case_Ex";
+      // Find a unique name for the case expression variable.
+      // Nested cases may have different widths, so we need separate variables.
       const vhdl_type *test_type = new vhdl_type(*test->get_type());
-
-      if (!proc->get_scope()->have_declared(tmp_name)) {
-         proc->get_scope()->add_decl
-            (new vhdl_var_decl(tmp_name, new vhdl_type(*test_type)));
+      std::string tmp_name_str = "Verilog_Case_Ex";
+      int suffix = 0;
+      while (proc->get_scope()->have_declared(tmp_name_str)
+             && proc->get_scope()->get_decl(tmp_name_str)->get_type()->get_width()
+                != test_type->get_width()) {
+         tmp_name_str = "Verilog_Case_Ex_" + std::to_string(++suffix);
       }
 
-      vhdl_var_ref *tmp_ref = new vhdl_var_ref(tmp_name, NULL);
+      if (!proc->get_scope()->have_declared(tmp_name_str)) {
+         proc->get_scope()->add_decl
+            (new vhdl_var_decl(tmp_name_str, new vhdl_type(*test_type)));
+      }
+
+      vhdl_var_ref *tmp_ref = new vhdl_var_ref(tmp_name_str.c_str(), NULL);
       container->add_stmt(new vhdl_assign_stmt(tmp_ref, test));
 
-      return new vhdl_var_ref(tmp_name, test_type);
+      return new vhdl_var_ref(tmp_name_str.c_str(), test_type);
    }
    else
       return dynamic_cast<vhdl_var_ref*>(test);
