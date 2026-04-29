@@ -925,6 +925,55 @@ void vhdl_cassign_stmt::add_condition(vhdl_expr *value, vhdl_expr *cond)
 
 void vhdl_cassign_stmt::emit(std::ostream &of, int level) const
 {
+   if (get_sv2vhdl_mode()) {
+      // In sv2vhdl mode, emit concurrent assignments as processes
+      // to avoid multi-driver issues. Each concurrent assign becomes
+      // a process(all) with a signal assignment.
+      emit_comment(of, level);
+      of << "process (all) is" << std::endl;
+      newline(of, level);
+      of << "begin";
+      newline(of, indent(level));
+      if (!whens_.empty()) {
+         // when/else -> if/elsif/else
+         for (std::list<when_part_t>::const_iterator it = whens_.begin();
+              it != whens_.end();
+              ++it) {
+            if (it == whens_.begin())
+               of << "if ";
+            else {
+               newline(of, indent(level));
+               of << "elsif ";
+            }
+            (*it).cond->emit(of, level);
+            of << " then";
+            newline(of, indent(indent(level)));
+            lhs_->emit(of, level);
+            of << " <= ";
+            (*it).value->emit(of, level);
+            of << ";";
+         }
+         newline(of, indent(level));
+         of << "else";
+         newline(of, indent(indent(level)));
+      }
+      lhs_->emit(of, level);
+      of << " <= ";
+      rhs_->emit(of, level);
+      if (after_) {
+         of << " after ";
+         after_->emit(of, level);
+      }
+      of << ";";
+      if (!whens_.empty()) {
+         newline(of, indent(level));
+         of << "end if;";
+      }
+      newline(of, level);
+      of << "end process;";
+      return;
+   }
+
    lhs_->emit(of, level);
    of << " <= ";
    if (!whens_.empty()) {
