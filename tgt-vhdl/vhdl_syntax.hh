@@ -207,12 +207,16 @@ private:
 class vhdl_const_bit : public vhdl_expr {
 public:
    explicit vhdl_const_bit(char bit);  // Defined in vhdl_syntax.cc
+   // Force std_logic type regardless of sv2vhdl mode (for casez comparisons)
+   static vhdl_const_bit *std_logic_bit(char bit);
    void emit(std::ostream &of, int level) const;
    vhdl_expr *to_boolean();
    vhdl_expr *to_integer();
    vhdl_expr *to_vector(vhdl_type_name_t name, int w);
    vhdl_expr *to_std_ulogic();
 private:
+   vhdl_const_bit(char bit, vhdl_type *t)
+      : vhdl_expr(t, true), bit_(bit) {}
    char bit_;
 };
 

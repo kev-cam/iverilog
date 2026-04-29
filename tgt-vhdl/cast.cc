@@ -49,6 +49,38 @@ vhdl_expr *vhdl_expr::cast(const vhdl_type *to)
       else
          return resize(to->get_width());
    }
+
+   // Cross-type conversions between logic3d and std_logic families
+   if (type_->get_name() == VHDL_TYPE_LOGIC3D_VECTOR
+       && (to->get_name() == VHDL_TYPE_UNSIGNED
+           || to->get_name() == VHDL_TYPE_STD_LOGIC_VECTOR)) {
+      // For constant bit vectors, emit directly as unsigned constant
+      // (needed for case alternatives which must be locally static).
+      // Force non-sv2vhdl mode temporarily to get unsigned type.
+      vhdl_const_bits *cbits = dynamic_cast<vhdl_const_bits*>(this);
+      if (cbits) {
+         int w = type_->get_width();
+         // Create a plain unsigned constant, bypassing logic3d
+         bool saved = get_sv2vhdl_mode();
+         set_sv2vhdl_mode(false);
+         vhdl_const_bits *result =
+            new vhdl_const_bits(cbits->get_value().c_str(), w, false);
+         set_sv2vhdl_mode(saved);
+         return result;
+      }
+      vhdl_fcall *conv = new vhdl_fcall("l3d_to_unsigned",
+                                         vhdl_type::nunsigned(type_->get_width()));
+      conv->add_expr(this);
+      return conv;
+   }
+   if ((type_->get_name() == VHDL_TYPE_UNSIGNED
+        || type_->get_name() == VHDL_TYPE_STD_LOGIC_VECTOR)
+       && to->get_name() == VHDL_TYPE_LOGIC3D_VECTOR) {
+      vhdl_fcall *conv = new vhdl_fcall("unsigned_to_l3d",
+                                         vhdl_type::logic3d_vector(type_->get_width()-1, 0));
+      conv->add_expr(this);
+      return conv;
+   }
    else {
       switch (to->get_name()) {
       case VHDL_TYPE_BOOLEAN:

@@ -1120,6 +1120,16 @@ static vhdl_var_ref *draw_case_test(vhdl_procedural *proc, stmt_container *conta
    if (NULL == test)
       return NULL;
 
+   // In sv2vhdl mode, extract the unsigned value field for case matching
+   if (get_sv2vhdl_mode() && test->get_type()
+       && test->get_type()->get_name() == VHDL_TYPE_LOGIC3D_VECTOR) {
+      int width = test->get_type()->get_width();
+      vhdl_fcall *conv = new vhdl_fcall("l3d_to_unsigned",
+                                         vhdl_type::nunsigned(width));
+      conv->add_expr(test);
+      test = conv;
+   }
+
    // VHDL case expressions are required to be quite simple: variable
    // references or slices. So we may need to create a temporary
    // variable to hold the result of the expression evaluation
@@ -1283,7 +1293,7 @@ static void check_against_x(vhdl_binop_expr *all, const vhdl_var_ref *test,
          vhdl_binop_expr *cmp =
             new vhdl_binop_expr(VHDL_BINOP_EQ, vhdl_type::boolean());
          cmp->add_expr(ref);
-         cmp->add_expr(new vhdl_const_bit('z'));
+         cmp->add_expr(vhdl_const_bit::std_logic_bit('z'));
          sub_expr->add_expr(cmp);
 
          // Compare the test bit against a constant 'x'.
@@ -1292,7 +1302,7 @@ static void check_against_x(vhdl_binop_expr *all, const vhdl_var_ref *test,
          ref->set_slice(new vhdl_const_int(i+base));
          cmp = new vhdl_binop_expr(VHDL_BINOP_EQ, vhdl_type::boolean());
          cmp->add_expr(ref);
-         cmp->add_expr(new vhdl_const_bit('x'));
+         cmp->add_expr(vhdl_const_bit::std_logic_bit('x'));
          sub_expr->add_expr(cmp);
 
          all->add_expr(sub_expr);
@@ -1335,7 +1345,7 @@ static void process_number(vhdl_binop_expr *all, const vhdl_var_ref *test,
       vhdl_binop_expr *cmp =
          new vhdl_binop_expr(VHDL_BINOP_EQ, vhdl_type::boolean());
       cmp->add_expr(ref);
-      cmp->add_expr(new vhdl_const_bit('z'));
+      cmp->add_expr(vhdl_const_bit::std_logic_bit('z'));
       sub_expr->add_expr(cmp);
 
       // If this is a casex statement check if the test bit is 'x'.
@@ -1345,7 +1355,7 @@ static void process_number(vhdl_binop_expr *all, const vhdl_var_ref *test,
          ref->set_slice(new vhdl_const_int(i+base));
          cmp = new vhdl_binop_expr(VHDL_BINOP_EQ, vhdl_type::boolean());
          cmp->add_expr(ref);
-         cmp->add_expr(new vhdl_const_bit('x'));
+         cmp->add_expr(vhdl_const_bit::std_logic_bit('x'));
          sub_expr->add_expr(cmp);
       }
 
@@ -1355,7 +1365,7 @@ static void process_number(vhdl_binop_expr *all, const vhdl_var_ref *test,
       ref->set_slice(new vhdl_const_int(i+base));
       cmp = new vhdl_binop_expr(VHDL_BINOP_EQ, vhdl_type::boolean());
       cmp->add_expr(ref);
-      cmp->add_expr(new vhdl_const_bit(bits[i]));
+      cmp->add_expr(vhdl_const_bit::std_logic_bit(bits[i]));
       sub_expr->add_expr(cmp);
 
       all->add_expr(sub_expr);
@@ -1413,7 +1423,7 @@ static bool process_signal(vhdl_binop_expr *all, const vhdl_var_ref *test,
             // Compare the bit against 'x'.
             cmp = new vhdl_binop_expr(VHDL_BINOP_EQ, vhdl_type::boolean());
             cmp->add_expr(ref);
-            cmp->add_expr(new vhdl_const_bit('x'));
+            cmp->add_expr(vhdl_const_bit::std_logic_bit('x'));
             all->add_expr(cmp);
             continue;
          } else {
@@ -1437,14 +1447,14 @@ static bool process_signal(vhdl_binop_expr *all, const vhdl_var_ref *test,
       // Check if the expression bit is 'z'.
       cmp = new vhdl_binop_expr(VHDL_BINOP_EQ, vhdl_type::boolean());
       cmp->add_expr(bit);
-      cmp->add_expr(new vhdl_const_bit('z'));
+      cmp->add_expr(vhdl_const_bit::std_logic_bit('z'));
       sub_expr->add_expr(cmp);
 
       // If this is a casex statement check if the expression bit is 'x'.
       if (!is_casez) {
          cmp = new vhdl_binop_expr(VHDL_BINOP_EQ, vhdl_type::boolean());
          cmp->add_expr(bit);
-         cmp->add_expr(new vhdl_const_bit('x'));
+         cmp->add_expr(vhdl_const_bit::std_logic_bit('x'));
          sub_expr->add_expr(cmp);
       }
 
@@ -1454,7 +1464,7 @@ static bool process_signal(vhdl_binop_expr *all, const vhdl_var_ref *test,
       ref->set_slice(new vhdl_const_int(i+base));
       cmp = new vhdl_binop_expr(VHDL_BINOP_EQ, vhdl_type::boolean());
       cmp->add_expr(ref);
-      cmp->add_expr(new vhdl_const_bit('z'));
+      cmp->add_expr(vhdl_const_bit::std_logic_bit('z'));
       sub_expr->add_expr(cmp);
 
       // If this is a casex statement check if the test bit is 'x'.
@@ -1464,7 +1474,7 @@ static bool process_signal(vhdl_binop_expr *all, const vhdl_var_ref *test,
          ref->set_slice(new vhdl_const_int(i+base));
          cmp = new vhdl_binop_expr(VHDL_BINOP_EQ, vhdl_type::boolean());
          cmp->add_expr(ref);
-         cmp->add_expr(new vhdl_const_bit('x'));
+         cmp->add_expr(vhdl_const_bit::std_logic_bit('x'));
          sub_expr->add_expr(cmp);
       }
 

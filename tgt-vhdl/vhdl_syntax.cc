@@ -837,7 +837,8 @@ bool vhdl_const_bits::has_meta_bits() const
 
 void vhdl_const_bits::emit(std::ostream &of, int) const
 {
-   if (get_sv2vhdl_mode()) {
+   if (get_sv2vhdl_mode()
+       && type_ && type_->get_name() == VHDL_TYPE_LOGIC3D_VECTOR) {
       // Emit as logic3d_vector aggregate: (L3D_0, L3D_1, ...)
       // MSB first (reverse of internal storage which is LSB-first)
       of << "(";
@@ -875,9 +876,15 @@ vhdl_const_bit::vhdl_const_bit(char bit)
    : vhdl_expr(get_sv2vhdl_mode() ? vhdl_type::logic3d()
                : vhdl_type::std_logic(), true), bit_(bit) {}
 
+vhdl_const_bit *vhdl_const_bit::std_logic_bit(char bit)
+{
+   return new vhdl_const_bit(bit, vhdl_type::std_logic());
+}
+
 void vhdl_const_bit::emit(std::ostream &of, int) const
 {
-   if (get_sv2vhdl_mode())
+   if (get_sv2vhdl_mode()
+       && type_ && type_->get_name() == VHDL_TYPE_LOGIC3D)
       of << logic3d_const_name(bit_);
    else
       of << "'" << vl_to_vhdl_bit(bit_) << "'";
