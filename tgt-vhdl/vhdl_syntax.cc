@@ -703,7 +703,7 @@ void vhdl_var_ref::set_slice(vhdl_expr *s, int w)
    }
    else if (tname == VHDL_TYPE_LOGIC3D_VECTOR) {
       if (w > 0)
-         type_ = vhdl_type::logic3d_vector(w - 1, 0);
+         type_ = vhdl_type::logic3d_vector(w, 0);  // w is MSB, not width
       else
          type_ = vhdl_type::logic3d();
    }
