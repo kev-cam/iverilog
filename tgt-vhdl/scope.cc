@@ -176,6 +176,11 @@ void draw_nexus(ivl_nexus_t nexus)
          }
 
          nexus_signal_width = ivl_signal_width(sig);
+
+         // Count output/inout/buffer ports as drivers
+         if (ivl_signal_port(sig) == IVL_SIP_OUTPUT
+             || ivl_signal_port(sig) == IVL_SIP_INOUT)
+            ndrivers++;
       }
    }
 
