@@ -106,8 +106,12 @@ extern "C" int target_design(ivl_design_t des)
    // Check for sv2vhdl mode flag
    set_sv2vhdl_mode(std::strcmp(ivl_design_flag(des, "sv2vhdl"), "") != 0);
 
-   for (unsigned int i = 0; i < nroots; i++)
+   for (unsigned int i = 0; i < nroots; i++) {
+      // Skip package scopes — they don't have VHDL entities
+      if (ivl_scope_type(roots[i]) == IVL_SCT_PACKAGE)
+         continue;
       draw_scope(roots[i], NULL);
+   }
 
    // Only generate processes if there were no errors generating entities
    // (otherwise the necessary information won't be present)

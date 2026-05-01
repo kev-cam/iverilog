@@ -178,6 +178,10 @@ vhdl_entity* find_entity(ivl_scope_t scope)
    while (ivl_scope_type(scope) == IVL_SCT_GENERATE)
       scope = ivl_scope_parent(scope);
 
+   // Package scopes don't have entities — return NULL
+   if (ivl_scope_type(scope) == IVL_SCT_PACKAGE)
+      return NULL;
+
    assert(ivl_scope_type(scope) == IVL_SCT_MODULE);
 
    if (is_default_scope_instance(scope)) {
