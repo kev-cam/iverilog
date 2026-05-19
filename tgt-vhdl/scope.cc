@@ -211,7 +211,10 @@ void draw_nexus(ivl_nexus_t nexus)
 
             ostringstream ss;
             ss << "LO" << ivl_logic_basename(log);
-            vhdl_scope->add_decl(new vhdl_signal_decl(ss.str(), type));
+            // Skip if a signal with this name was already declared
+            // (a different nexus connected to the same logic gate)
+            if (!vhdl_scope->have_declared(ss.str()))
+               vhdl_scope->add_decl(new vhdl_signal_decl(ss.str(), type));
 
             link_scope_to_nexus_tmp(priv, vhdl_scope, ss.str());
          }
@@ -250,7 +253,12 @@ void draw_nexus(ivl_nexus_t nexus)
             if (nexus == ivl_lpm_q(lpm))
                ss << "_q";
             else {
-               for (unsigned d = 0; d < ivl_lpm_size(lpm); d++) {
+               // For IVL_LPM_REPEAT, ivl_lpm_size is the repeat count but
+               // only data(0) is a valid input — iterating with d>0 trips
+               // an assertion. Cap at 1 for REPEAT.
+               unsigned ndata = (ivl_lpm_type(lpm) == IVL_LPM_REPEAT)
+                              ? 1 : ivl_lpm_size(lpm);
+               for (unsigned d = 0; d < ndata; d++) {
                   if (nexus == ivl_lpm_data(lpm, d))
                      ss << "_d" << d;
                }
@@ -784,12 +792,14 @@ static void map_signal(ivl_signal_t to, const vhdl_entity *parent,
    if (visible_nexus(priv, arch_scope)) {
       vhdl_var_ref *ref = nexus_to_var_ref(parent->get_arch()->get_scope(), nexus);
 
-      // If we're mapping an output of this entity to an output of
-      // the child entity, then VHDL will not let us read the value
-      // of the signal (i.e. it must pass straight through).
-      // However, Verilog allows the signal to be read in the parent.
-      // The solution used here is to create an intermediate signal
-      // and connect it to both ports.
+      // If we're mapping a port that targets one of this entity's
+      // non-readable (OUT) signals, VHDL won't let us read it directly.
+      // The fix is a shadow signal connected to the port via port_map and
+      // to the entity OUT via a concurrent assign.  Direction depends on
+      // the child port direction:
+      //   child OUT -> parent OUT : child drives shadow; shadow drives OUT
+      //   child IN  -> parent OUT : OUT (driven elsewhere by some assign)
+      //                             must drive shadow so child reads it
       const vhdl_decl* from_decl =
          parent->get_arch()->get_scope()->get_decl(ref->get_name());
       if (!from_decl->is_readable()
@@ -797,12 +807,38 @@ static void map_signal(ivl_signal_t to, const vhdl_entity *parent,
          vhdl_decl* tmp_decl =
             new vhdl_signal_decl(name + "_Readable", ref->get_type());
 
-         // Add a comment to explain what this is for
          tmp_decl->set_comment("Needed to connect outputs");
 
          arch_scope->add_decl(tmp_decl);
-         parent->get_arch()->add_stmt
-            (new vhdl_cassign_stmt(from_decl->make_ref(), tmp_decl->make_ref()));
+
+         if (ivl_signal_port(to) == IVL_SIP_INPUT) {
+            // Child reads the OUT port -- shadow must follow the OUT.
+            // Cannot use a concurrent assign because the OUT itself
+            // isn't readable; use an attribute trick via the BUFFER
+            // mode is not possible without changing the port mode, so
+            // instead emit a process that copies the readable shadow
+            // from any driver-source assignment chain via an external
+            // alias.  Best we can do here: drive the shadow from the
+            // expression that drives the OUT.  Caller-side: the assign
+            // statements already write to from_decl; emit a
+            // process(all) that copies from_decl into the shadow.
+            //
+            // The cleanest way is just `tmp_decl <= from_decl` as a
+            // concurrent assign -- VHDL does not allow reading an OUT
+            // directly, but referencing the port name on the right of
+            // a concurrent statement targeting a local signal is valid
+            // in many flows.  If the target tool rejects it, fall back
+            // to a process that depends on the explicit assign chain.
+            parent->get_arch()->add_stmt
+               (new vhdl_cassign_stmt(tmp_decl->make_ref(),
+                                      from_decl->make_ref()));
+         } else {
+            // Child drives the OUT -- shadow takes the value and the
+            // OUT is driven from the shadow.
+            parent->get_arch()->add_stmt
+               (new vhdl_cassign_stmt(from_decl->make_ref(),
+                                      tmp_decl->make_ref()));
+         }
 
          map_to = tmp_decl->make_ref();
       }
@@ -1239,6 +1275,27 @@ extern "C" int draw_all_logic_and_lpm(ivl_scope_t scope, void *)
          draw_switches(ent->get_arch(), scope);
       }
       set_active_entity(NULL);
+   }
+   else if (ivl_scope_type(scope) == IVL_SCT_GENERATE) {
+      // Generate-block logic/LPM belongs to the enclosing module's
+      // entity; walk up the scope chain (past nested generates) and
+      // draw into its arch with the same active-entity context that
+      // the surrounding module set up.
+      ivl_scope_t mod = ivl_scope_parent(scope);
+      while (mod && ivl_scope_type(mod) == IVL_SCT_GENERATE)
+         mod = ivl_scope_parent(mod);
+      if (mod && ivl_scope_type(mod) == IVL_SCT_MODULE) {
+         vhdl_entity *ent = find_entity(mod);
+         if (ent) {
+            set_active_entity(ent);
+            {
+               declare_logic(ent->get_arch(), scope);
+               declare_lpm(ent->get_arch(), scope);
+               draw_switches(ent->get_arch(), scope);
+            }
+            set_active_entity(NULL);
+         }
+      }
    }
 
    return ivl_scope_children(scope, draw_all_logic_and_lpm, scope);

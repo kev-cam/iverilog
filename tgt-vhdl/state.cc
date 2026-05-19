@@ -82,6 +82,8 @@ static bool g_sv2vhdl_mode = false;
 typedef std::vector<ivl_scope_t> default_scopes_t;
 static default_scopes_t g_default_scopes;
 
+static bool same_scope_type_name(ivl_scope_t a, ivl_scope_t b);
+
 // True if signal `sig' has already been encountered by the code
 // generator. This means we have already assigned it to a VHDL code
 // object and possibly renamed it.
@@ -192,11 +194,14 @@ vhdl_entity* find_entity(ivl_scope_t scope)
          return NULL;
    }
    else {
-      const char *tname = ivl_scope_tname(scope);
-
+      // Non-default instance: find the matching default scope by both
+      // type name AND parameter values. Matching only by type name
+      // returns the wrong entity when the same module is elaborated with
+      // multiple parameter combinations (e.g. rvdff with WIDTH=3 and
+      // WIDTH=5 produce distinct entities, both with tname "rvdff").
       for (scope_name_map_t::iterator it = g_scope_names.begin();
            it != g_scope_names.end(); ++it) {
-         if (strcmp(tname, ivl_scope_tname((*it).first)) == 0)
+         if (same_scope_type_name(scope, (*it).first))
             return find_entity((*it).second);
       }
 
@@ -271,8 +276,26 @@ bool get_sv2vhdl_mode()
  */
 static bool same_scope_type_name(ivl_scope_t a, ivl_scope_t b)
 {
-   if (strcmp(ivl_scope_tname(a), ivl_scope_tname(b)) != 0)
+   const char *ta = ivl_scope_tname(a), *tb = ivl_scope_tname(b);
+   if (strcmp(ta, tb) != 0)
       return false;
+
+   // For GENERATE scopes the type name alone doesn't capture the
+   // enclosing parameterized context: a `genblock` inside rvdffe(WIDTH=8)
+   // shares its tname with the `genblock` inside rvdffe(WIDTH=31), but
+   // their child sub-instances elaborate at different widths.  Walk up
+   // to the enclosing MODULE on both sides and compare those instead;
+   // the recursive call disambiguates by the module's parameter values.
+   if (ivl_scope_type(a) == IVL_SCT_GENERATE) {
+      ivl_scope_t pa = ivl_scope_parent(a);
+      ivl_scope_t pb = ivl_scope_parent(b);
+      while (pa && ivl_scope_type(pa) == IVL_SCT_GENERATE)
+         pa = ivl_scope_parent(pa);
+      while (pb && ivl_scope_type(pb) == IVL_SCT_GENERATE)
+         pb = ivl_scope_parent(pb);
+      if (pa != NULL && pb != NULL)
+         return same_scope_type_name(pa, pb);
+   }
 
    unsigned nparams_a = ivl_scope_params(a);
    unsigned nparams_b = ivl_scope_params(b);
@@ -288,8 +311,12 @@ static bool same_scope_type_name(ivl_scope_t a, ivl_scope_t b)
                  ivl_parameter_basename(param_b)) != 0)
          return false;
 
-      if (ivl_parameter_local(param_a) && ivl_parameter_local(param_b))
-	    continue;
+      // Note: don't skip local parameters here.  Parameterized modules
+      // can have their effective WIDTH/etc. exposed as a local parameter
+      // (after parameter resolution).  Treating two scope instances with
+      // different localparam values as the same scope-type collapses
+      // their elaboration -- only the first gets its child hierarchy
+      // fully drawn, leaving the others as truncated arches.
 
       // If this is a type parameter consider the scopes not equal since we do
       // not have support for comparing the actual types yet.

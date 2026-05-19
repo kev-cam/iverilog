@@ -44,6 +44,23 @@ static void default_logic(vhdl_arch *arch, ivl_net_logic_t log);
 /*
  * Build a safe VHDL instance name from a base name and prefix.
  */
+// Build a basename string that includes the generate-scope chain so two
+// gates in different generate branches of the same module don't collide
+// after both branches' logic is hoisted into the module arch.
+static string scoped_basename(const char *raw_basename, ivl_scope_t scope)
+{
+   string suffix;
+   while (scope && ivl_scope_type(scope) == IVL_SCT_GENERATE) {
+      const char *bn = ivl_scope_basename(scope);
+      if (bn && *bn) {
+         suffix.insert(0, "_");
+         suffix.insert(0, bn);
+      }
+      scope = ivl_scope_parent(scope);
+   }
+   return suffix.empty() ? string(raw_basename) : (suffix + raw_basename);
+}
+
 static string make_inst_name(const char *basename, const char *prefix)
 {
    ostringstream ss;
@@ -343,7 +360,9 @@ static void sv_prim_logic(vhdl_arch *arch, ivl_net_logic_t log)
       return;
    }
 
-   string inst_name = make_inst_name(ivl_logic_basename(log), entity_name);
+   string inst_name = make_inst_name(
+      scoped_basename(ivl_logic_basename(log), ivl_logic_scope(log)).c_str(),
+      entity_name);
 
    vhdl_entity_inst *inst = new vhdl_entity_inst(
       inst_name.c_str(), "sv2vhdl", entity_name, "behavioral");
@@ -404,7 +423,9 @@ static void sv_multi_input_logic(vhdl_arch *arch, ivl_net_logic_t log)
    int npins = ivl_logic_pins(log);
    int ninputs = npins - 1;
 
-   string inst_name = make_inst_name(ivl_logic_basename(log), entity_name);
+   string inst_name = make_inst_name(
+      scoped_basename(ivl_logic_basename(log), ivl_logic_scope(log)).c_str(),
+      entity_name);
    vhdl_entity_inst *inst = new vhdl_entity_inst(
       inst_name.c_str(), "sv2vhdl", entity_name, "behavioral");
 
@@ -454,7 +475,9 @@ static void sv_buf_not_logic(vhdl_arch *arch, ivl_net_logic_t log)
    const char *entity_name = (ivl_logic_type(log) == IVL_LO_NOT)
       ? "sv_not" : "sv_buf";
 
-   string inst_name = make_inst_name(ivl_logic_basename(log), entity_name);
+   string inst_name = make_inst_name(
+      scoped_basename(ivl_logic_basename(log), ivl_logic_scope(log)).c_str(),
+      entity_name);
 
    // Create a temporary std_logic_vector signal for the output
    string tmp_name = inst_name + "_y";
@@ -613,7 +636,9 @@ static void draw_one_switch(vhdl_arch *arch, ivl_switch_t sw)
       return;
    }
 
-   string inst_name = make_inst_name(ivl_switch_basename(sw), entity_name);
+   string inst_name = make_inst_name(
+      scoped_basename(ivl_switch_basename(sw), ivl_switch_scope(sw)).c_str(),
+      entity_name);
    vhdl_entity_inst *inst = new vhdl_entity_inst(
       inst_name.c_str(), "sv2vhdl", entity_name, arch_name);
 
