@@ -1159,12 +1159,70 @@ static vhdl_var_ref *draw_case_test(vhdl_procedural *proc, stmt_container *conta
       return dynamic_cast<vhdl_var_ref*>(test);
 }
 
+// Return true if every case-choice expression in `stmt` is a constant.
+// Verilog allows non-constant case choices (`case (1'b1) when sig:`) but
+// VHDL requires choices to be locally static; if any branch is dynamic
+// we'll have to emit an if/elsif chain instead.
+static bool case_choices_all_static(ivl_statement_t stmt)
+{
+   int nbranches = ivl_stmt_case_count(stmt);
+   for (int i = 0; i < nbranches; i++) {
+      ivl_expr_t net = ivl_stmt_case_expr(stmt, i);
+      if (!net) continue;   // default branch
+      ivl_expr_type_t et = ivl_expr_type(net);
+      if (et != IVL_EX_NUMBER && et != IVL_EX_STRING && et != IVL_EX_ULONG)
+         return false;
+   }
+   return true;
+}
+
 static int draw_case(vhdl_procedural *proc, stmt_container *container,
                      ivl_statement_t stmt, bool is_last)
 {
    vhdl_var_ref *test = draw_case_test(proc, container, stmt);
    if (NULL == test)
       return 1;
+
+   if (!case_choices_all_static(stmt)) {
+      // Emit an if/elsif chain: `when expr =>` becomes
+      // `if test = expr then ... elsif test = expr2 then ...`.
+      vhdl_if_stmt *if_chain = NULL;
+      ivl_statement_t default_stmt = NULL;
+      int nbranches = ivl_stmt_case_count(stmt);
+      for (int i = 0; i < nbranches; i++) {
+         ivl_expr_t net = ivl_stmt_case_expr(stmt, i);
+         ivl_statement_t bstmt = ivl_stmt_case_stmt(stmt, i);
+         if (!net) { default_stmt = bstmt; continue; }
+
+         vhdl_expr *when = translate_expr(net);
+         if (!when) return 1;
+         when = when->cast(test->get_type());
+         if (!when) return 1;
+
+         vhdl_expr *cmp = new vhdl_binop_expr(
+            new vhdl_var_ref(test->get_name().c_str(), test->get_type()),
+            VHDL_BINOP_EQ, when, vhdl_type::boolean());
+
+         stmt_container *body;
+         if (if_chain == NULL) {
+            if_chain = new vhdl_if_stmt(cmp);
+            body = if_chain->get_then_container();
+         } else {
+            body = if_chain->add_elsif(cmp);
+         }
+         draw_stmt(proc, body, bstmt, is_last);
+      }
+      if (if_chain == NULL) {
+         // Only had a default; emit it directly.
+         if (default_stmt)
+            draw_stmt(proc, container, default_stmt, is_last);
+         return 0;
+      }
+      if (default_stmt)
+         draw_stmt(proc, if_chain->get_else_container(), default_stmt, is_last);
+      container->add_stmt(if_chain);
+      return 0;
+   }
 
    vhdl_case_stmt *vhdlcase = new vhdl_case_stmt(test);
    container->add_stmt(vhdlcase);
