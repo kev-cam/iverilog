@@ -1190,8 +1190,14 @@ extern "C" int draw_constant_drivers(ivl_scope_t scope, void *)
 
    ivl_scope_children(scope, draw_constant_drivers, scope);
 
-   if (ivl_scope_type(scope) == IVL_SCT_MODULE) {
-      vhdl_entity *ent = find_entity(scope);
+   if (ivl_scope_type(scope) == IVL_SCT_MODULE
+       || ivl_scope_type(scope) == IVL_SCT_GENERATE) {
+      // For generate scopes, hoist drivers to the containing module entity
+      // (mirroring declare_signals/draw_all_signals).
+      ivl_scope_t ent_scope = scope;
+      while (ivl_scope_type(ent_scope) == IVL_SCT_GENERATE)
+         ent_scope = ivl_scope_parent(ent_scope);
+      vhdl_entity *ent = find_entity(ent_scope);
       assert(ent);
 
       int nsigs = ivl_scope_sigs(scope);
