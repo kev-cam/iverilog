@@ -27,11 +27,13 @@
 #include <map>
 #include "vhdl_element.hh"
 #include "vhdl_type.hh"
+#include <vector>
 
 class vhdl_scope;
 class vhdl_entity;
 class vhdl_arch;
 class vhdl_var_ref;
+class stmt_container;
 
 typedef std::set<vhdl_var_ref*> vhdl_var_set_t;
 
@@ -78,11 +80,17 @@ public:
    const std::string &get_name() const { return name_; }
    void set_name(const std::string &name) { name_ = name; }
    void set_slice(vhdl_expr *s, int w=0);
+   vhdl_expr *get_slice() const { return slice_; }
+   unsigned get_slice_width() const { return slice_width_; }
+   // Append an additional bit-select to the chain (emits as `(idx)(extra)…`).
+   // Used by `$set_val(arr, i, j, val)` to build `arr(i)(j) := val`.
+   void add_extra_slice(vhdl_expr *s) { extra_slices_.push_back(s); }
    void find_vars(vhdl_var_set_t& read);
 private:
    std::string name_;
    vhdl_expr *slice_;
    unsigned slice_width_;
+   std::vector<vhdl_expr *> extra_slices_;
 };
 
 enum vhdl_binop_t {
@@ -243,6 +251,7 @@ public:
       : vhdl_expr(vhdl_type::integer(), true), value_(value) {}
    void emit(std::ostream &of, int level) const;
    vhdl_expr *to_vector(vhdl_type_name_t name, int w);
+   int64_t get_value() const { return value_; }
 private:
    int64_t value_;
 };
@@ -371,6 +380,11 @@ public:
    // This is used to clean up the VHDL output
    virtual void find_vars(vhdl_var_set_t& read,
                           vhdl_var_set_t& write) = 0;
+
+   // Append any sub-statement containers this stmt holds to `out`.
+   // Used by post-processing passes (e.g. shadow_blocking_targets) that
+   // need to walk the whole statement tree.
+   virtual void get_sub_containers(std::vector<stmt_container*>&) {}
 };
 
 
@@ -383,6 +397,7 @@ public:
    ~stmt_container();
 
    void add_stmt(vhdl_seq_stmt *stmt);
+   void prepend_stmt(vhdl_seq_stmt *stmt) { stmts_.push_front(stmt); }
    void move_stmts_from(stmt_container *other);
    void emit(std::ostream &of, int level, bool newline=true) const;
    bool empty() const { return stmts_.empty(); }
@@ -406,6 +421,8 @@ public:
 
    void set_after(vhdl_expr *after) { after_ = after; }
    void find_vars(vhdl_var_set_t& read, vhdl_var_set_t& write);
+   vhdl_var_ref *get_lhs() const { return lhs_; }
+   vhdl_expr *get_rhs() const { return rhs_; }
 protected:
    vhdl_var_ref *lhs_;
    vhdl_expr *rhs_, *after_;
@@ -419,9 +436,13 @@ protected:
 class vhdl_nbassign_stmt : public vhdl_abstract_assign_stmt {
 public:
    vhdl_nbassign_stmt(vhdl_var_ref *lhs, vhdl_expr *rhs)
-      : vhdl_abstract_assign_stmt(lhs, rhs) {}
+      : vhdl_abstract_assign_stmt(lhs, rhs), emit_as_var_(false) {}
 
    void emit(std::ostream &of, int level) const;
+   void set_emit_as_var() { emit_as_var_ = true; }
+   bool get_emit_as_var() const { return emit_as_var_; }
+private:
+   bool emit_as_var_;
 };
 
 
@@ -516,6 +537,13 @@ public:
    stmt_container *add_elsif(vhdl_expr *test);
    void emit(std::ostream &of, int level) const;
    void find_vars(vhdl_var_set_t& read, vhdl_var_set_t& write);
+   void get_sub_containers(std::vector<stmt_container*>& out) {
+      out.push_back(&then_part_);
+      out.push_back(&else_part_);
+      for (std::list<elsif>::iterator it = elsif_parts_.begin();
+           it != elsif_parts_.end(); ++it)
+         out.push_back(it->container);
+   }
 private:
    struct elsif {
       vhdl_expr *test;
@@ -555,6 +583,12 @@ public:
    void add_branch(vhdl_case_branch *b) { branches_.push_back(b); }
    void emit(std::ostream &of, int level) const;
    void find_vars(vhdl_var_set_t& read, vhdl_var_set_t& write);
+   case_branch_list_t &get_branches() { return branches_; }
+   void get_sub_containers(std::vector<stmt_container*>& out) {
+      for (case_branch_list_t::iterator it = branches_.begin();
+           it != branches_.end(); ++it)
+         out.push_back((*it)->get_container());
+   }
 private:
    vhdl_expr *test_;
    case_branch_list_t branches_;
@@ -569,6 +603,9 @@ public:
    void emit(std::ostream &of, int level) const;
    virtual void find_vars(vhdl_var_set_t& read,
                           vhdl_var_set_t& write);
+   void get_sub_containers(std::vector<stmt_container*>& out) {
+      out.push_back(&stmts_);
+   }
 private:
    stmt_container stmts_;
 };
@@ -874,6 +911,8 @@ public:
    // Managing set of blocking assignment targets in this block
    void add_blocking_target(const vhdl_var_ref* ref);
    bool is_blocking_target(const vhdl_var_ref* ref) const;
+   const std::set<std::string>& get_blocking_targets() const
+      { return blocking_targets_; }
 
 protected:
    stmt_container stmts_;

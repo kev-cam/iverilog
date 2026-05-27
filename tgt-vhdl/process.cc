@@ -20,6 +20,7 @@
 
 #include "vhdl_target.h"
 #include "vhdl_element.hh"
+#include "vhdl_syntax.hh"
 #include "state.hh"
 
 #include <iostream>
@@ -29,6 +30,256 @@
 #include <vector>
 #include <set>
 #include <utility>
+
+// ---------------------------------------------------------------------------
+// Shadow blocking-target signals with process variables.
+//
+// iverilog emits Verilog blocking assignments (`=`) as VHDL non-blocking
+// signal assignments (`<=`) with an explicit `wait for 0 ns;` whenever a
+// later statement in the same process reads the target.  This is the only
+// way to recover the read-after-write semantics with signals.
+//
+// The trouble is that `wait for 0 ns;` introduces a delta cycle in the
+// middle of an always-block.  If the process resets a signal at the top
+// of the block (`signal <= default;`) and then a case branch overrides
+// the signal AFTER the wait, the default value commits at the wait and
+// the override commits one delta later — producing two events per
+// iteration.  When the process is sensitive to its own outputs (as is
+// the case for an always-comb translated this way), the second event
+// re-fires the process and we never converge.  See livelock_test6.vhd.
+//
+// The fix is to shadow each blocking-target signal with a process-local
+// variable.  Writes go to the variable (`v_sig := …`), reads come from
+// the variable (`v_sig…`), and a single `sig <= v_sig` at the end of the
+// process commits the final value.  No `wait for 0 ns;` is needed
+// because variables hold their values across statements without delta
+// cycles, so reads always see the most-recent in-process write.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct WriteInfo {
+   bool found = false;
+   bool ambiguous = false;
+   vhdl_expr *slice = NULL;
+   unsigned slice_width = 0;
+};
+
+static bool same_const_int(vhdl_expr *a, vhdl_expr *b)
+{
+   vhdl_const_int *ca = dynamic_cast<vhdl_const_int*>(a);
+   vhdl_const_int *cb = dynamic_cast<vhdl_const_int*>(b);
+   return ca && cb && ca->get_value() == cb->get_value();
+}
+
+static void find_write_info_recurse(vhdl_seq_stmt *s,
+                                    const std::string &name,
+                                    WriteInfo &info);
+
+static void find_write_info(stmt_container *c,
+                            const std::string &name,
+                            WriteInfo &info)
+{
+   for (vhdl_seq_stmt *s : c->get_stmts()) {
+      find_write_info_recurse(s, name, info);
+      if (info.ambiguous)
+         return;
+   }
+}
+
+static void find_write_info_recurse(vhdl_seq_stmt *s,
+                                    const std::string &name,
+                                    WriteInfo &info)
+{
+   if (info.ambiguous)
+      return;
+   if (vhdl_nbassign_stmt *nb = dynamic_cast<vhdl_nbassign_stmt*>(s)) {
+      if (nb->get_lhs()->get_name() == name) {
+         vhdl_expr *slice = nb->get_lhs()->get_slice();
+         unsigned w = nb->get_lhs()->get_slice_width();
+         if (!info.found) {
+            info.found = true;
+            info.slice = slice;
+            info.slice_width = w;
+         } else {
+            // Subsequent write: must target the same slice or we bail.
+            bool same;
+            if (info.slice == NULL && slice == NULL)
+               same = true;
+            else
+               same = (info.slice_width == w
+                       && same_const_int(info.slice, slice));
+            if (!same)
+               info.ambiguous = true;
+         }
+      }
+   }
+   std::vector<stmt_container*> subs;
+   s->get_sub_containers(subs);
+   for (stmt_container *sc : subs)
+      find_write_info(sc, name, info);
+}
+
+static void mark_var_assigns(stmt_container *c, const std::string &var_name);
+
+static void mark_var_assigns_recurse(vhdl_seq_stmt *s,
+                                     const std::string &var_name)
+{
+   if (vhdl_nbassign_stmt *nb = dynamic_cast<vhdl_nbassign_stmt*>(s)) {
+      if (nb->get_lhs()->get_name() == var_name)
+         nb->set_emit_as_var();
+   }
+   std::vector<stmt_container*> subs;
+   s->get_sub_containers(subs);
+   for (stmt_container *sc : subs)
+      mark_var_assigns(sc, var_name);
+}
+
+static void mark_var_assigns(stmt_container *c, const std::string &var_name)
+{
+   for (vhdl_seq_stmt *s : c->get_stmts())
+      mark_var_assigns_recurse(s, var_name);
+}
+
+static void remove_wait_for_0(stmt_container *body)
+{
+   stmt_container::stmt_list_t &stmts = body->get_stmts();
+   stmt_container::stmt_list_t::iterator it = stmts.begin();
+   while (it != stmts.end()) {
+      vhdl_wait_stmt *w = dynamic_cast<vhdl_wait_stmt*>(*it);
+      if (w && w->get_type() == VHDL_WAIT_FOR0) {
+         delete *it;
+         it = stmts.erase(it);
+      } else {
+         std::vector<stmt_container*> subs;
+         (*it)->get_sub_containers(subs);
+         for (stmt_container *sub : subs)
+            remove_wait_for_0(sub);
+         ++it;
+      }
+   }
+}
+
+static vhdl_expr *clone_slice(vhdl_expr *e)
+{
+   if (e == NULL)
+      return NULL;
+   if (vhdl_const_int *ci = dynamic_cast<vhdl_const_int*>(e))
+      return new vhdl_const_int(ci->get_value());
+   return NULL;
+}
+
+static void shadow_blocking_targets(vhdl_process *vhdl_proc, vhdl_entity *ent)
+{
+   const std::set<std::string> &targets = vhdl_proc->get_blocking_targets();
+   if (targets.empty())
+      return;
+
+   stmt_container *body = vhdl_proc->get_container();
+   vhdl_scope *proc_scope = vhdl_proc->get_scope();
+   vhdl_scope *arch_scope = ent->get_arch()->get_scope();
+
+   for (std::set<std::string>::const_iterator tit = targets.begin();
+        tit != targets.end(); ++tit) {
+      const std::string &sig_name = *tit;
+
+      vhdl_decl *sig_decl = arch_scope->get_decl(sig_name);
+      if (sig_decl == NULL)
+         continue;
+      if (sig_decl->assignment_type() != vhdl_decl::ASSIGN_NONBLOCK)
+         continue;  // already a variable — nothing to do
+
+      WriteInfo info;
+      find_write_info(body, sig_name, info);
+      if (!info.found || info.ambiguous)
+         continue;  // skip mixed-slice cases for now
+
+      // If the write has a slice we don't know how to clone, skip.
+      vhdl_expr *commit_lhs_slice = NULL;
+      vhdl_expr *commit_rhs_slice = NULL;
+      if (info.slice) {
+         commit_lhs_slice = clone_slice(info.slice);
+         commit_rhs_slice = clone_slice(info.slice);
+         if (commit_lhs_slice == NULL || commit_rhs_slice == NULL) {
+            delete commit_lhs_slice;
+            delete commit_rhs_slice;
+            continue;
+         }
+      }
+
+      std::string var_name = "v_" + sig_name;
+      while (proc_scope->have_declared(var_name))
+         var_name += "_";
+
+      const vhdl_type *src_type = sig_decl->get_type();
+      vhdl_var_decl *var_decl =
+         new vhdl_var_decl(var_name, new vhdl_type(*src_type));
+      proc_scope->add_decl(var_decl);
+
+      // Rename all in-body refs of sig_name to var_name.  This rewrites
+      // both reads (RHS, conditions, etc.) and the LHS of nbassign stmts.
+      vhdl_var_set_t reads, writes;
+      body->find_vars(reads, writes);
+      for (vhdl_var_set_t::iterator rit = reads.begin();
+           rit != reads.end(); ++rit) {
+         if ((*rit)->get_name() == sig_name)
+            (*rit)->set_name(var_name);
+      }
+      for (vhdl_var_set_t::iterator wit = writes.begin();
+           wit != writes.end(); ++wit) {
+         if ((*wit)->get_name() == sig_name)
+            (*wit)->set_name(var_name);
+      }
+
+      // The nbassign statements whose LHS now refers to the variable must
+      // emit as `:=` rather than `<=`.
+      mark_var_assigns(body, var_name);
+
+      // Prepend `v_sig := sig;` so reads of other slices see live values.
+      {
+         vhdl_var_ref *init_lhs =
+            new vhdl_var_ref(var_name, new vhdl_type(*src_type));
+         vhdl_var_ref *init_rhs =
+            new vhdl_var_ref(sig_name, new vhdl_type(*src_type));
+         body->prepend_stmt(new vhdl_assign_stmt(init_lhs, init_rhs));
+      }
+
+      // Append `sig(slice) <= v_sig(slice);` just before the trailing
+      // wait_on (or at end if no trailing wait).
+      {
+         vhdl_var_ref *lhs =
+            new vhdl_var_ref(sig_name, new vhdl_type(*src_type));
+         if (commit_lhs_slice)
+            lhs->set_slice(commit_lhs_slice, info.slice_width);
+         vhdl_var_ref *rhs =
+            new vhdl_var_ref(var_name, new vhdl_type(*src_type));
+         if (commit_rhs_slice)
+            rhs->set_slice(commit_rhs_slice, info.slice_width);
+         vhdl_nbassign_stmt *commit = new vhdl_nbassign_stmt(lhs, rhs);
+
+         stmt_container::stmt_list_t &stmts = body->get_stmts();
+         stmt_container::stmt_list_t::iterator wait_pos = stmts.end();
+         for (stmt_container::stmt_list_t::iterator it = stmts.begin();
+              it != stmts.end(); ++it) {
+            vhdl_wait_stmt *w = dynamic_cast<vhdl_wait_stmt*>(*it);
+            if (w && (w->get_type() == VHDL_WAIT_ON
+                      || w->get_type() == VHDL_WAIT_INDEF))
+               wait_pos = it;
+         }
+         if (wait_pos != stmts.end())
+            stmts.insert(wait_pos, commit);
+         else
+            stmts.push_back(commit);
+      }
+   }
+
+   // wait_for_0 stmts are no longer needed: blocking-read semantics are
+   // now expressed through variables, which see all in-process writes
+   // without a delta cycle.
+   remove_wait_for_0(body);
+}
+
+}  // namespace
 
 // Signals whose initial value was hoisted to a declaration default.
 // These signals should have their first assignment skipped in the
@@ -154,6 +405,15 @@ static int generate_vhdl_process(vhdl_entity *ent, ivl_process_t proc)
    int rc = draw_stmt(vhdl_proc, vhdl_proc->get_container(), stmt);
    if (rc != 0)
       return rc;
+
+   // Replace each blocking-target signal with a process-local variable
+   // shadow so we can drop the `wait for 0 ns;` statements that would
+   // otherwise commit intermediate values and drive delta-cycle livelock
+   // on self-sensitive always-comb blocks.  Only applied to non-initial
+   // processes (initial blocks have different semantics and are emitted
+   // as deposit-style assignments anyway).
+   if (ivl_process_type(proc) != IVL_PR_INITIAL)
+      shadow_blocking_targets(vhdl_proc, ent);
 
    // Initial processes are translated to VHDL processes with
    // no sensitivity list and and indefinite wait statement at

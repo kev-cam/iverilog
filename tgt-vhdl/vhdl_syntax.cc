@@ -621,6 +621,18 @@ void vhdl_signal_decl::emit(std::ostream &of, int level) const
    if (initial_) {
       of << " := ";
       initial_->emit(of, level);
+   } else if (get_sv2vhdl_mode()) {
+      // Pragmatic init: L3D_0 (driven 0, certain) so combinational
+      // networks settle without producing X-states that re-trigger
+      // delta-cycle loops. Loses Verilog X-semantics but lets benchmark
+      // designs converge on first iteration. Real Verilog semantics
+      // would use L3D_0X; revisit once iverilog uses VHDL variables for
+      // procedural locals in always_comb.
+      vhdl_type_name_t tn = type_->get_name();
+      if (tn == VHDL_TYPE_LOGIC3D)
+         of << " := L3D_0";
+      else if (tn == VHDL_TYPE_LOGIC3D_VECTOR)
+         of << " := (others => L3D_0)";
    }
 
    of << ";";
@@ -707,6 +719,11 @@ void vhdl_var_ref::set_slice(vhdl_expr *s, int w)
       else
          type_ = vhdl_type::logic3d();
    }
+   else if (tname == VHDL_TYPE_LOGIC3D) {
+      // Bit-select on a single logic3d is degenerate: the only valid index
+      // is 0, and the result is still a logic3d.
+      type_ = vhdl_type::logic3d();
+   }
    else {
       assert(tname == VHDL_TYPE_UNSIGNED || tname == VHDL_TYPE_SIGNED);
 
@@ -732,6 +749,11 @@ void vhdl_var_ref::emit(std::ostream &of, int level) const
          of << " + " << slice_width_ << " downto ";
       }
       slice_->emit(of, level);
+      of << ")";
+   }
+   for (auto *extra : extra_slices_) {
+      of << "(";
+      extra->emit(of, level);
       of << ")";
    }
 }
@@ -779,10 +801,10 @@ void vhdl_abstract_assign_stmt::find_vars(vhdl_var_set_t& read,
 void vhdl_nbassign_stmt::emit(std::ostream &of, int level) const
 {
    lhs_->emit(of, level);
-   of << " <= ";
+   of << (emit_as_var_ ? " := " : " <= ");
    rhs_->emit(of, level);
 
-   if (after_) {
+   if (after_ && !emit_as_var_) {
       of << " after ";
       after_->emit(of, level);
    }
