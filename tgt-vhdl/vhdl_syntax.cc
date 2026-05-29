@@ -737,6 +737,10 @@ void vhdl_var_ref::set_slice(vhdl_expr *s, int w)
 void vhdl_var_ref::find_vars(vhdl_var_set_t& read)
 {
    read.insert(this);
+   if (slice_)
+      slice_->find_vars(read);
+   for (auto *extra : extra_slices_)
+      extra->find_vars(read);
 }
 
 void vhdl_var_ref::emit(std::ostream &of, int level) const
