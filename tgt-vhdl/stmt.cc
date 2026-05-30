@@ -593,9 +593,15 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
       // signal. Deposit writes the effective value without a driver,
       // matching Verilog's shared-driver reg semantics.
       // NVC --std=2040 supports := on signals (T_DEPOSIT).
+      //
+      // Exception: an NBA with an `after` delay (`a <= #2 1;`) needs the
+      // signal-assignment semantics so the value change is scheduled,
+      // not deposited immediately.  vhdl_assign_stmt has no `after`
+      // form, so keep it as a non-blocking signal assignment.
       vhdl_decl::assign_type_t atype = decl->assignment_type();
       if (proc->get_scope()->initializing()
-          && atype == vhdl_decl::ASSIGN_NONBLOCK)
+          && atype == vhdl_decl::ASSIGN_NONBLOCK
+          && after == NULL)
          atype = vhdl_decl::ASSIGN_BLOCK;
 
       if (!check_valid_assignment(atype, proc, stmt))
