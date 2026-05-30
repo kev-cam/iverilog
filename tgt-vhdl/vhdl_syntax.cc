@@ -838,6 +838,14 @@ vhdl_const_bits::vhdl_const_bits(const char *value, int width, bool issigned,
       value_.push_back(*value++);
 }
 
+vhdl_const_bits *vhdl_const_bits::std_logic_vector_bits(const char *value,
+                                                        int width)
+{
+   vhdl_const_bits *cb = new vhdl_const_bits(value, width, false);
+   cb->type_ = vhdl_type::std_logic_vector(width - 1, 0);
+   return cb;
+}
+
 static const char *logic3d_const_name(char bit)
 {
    switch (bit) {

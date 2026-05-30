@@ -197,6 +197,10 @@ class vhdl_const_bits : public vhdl_expr {
 public:
    vhdl_const_bits(const char *value, int width, bool issigned,
                    bool qualify=false);
+   // Force std_logic_vector type regardless of sv2vhdl mode (for UDP case
+   // selector constants, which must match a std_logic_vector temp because
+   // VHDL `with..select' requires a discrete/character-array selector).
+   static vhdl_const_bits *std_logic_vector_bits(const char *value, int width);
    void emit(std::ostream &of, int level) const;
    const std::string &get_value() const { return value_; }
    vhdl_expr *to_integer();

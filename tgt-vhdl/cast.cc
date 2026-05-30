@@ -126,6 +126,22 @@ vhdl_expr *vhdl_expr::to_vector(vhdl_type_name_t name, int w)
 
       return bs;
    }
+   else if (type_->get_name() == VHDL_TYPE_LOGIC3D
+            && name == VHDL_TYPE_STD_LOGIC_VECTOR) {
+      // logic3d (single bit) → std_logic_vector: wrap to_std_logic in a
+      // 1-element aggregate.  Used by seq_udp_logic when assigning a
+      // single logic3d input to the std_logic_vector UDP_Inputs temp —
+      // a direct `std_logic_vector(logic3d)` cast is invalid (not
+      // closely related types).
+      vhdl_fcall *to_sl = new vhdl_fcall("to_std_logic",
+                                          vhdl_type::std_logic());
+      to_sl->add_expr(this);
+      vhdl_expr *others = w == 1 ? NULL : new vhdl_const_bit('0');
+      vhdl_bit_spec_expr *bs =
+         new vhdl_bit_spec_expr(new vhdl_type(name, w - 1, 0), others);
+      bs->add_bit(0, to_sl);
+      return bs;
+   }
    else {
       // We have to cast the expression before resizing or the
       // wrong sign bit may be extended (i.e. when casting between

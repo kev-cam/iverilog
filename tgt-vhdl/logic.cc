@@ -227,7 +227,13 @@ static void comb_udp_logic(vhdl_arch *arch, ivl_net_logic_t log)
       const char *row = ivl_udp_row(udp, i);
 
       vhdl_expr *value = new vhdl_const_bit(row[nin]);
-      vhdl_expr *cond = new vhdl_const_bits(row, nin, false);
+      // The UDP `<tmp>_Tmp` selector is std_logic_vector even in sv2vhdl
+      // mode (VHDL's `with..select` requires a discrete or character-array
+      // selector and logic3d_vector is an integer-subtype array), so force
+      // the case condition aggregate to std_logic_vector too.  Without this
+      // override vhdl_const_bits defaults to logic3d_vector under sv2vhdl
+      // and the case-when types mismatch.
+      vhdl_expr *cond = vhdl_const_bits::std_logic_vector_bits(row, nin);
 
       ivl_expr_t delay_ex = ivl_logic_delay(log, 1);
       vhdl_expr *delay = NULL;
