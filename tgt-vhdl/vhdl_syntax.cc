@@ -873,10 +873,18 @@ void vhdl_const_bits::emit(std::ostream &of, int) const
 {
    if (get_sv2vhdl_mode()
        && type_ && type_->get_name() == VHDL_TYPE_LOGIC3D_VECTOR) {
-      // Emit as logic3d_vector aggregate: (L3D_0, L3D_1, ...)
-      // MSB first (reverse of internal storage which is LSB-first)
-      of << "(";
+      // Emit as type-qualified logic3d_vector aggregate:
+      //    logic3d_vector'(L3D_0, L3D_1, ...)
+      // MSB first (reverse of internal storage which is LSB-first).
+      // The qualification is needed because the sv2vhdl pkg overloads
+      // operators like `&` and `=` to return both logic3d_vector and
+      // std_logic_vector, leaving unqualified aggregates ambiguous.
+      // Single-element aggregates also need a `0 =>` index because
+      // `(x)` is parsed as a parenthesised expression, not an aggregate.
+      of << "logic3d_vector'(";
       size_t bits = value_.size();
+      if (bits == 1)
+         of << "0 => ";
       for (size_t i = 0; i < bits; i++) {
          if (i > 0) of << ", ";
          of << logic3d_const_name(value_[bits - 1 - i]);
