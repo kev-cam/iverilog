@@ -326,7 +326,7 @@ NetExpr* PEAssignPattern::elaborate_expr_uarray_(Design *des, NetScope *scope,
       if (dims.size() <= cur_dim)
 	    return nullptr;
 
-      if (dims[cur_dim].width() != parms_.size()) {
+      if (!default_ && dims[cur_dim].width() != parms_.size()) {
 	    cerr << get_fileline() << ": error: Unpacked array assignment pattern expects "
 	         << dims[cur_dim].width() << " element(s) in this context.\n"
 	         << get_fileline() << ":      : Found "
@@ -335,6 +335,21 @@ NetExpr* PEAssignPattern::elaborate_expr_uarray_(Design *des, NetScope *scope,
       }
 
       bool up = dims[cur_dim].get_msb() < dims[cur_dim].get_lsb();
+
+	// SystemVerilog '{default:expr}: replicate the default value across
+	// every element of this (the innermost) dimension.
+      if (default_ && cur_dim == dims.size() - 1) {
+	    ivl_type_t elem_type = uarray_type->element_type();
+	    size_t count = dims[cur_dim].width();
+	    vector<NetExpr*> elem_exprs(count);
+	    for (size_t idx = 0 ; idx < count ; idx += 1)
+		  elem_exprs[idx] = elaborate_rval_expr(des, scope, elem_type,
+							default_, need_const);
+	    NetEArrayPattern*res = new NetEArrayPattern(uarray_type, elem_exprs);
+	    res->set_line(*this);
+	    return res;
+      }
+
       if  (cur_dim == dims.size() - 1) {
 	    return elaborate_expr_array_(des, scope, uarray_type, need_const, up);
       }
@@ -399,7 +414,7 @@ NetExpr* PEAssignPattern::elaborate_expr_packed_(Design *des, NetScope *scope,
 	    return nullptr;
       }
 
-      if (dims[cur_dim].width() != parms_.size()) {
+      if (!default_ && dims[cur_dim].width() != parms_.size()) {
 	    cerr << get_fileline() << ": error: Packed array assignment pattern expects "
 	         << dims[cur_dim].width() << " element(s) in this context.\n"
 	         << get_fileline() << ":      : Found "
@@ -407,24 +422,29 @@ NetExpr* PEAssignPattern::elaborate_expr_packed_(Design *des, NetScope *scope,
 	    des->errors++;
       }
 
+	// SystemVerilog '{default:expr}: replicate the default across every
+	// element of this dimension.
+      size_t count = default_ ? dims[cur_dim].width() : parms_.size();
+
       width /= dims[cur_dim].width();
       cur_dim++;
 
-      NetEConcat *neconcat = new NetEConcat(parms_.size(), 1, base_type);
-      for (size_t idx = 0; idx < parms_.size(); idx++) {
+      NetEConcat *neconcat = new NetEConcat(count, 1, base_type);
+      for (size_t idx = 0; idx < count; idx++) {
 	    NetExpr *expr;
+	    PExpr*item = default_ ? default_ : parms_[idx];
 	    // Handle nested assignment patterns as a special case. We do not
 	    // have a good way of passing the inner dimensions through the
 	    // generic elaborate_expr() API and assigment patterns is the only
 	    // place where we need it.
-	    const auto ap = dynamic_cast<PEAssignPattern*>(parms_[idx]);
+	    const auto ap = dynamic_cast<PEAssignPattern*>(item);
 	    if (ap)
 		  expr = ap->elaborate_expr_packed_(des, scope, base_type,
 						    width, dims, cur_dim, need_const);
 	    else
 		  expr = elaborate_rval_expr(des, scope, nullptr,
 					     base_type, width,
-					     parms_[idx], need_const);
+					     item, need_const);
 	    if (expr)
 		  neconcat->set(idx, expr);
       }

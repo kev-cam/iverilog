@@ -921,6 +921,12 @@ assignment_pattern /* IEEE1800-2005: A.6.7.1 */
 	FILE_NAME(tmp, @1);
 	$$ = tmp;
       }
+  | K_LP K_default ':' expression '}'
+      { PEAssignPattern*tmp = new PEAssignPattern;
+	FILE_NAME(tmp, @1);
+	tmp->set_default($4);
+	$$ = tmp;
+      }
   ;
 
   /* Some rules have a ... [ block_identifier ':' ] ... part. This

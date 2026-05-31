@@ -215,6 +215,9 @@ class PEAssignPattern : public PExpr {
       virtual NetExpr*elaborate_expr(Design*des, NetScope*scope,
 				     unsigned expr_wid,
                                      unsigned flags) const override;
+
+	// SystemVerilog '{default:expr} fill value. Null when not present.
+      void set_default(PExpr*d) { default_ = d; }
     private:
       NetExpr* elaborate_expr_packed_(Design *des, NetScope *scope,
 				      ivl_variable_type_t base_type,
@@ -236,6 +239,7 @@ class PEAssignPattern : public PExpr {
 
     private:
       std::vector<PExpr*>parms_;
+      PExpr*default_ = nullptr;
 };
 
 class PEConcat : public PExpr {
