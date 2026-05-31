@@ -452,6 +452,13 @@ TU [munpf]
       return IDENTIFIER;
   }
 
+  /* SystemVerilog "$root." absolute-hierarchy prefix. A top-level module is
+     a child of $root, so "$root.top.sig" is the root-anchored name "top.sig",
+     which iverilog already resolves from any scope. Drop the "$root." prefix
+     and continue scanning (emit no token). Longest-match makes this win over
+     the generic $-identifier rule below. */
+\$root\.        {  }
+
 \$([a-zA-Z0-9$_]+)        {
 	/* The 1364-1995 timing checks. */
       if (strcmp(yytext,"$hold") == 0)
