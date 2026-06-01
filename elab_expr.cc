@@ -5708,6 +5708,47 @@ NetExpr* PEIdent::elaborate_expr_param_(Design*des,
 
       ivl_assert(*this, use_sel != index_component_t::SEL_BIT_LAST);
 
+	// An unpacked-array parameter (e.g. localparam int X[N] = '{...})
+	// has its value stored as a NetEArrayPattern. A simple index X[i]
+	// selects one element. Handle this before the scalar/vector param
+	// select paths, which assume the value is a NetEConst.
+      if (const NetEArrayPattern*apat = dynamic_cast<const NetEArrayPattern*>(par)) {
+	    if (use_sel != index_component_t::SEL_BIT) {
+		  cerr << get_fileline() << ": sorry: only a simple index "
+		       << "select of an unpacked array parameter is supported."
+		       << endl;
+		  des->errors += 1;
+		  return 0;
+	    }
+	    const name_component_t&atail = path_.back();
+	    const index_component_t&aidx = atail.index.back();
+	    NetExpr*sel = elab_and_eval(des, scope, aidx.msb, -1, need_const);
+	    const NetEConst*sel_c = dynamic_cast<NetEConst*>(sel);
+	    if (sel_c == 0) {
+		  cerr << get_fileline() << ": sorry: index of an unpacked "
+		       << "array parameter must be constant." << endl;
+		  des->errors += 1;
+		  return 0;
+	    }
+	    long sel_v = sel_c->value().as_long();
+	      // Map the declared index to the 0-based item order. The array
+	      // pattern items are stored in declaration (msb..lsb) order.
+	    long par_msv, par_lsv;
+	    if (calculate_param_range(*this, par_type, par_msv, par_lsv,
+				      apat->item_size())) {
+		  if (par_msv >= par_lsv) sel_v -= par_lsv;
+		  else sel_v = par_lsv - sel_v;
+	    }
+	    if (sel_v < 0 || (size_t)sel_v >= apat->item_size()) {
+		  cerr << get_fileline() << ": warning: index of unpacked "
+		       << "array parameter is out of range." << endl;
+		  return new NetEConst(verinum(verinum::Vx));
+	    }
+	    NetExpr*item = apat->item(sel_v)->dup_expr();
+	    item->set_line(*this);
+	    return item;
+      }
+
       if (use_sel == index_component_t::SEL_BIT)
 	    return elaborate_expr_param_bit_(des, scope, par, found_in,
 					     par_type, need_const);

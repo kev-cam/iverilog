@@ -563,6 +563,16 @@ void NetScope::evaluate_parameter_logic_(Design*des, param_ref_t cur)
       if (! expr)
             return;
 
+	// An unpacked-array parameter's value is an array assignment pattern
+	// (e.g. localparam int X[N] = '{default:0}). It is not reducible to a
+	// single NetEConst, so store the elaborated array pattern directly;
+	// the parameter's ivl_type (a netuarray_t) was already set by the
+	// caller. Element reads X[i] are handled at the use site.
+      if (dynamic_cast<NetEArrayPattern*>(expr)) {
+	    cur->second.val = expr;
+	    return;
+      }
+
       // Make sure to carry the signed-ness from a vector type.
       if (param_vect)
 	    expr->cast_signed(param_vect->get_signed());

@@ -2941,10 +2941,14 @@ void pform_set_parameter(const struct vlltype&loc,
       }
 
       if (udims) {
-	    if (pform_requires_sv(loc, "unpacked array parameter")) {
-		  VLerror(loc, "sorry: unpacked array parameters are not supported yet.");
-	    }
-	    return;
+	    if (!pform_requires_sv(loc, "unpacked array parameter"))
+		  return;
+	      // Wrap the base data type in an unpacked-array type built from
+	      // the unpacked dimensions, the same way variable/typedef decls
+	      // do (see pform_set_typedef). The '{...} value expression is
+	      // then elaborated against this array type at parameter eval.
+	    data_type = new uarray_type_t(data_type,
+					  new list<pform_range_t>(*udims));
       }
 
       bool overridable = !is_local;

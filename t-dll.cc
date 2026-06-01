@@ -503,6 +503,15 @@ void dll_target::make_scope_parameters(ivl_scope_t scop, const NetScope*net)
       for (pit_t cur_pit = net->parameters.begin()
 		 ; cur_pit != net->parameters.end() ; ++ cur_pit ) {
 
+	      // An unpacked-array parameter's value is a NetEArrayPattern,
+	      // which has no scalar ivl_parameter (VPI) representation. Such a
+	      // parameter is compile-time only — its element reads were folded
+	      // to constants during elaboration — so it is not emitted as a
+	      // scope parameter. Skip it (and do not consume a param slot).
+	    if (!cur_pit->second.type_flag && cur_pit->second.val &&
+		dynamic_cast<const NetEArrayPattern*>(cur_pit->second.val))
+		  continue;
+
 	    assert(idx < scop->param.size());
 	    ivl_parameter_t cur_par = &scop->param[idx];
 	    cur_par->basename = cur_pit->first;
@@ -540,6 +549,9 @@ void dll_target::make_scope_parameters(ivl_scope_t scop, const NetScope*net)
 
 	    idx += 1;
       }
+
+	// Trim any slots left unused by skipped array-valued parameters.
+      scop->param.resize(idx);
 }
 
 void dll_target::make_scope_param_expr(ivl_parameter_t cur_par, NetExpr*etmp)
