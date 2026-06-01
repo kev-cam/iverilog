@@ -127,12 +127,22 @@ vhdl_expr *vhdl_expr::to_vector(vhdl_type_name_t name, int w)
       return bs;
    }
    else if (type_->get_name() == VHDL_TYPE_LOGIC3D
+            && (name == VHDL_TYPE_UNSIGNED || name == VHDL_TYPE_SIGNED)) {
+      // logic3d (single bit) → unsigned: use l3d_to_unsigned overload that
+      // returns a 1-bit unsigned, then resize if needed.
+      vhdl_fcall *conv = new vhdl_fcall("l3d_to_unsigned",
+                                         vhdl_type::nunsigned(1));
+      conv->add_expr(this);
+      if (w != 1)
+         return conv->resize(w);
+      else
+         return conv;
+   }
+   else if (type_->get_name() == VHDL_TYPE_LOGIC3D
             && name == VHDL_TYPE_STD_LOGIC_VECTOR) {
       // logic3d (single bit) → std_logic_vector: wrap to_std_logic in a
       // 1-element aggregate.  Used by seq_udp_logic when assigning a
-      // single logic3d input to the std_logic_vector UDP_Inputs temp —
-      // a direct `std_logic_vector(logic3d)` cast is invalid (not
-      // closely related types).
+      // single logic3d input to the std_logic_vector UDP_Inputs temp.
       vhdl_fcall *to_sl = new vhdl_fcall("to_std_logic",
                                           vhdl_type::std_logic());
       to_sl->add_expr(this);
@@ -293,6 +303,15 @@ vhdl_expr *vhdl_expr::to_std_logic()
       return ah;
    }
    else if (type_->get_name() == VHDL_TYPE_UNSIGNED) {
+      // sv2vhdl mode: stay in the logic3d family so comparisons against
+      // logic3d operands type-check. Use a dedicated package fn that
+      // returns a single logic3d from an N-bit unsigned.
+      if (get_sv2vhdl_mode()) {
+         vhdl_fcall *bit = new vhdl_fcall("unsigned_to_l3d_bit",
+                                          vhdl_type::logic3d());
+         bit->add_expr(this);
+         return bit;
+      }
       require_support_function(SF_UNSIGNED_TO_LOGIC);
 
       vhdl_fcall *ah =
@@ -366,6 +385,15 @@ vhdl_expr *vhdl_expr::resize(int newwidth)
          new vhdl_binop_expr(zeros, VHDL_BINOP_CONCAT, this,
                              vhdl_type::nunsigned(newwidth));
       return concat;
+   }
+   else if (type_->get_name() == VHDL_TYPE_LOGIC3D_VECTOR) {
+      // Use the package-provided resize for logic3d_vector. It performs
+      // sign extension when the input is signed (Verilog source).
+      vhdl_fcall *resizef =
+         new vhdl_fcall("resize", vhdl_type::logic3d_vector(newwidth - 1, 0));
+      resizef->add_expr(this);
+      resizef->add_expr(new vhdl_const_int(newwidth));
+      return resizef;
    }
    else
       return this;   // Doesn't make sense to resize non-vector type

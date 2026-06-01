@@ -80,6 +80,12 @@ extern unsigned recursive_mod_limit;
 /* Implicit definitions of wires. */
 extern bool warn_implicit;
 
+/* Allow multiple drivers on var/logic/struct vars without error.
+   Set when iverilog runs in sv2vhdl mode (`-psv2vhdl=1`) — downstream
+   tools (NVC's logic3d resolver) compose the per-bit result, treating
+   driver-bits-not-set as weak (strength=0). */
+extern bool relax_multi_driver;
+
 /* Warn if dimensions of port or var/net are implicitly taken from
    the input/output/inout declaration. */
 extern bool warn_implicit_dimensions;

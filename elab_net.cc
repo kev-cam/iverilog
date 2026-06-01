@@ -912,6 +912,20 @@ NetNet* PEIdent::elaborate_lnet_common_(Design*des, NetScope*scope,
 	    long wcount = widx_flag ? 1 : sig->pin_count();
 	    for (long idx = 0; idx < wcount; idx += 1) {
 		  if (sig->test_and_set_part_driver(midx, lidx, widx + idx)) {
+			if (relax_multi_driver) {
+			      // sv2vhdl: downstream resolver merges per-bit;
+			      // mark the bit as already driven (test_and_set
+			      // already did) and continue. Emit a warning
+			      // only in debug mode to avoid noise.
+			      if (debug_elaborate) {
+				    cerr << get_fileline() << ": warning: "
+					 << "multiple drivers of '"
+					 << sig->name()
+					 << "' (allowed in sv2vhdl mode)"
+					 << endl;
+			      }
+			      continue;
+			}
 			cerr << get_fileline() << ": error: ";
 			if (sig->coerced_to_uwire())
 			      cerr << "Variable '";

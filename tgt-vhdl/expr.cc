@@ -695,6 +695,88 @@ vhdl_expr *translate_sfunc_fopen(ivl_expr_t)
    return result;
 }
 
+/*
+ * `$get_val(arr, idx0, idx1, …)` returns the inner-element slice at
+ * `arr[idx0][idx1]…`. Used as an escape hatch for chained-RHS reads on
+ * packed arrays where iverilog's elaborator rejects non-constant outer
+ * indices. Emitted as `arr(flat_offset + W-1 downto flat_offset)` where
+ * the flat offset and width come from the signal's packed dims.
+ */
+vhdl_expr *translate_sfunc_get_val(ivl_expr_t e)
+{
+   const unsigned count = ivl_expr_parms(e);
+   if (count < 2) {
+      error("$get_val requires at least 2 args (arr, idx)");
+      return NULL;
+   }
+   ivl_expr_t arr_e = ivl_expr_parm(e, 0);
+   if (!arr_e || ivl_expr_type(arr_e) != IVL_EX_SIGNAL) {
+      error("first arg to $get_val must be a signal");
+      return NULL;
+   }
+   ivl_signal_t sig = ivl_expr_signal(arr_e);
+   string signame(get_renamed_signal(sig));
+
+   const int nidx = count - 1;
+   const unsigned packed_dims = ivl_signal_packed_dimensions(sig);
+   if (nidx < 1 || (unsigned)nidx > packed_dims) {
+      error("$get_val index count doesn't match packed dims");
+      return NULL;
+   }
+
+   std::vector<int> dim_size(packed_dims, 1);
+   for (unsigned d = 0; d < packed_dims; d++) {
+      int msb = ivl_signal_packed_msb(sig, d);
+      int lsb = ivl_signal_packed_lsb(sig, d);
+      dim_size[d] = (msb >= lsb ? msb - lsb : lsb - msb) + 1;
+   }
+   // Inner-element width = product of dim sizes for the unindexed (inner) dims.
+   int inner_width = 1;
+   for (int d = nidx; d < (int)packed_dims; d++)
+      inner_width *= dim_size[d];
+
+   vhdl_type integer(VHDL_TYPE_INTEGER);
+   vhdl_expr *flat = NULL;
+   for (int p = 0; p < nidx; p++) {
+      ivl_expr_t idx_e = ivl_expr_parm(e, p + 1);
+      vhdl_expr *idx = translate_expr(idx_e);
+      if (!idx) return NULL;
+      idx = idx->cast(&integer);
+      // Subtract this dim's lsb so the expression is 0-based against
+      // iverilog's flat storage. E.g. for `[31:1]` packed dim, source
+      // indexes j=1..31 must map to storage offsets 0..30.
+      int msb = ivl_signal_packed_msb(sig, p);
+      int lsb = ivl_signal_packed_lsb(sig, p);
+      int dim_lsb = (msb >= lsb) ? lsb : msb;
+      if (dim_lsb != 0) {
+         vhdl_expr *off = new vhdl_const_int(dim_lsb);
+         idx = new vhdl_binop_expr(idx, VHDL_BINOP_SUB, off,
+                                    new vhdl_type(VHDL_TYPE_INTEGER));
+      }
+      int weight = 1;
+      for (int d = p + 1; d < (int)packed_dims; d++)
+         weight *= dim_size[d];
+      vhdl_expr *term = idx;
+      if (weight != 1) {
+         vhdl_expr *w = new vhdl_const_int(weight);
+         term = new vhdl_binop_expr(idx, VHDL_BINOP_MULT, w,
+                                     new vhdl_type(VHDL_TYPE_INTEGER));
+      }
+      if (flat == NULL)
+         flat = term;
+      else
+         flat = new vhdl_binop_expr(flat, VHDL_BINOP_ADD, term,
+                                    new vhdl_type(VHDL_TYPE_INTEGER));
+   }
+
+   const vhdl_type *result_type =
+      vhdl_type::type_for(inner_width, ivl_signal_signed(sig) != 0);
+   vhdl_var_ref *ref =
+      new vhdl_var_ref(signame, new vhdl_type(*result_type));
+   ref->set_slice(flat, inner_width - 1);
+   return ref;
+}
+
 vhdl_expr *translate_sfunc(ivl_expr_t e)
 {
    const char *name = ivl_expr_name(e);
@@ -708,6 +790,8 @@ vhdl_expr *translate_sfunc(ivl_expr_t e)
       return translate_sfunc_random(e);
    else if (strcmp(name, "$fopen") == 0)
       return translate_sfunc_random(e);
+   else if (strcmp(name, "$get_val") == 0)
+      return translate_sfunc_get_val(e);
    else {
       error("No translation for system function %s", name);
       return NULL;

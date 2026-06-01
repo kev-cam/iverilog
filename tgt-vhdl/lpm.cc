@@ -235,7 +235,38 @@ static vhdl_expr *shift_lpm_to_expr(vhdl_scope *scope, ivl_lpm_t lpm,
 static vhdl_expr *repeat_lpm_to_expr(vhdl_scope *scope, ivl_lpm_t lpm)
 {
    vhdl_expr *in = readable_ref(scope, ivl_lpm_data(lpm, 0));
-   return new vhdl_bit_spec_expr(NULL, in);
+   if (!in)
+      return NULL;
+
+   const unsigned count = ivl_lpm_size(lpm);
+
+   // For a single-bit input, `(others => bit)` is the natural form and
+   // works for both std_logic_vector and logic3d_vector.
+   if (in->get_type()->get_width() == 1
+       && (in->get_type()->get_name() == VHDL_TYPE_STD_LOGIC
+           || in->get_type()->get_name() == VHDL_TYPE_STD_ULOGIC
+           || in->get_type()->get_name() == VHDL_TYPE_LOGIC3D))
+      return new vhdl_bit_spec_expr(NULL, in);
+
+   // For a vector input, emit a concatenation `in & in & ... & in`.
+   // VHDL's `(others => x)` requires x to be the array element type, so
+   // it can't replicate a sub-vector.
+   if (count <= 1)
+      return in;
+
+   const int element_width = in->get_type()->get_width();
+   const int total_width = element_width * count;
+   vhdl_type_name_t result_name = in->get_type()->get_name();
+   const vhdl_type *result_type =
+      new vhdl_type(result_name, total_width - 1, 0);
+
+   vhdl_expr *result = in;
+   for (unsigned i = 1; i < count; i++) {
+      vhdl_expr *next = readable_ref(scope, ivl_lpm_data(lpm, 0));
+      result = new vhdl_binop_expr(result, VHDL_BINOP_CONCAT, next,
+                                    new vhdl_type(*result_type));
+   }
+   return result;
 }
 
 static vhdl_expr *lpm_to_expr(vhdl_scope *scope, ivl_lpm_t lpm)

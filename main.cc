@@ -126,6 +126,7 @@ bool gn_verilog_ams_flag = false;
 ivl_sfunc_as_task_t def_sfunc_as_task = IVL_SFUNC_AS_TASK_ERROR;
 
 map<string,const char*> flags;
+bool relax_multi_driver = false;
 char*vpi_module_list = 0;
 void add_vpi_module(const char*name)
 {
@@ -1243,6 +1244,13 @@ int main(int argc, char*argv[])
 	 * as tasks. */
       if (gn_system_verilog()) {
 	    def_sfunc_as_task = IVL_SFUNC_AS_TASK_WARNING;
+      }
+
+	/* sv2vhdl mode: relax the multi-driver check on var/logic. NVC's
+	 * logic3d resolver per-bit-merges drivers downstream. */
+      if (flags.count("sv2vhdl") && flags["sv2vhdl"]
+          && strcmp(flags["sv2vhdl"], "1") == 0) {
+	    relax_multi_driver = true;
       }
 
 	/* On with the process of elaborating the module. */

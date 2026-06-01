@@ -74,12 +74,25 @@ static struct sfunc_return_type* find_in_sys_func_list(const char*name)
       return 0;
 }
 
+/* sv2vhdl mode helper: $get_val(arr, idx0, idx1, …) returns the slice of an
+   N-D packed array at the given indices. Width is determined per call from
+   the first argument's signal width; we return a placeholder wide entry so
+   the elaborator accepts it. tgt-vhdl translates this to a VHDL slice.
+*/
+static struct sfunc_return_type sv2vhdl_get_val_def =
+    { "$get_val", IVL_VT_LOGIC, 4096, false, false };
+
 const struct sfunc_return_type* lookup_sys_func(const char*name)
 {
 	/* First, try to find the name in the function list. */
       struct sfunc_return_type*def = find_in_sys_func_list(name);
       if (def)
 	    return def;
+
+	/* sv2vhdl-mode: $get_val needs a non-default entry so that synth
+	   contexts (continuous-assign, port-map outputs) accept it. */
+      if (strcmp(name, "$get_val") == 0)
+	    return &sv2vhdl_get_val_def;
 
 	/* No luck finding, so return the default description. */
       return &default_return_type;

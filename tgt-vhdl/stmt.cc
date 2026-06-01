@@ -221,6 +221,106 @@ static int draw_stask_display(vhdl_procedural *proc,
 }
 
 /*
+ * `$set_val(arr, idx0, idx1, …, idxN, val)` emits `arr(idx0)(idx1)…(idxN) := val;`
+ * (or `<= val;` for signals). Workaround for iverilog's restriction on chained
+ * procedural part-selects on the LHS — sv-normalize rewrites
+ * `arr[i][j] = X;` as `$set_val(arr, i, j, X);`.
+ */
+static int draw_stask_set_val(vhdl_procedural *proc,
+                               stmt_container *container,
+                               ivl_statement_t stmt)
+{
+   const int count = ivl_stmt_parm_count(stmt);
+   if (count < 3) {
+      cerr << "Error: $set_val requires at least 3 args (arr, idx, val)" << endl;
+      return 1;
+   }
+
+   // First parameter is the array signal; extract the underlying signal.
+   ivl_expr_t arr_expr = ivl_stmt_parm(stmt, 0);
+   if (!arr_expr || ivl_expr_type(arr_expr) != IVL_EX_SIGNAL) {
+      cerr << "Error: first arg to $set_val must be a signal" << endl;
+      return 1;
+   }
+   ivl_signal_t sig = ivl_expr_signal(arr_expr);
+   string signame(get_renamed_signal(sig));
+   vhdl_decl *decl = proc->get_scope()->get_decl(signame);
+   if (!decl) {
+      cerr << "Error: $set_val could not resolve signal " << signame << endl;
+      return 1;
+   }
+
+   const vhdl_type *ltype = new vhdl_type(*decl->get_type());
+   vhdl_var_ref *lhs = new vhdl_var_ref(signame, ltype);
+
+   // Indices are parms 1 .. count-2; value is parm count-1.
+   // Iverilog flattens packed N-D arrays to a single dimension in VHDL, so
+   // we compute a flat offset: idx0*W1*W2*…*Wn + idx1*W2*…*Wn + … + idxn.
+   // Each Wk is the bit-width of the k-th packed dimension below the outer.
+   vhdl_type integer(VHDL_TYPE_INTEGER);
+   const int nidx = count - 2;
+   const unsigned packed_dims = ivl_signal_packed_dimensions(sig);
+   if (nidx >= 1 && (unsigned)nidx <= packed_dims) {
+      // Build per-index dimension widths: dim 0 is innermost, dim packed_dims-1
+      // is outermost. For an outer index `i`, its weight is the product of
+      // the inner-dimension sizes.
+      std::vector<int> dim_size(packed_dims, 1);
+      for (unsigned d = 0; d < packed_dims; d++) {
+         int msb = ivl_signal_packed_msb(sig, d);
+         int lsb = ivl_signal_packed_lsb(sig, d);
+         dim_size[d] = (msb >= lsb ? msb - lsb : lsb - msb) + 1;
+      }
+
+      // iverilog: dim 0 is the OUTER (first-declared) packed dim, dim
+      // packed_dims-1 is the innermost. For an outer index p (0=outermost),
+      // its weight is the product of dim sizes for dims (p+1 .. packed_dims-1).
+      vhdl_expr *flat = NULL;
+      for (int p = 0; p < nidx; p++) {
+         ivl_expr_t idx_e = ivl_stmt_parm(stmt, p + 1);
+         vhdl_expr *idx = translate_expr(idx_e);
+         if (!idx) return 1;
+         idx = idx->cast(&integer);
+         int weight = 1;
+         for (int d = p + 1; d < (int)packed_dims; d++)
+            weight *= dim_size[d];
+         vhdl_expr *term = idx;
+         if (weight != 1) {
+            vhdl_expr *w = new vhdl_const_int(weight);
+            term = new vhdl_binop_expr(idx, VHDL_BINOP_MULT, w,
+                                        new vhdl_type(VHDL_TYPE_INTEGER));
+         }
+         if (flat == NULL)
+            flat = term;
+         else
+            flat = new vhdl_binop_expr(flat, VHDL_BINOP_ADD, term,
+                                       new vhdl_type(VHDL_TYPE_INTEGER));
+      }
+      lhs->set_slice(flat, 0);
+   }
+   else {
+      // Fallback: chained slice (works when iverilog kept the array shape).
+      for (int p = 1; p < count - 1; p++) {
+         ivl_expr_t idx_e = ivl_stmt_parm(stmt, p);
+         vhdl_expr *idx = translate_expr(idx_e);
+         if (!idx) return 1;
+         idx = idx->cast(&integer);
+         if (p == 1)
+            lhs->set_slice(idx, 0);
+         else
+            lhs->add_extra_slice(idx);
+      }
+   }
+
+   ivl_expr_t val_e = ivl_stmt_parm(stmt, count - 1);
+   vhdl_expr *val = translate_expr(val_e);
+   if (!val) return 1;
+
+   vhdl_assign_stmt *assign = new vhdl_assign_stmt(lhs, val);
+   container->add_stmt(assign);
+   return 0;
+}
+
+/*
  * Generate VHDL for system tasks (like $display). Not all of
  * these are supported.
  */
@@ -235,6 +335,8 @@ static int draw_stask(vhdl_procedural *proc, stmt_container *container,
       return draw_stask_display(proc, container, stmt);
    else if (strcmp(name, "$finish") == 0)
       return draw_stask_finish(proc, container, stmt);
+   else if (strcmp(name, "$set_val") == 0)
+      return draw_stask_set_val(proc, container, stmt);
    else {
       vhdl_seq_stmt *result = new vhdl_null_stmt();
       ostringstream ss;
@@ -266,7 +368,11 @@ static int draw_block(vhdl_procedural *proc, stmt_container *container,
       int nsigs = ivl_scope_sigs(block_scope);
       for (int i = 0; i < nsigs; i++) {
          ivl_signal_t sig = ivl_scope_sig(block_scope, i);
-         remember_signal(sig, proc->get_scope());
+         // Guard against re-entry: when a parent module elaborates this same
+         // block via different paths (e.g. in iterated/loop unrolling), the
+         // signal may already be remembered. remember_signal asserts on dups.
+         if (!seen_signal_before(sig))
+            remember_signal(sig, proc->get_scope());
 
          std::string safe_name = make_safe_name(sig);
          if (!proc->get_scope()->have_declared(safe_name)) {
