@@ -18,12 +18,14 @@
  */
 
 # include  "arith.h"
+# include  "arith_kernel.h"
 # include  "schedule.h"
 # include  <climits>
 # include  <iostream>
 # include  <cassert>
 # include  <cstdlib>
 # include  <cmath>
+# include  <vector>
 
 using namespace std;
 
@@ -524,6 +526,32 @@ vvp_arith_sum::~vvp_arith_sum()
 {
 }
 
+/* Fixed buffer size shared with the wandering-thread hop descriptor
+ * (KERNEL_VEC_BYTES in fpga/zcu104/sw/hop_worker.c and
+ * examples/wander-hop/hop_routines_arith.c). Sizing both ends to a
+ * fixed amount lets the hop's copy-in/copy-out walker memcpy a known
+ * number of bytes without overrunning the caller's storage. */
+#define ARITH_KERNEL_WORDS 8u   /* 8 × 32 bits = 256-bit max width */
+
+/* Helper: pack a vvp_vector4_t's bits into a fixed-size 8-word slice.
+ * Trailing words remain zero (matches the kernel's BIT4_0 padding). */
+static void pack_vec4_fixed(const vvp_vector4_t&v,
+                            uint32_t abits[ARITH_KERNEL_WORDS],
+                            uint32_t bbits[ARITH_KERNEL_WORDS])
+{
+      for (unsigned w = 0; w < ARITH_KERNEL_WORDS; w++) {
+            abits[w] = 0; bbits[w] = 0;
+      }
+      unsigned n = v.size();
+      if (n > ARITH_KERNEL_WORDS * 32u) n = ARITH_KERNEL_WORDS * 32u;
+      for (unsigned i = 0; i < n; i++) {
+            vvp_bit4_t bv = v.value(i);
+            uint32_t aw = i >> 5, ab = i & 31u;
+            abits[aw] |= ((unsigned)bv & 1u) << ab;
+            bbits[aw] |= (((unsigned)bv >> 1) & 1u) << ab;
+      }
+}
+
 void vvp_arith_sum::recv_vec4(vvp_net_ptr_t ptr, const vvp_vector4_t&bit,
                               vvp_context_t)
 {
@@ -531,24 +559,48 @@ void vvp_arith_sum::recv_vec4(vvp_net_ptr_t ptr, const vvp_vector4_t&bit,
 
       vvp_net_t*net = ptr.ptr();
 
+      /* For widths beyond what the fixed-size kernel buffer can hold,
+       * fall back to the original add_with_carry ripple. */
+      if (wid_ > ARITH_KERNEL_WORDS * 32u
+          || op_a_.size() > ARITH_KERNEL_WORDS * 32u
+          || op_b_.size() > ARITH_KERNEL_WORDS * 32u) {
+            vvp_vector4_t value (wid_);
+            const vvp_bit4_t pad = BIT4_0;
+            vvp_bit4_t carry = BIT4_0;
+            for (unsigned idx = 0; idx < wid_; idx += 1) {
+                  vvp_bit4_t a = (idx >= op_a_.size())? pad : op_a_.value(idx);
+                  vvp_bit4_t b = (idx >= op_b_.size())? pad : op_b_.value(idx);
+                  vvp_bit4_t cur = add_with_carry(a, b, carry);
+                  if (cur == BIT4_X) { net->send_vec4(x_val_, 0); return; }
+                  value.set_bit(idx, cur);
+            }
+            net->send_vec4(value, 0);
+            return;
+      }
+
+      uint32_t a_abits[ARITH_KERNEL_WORDS], a_bbits[ARITH_KERNEL_WORDS];
+      uint32_t b_abits[ARITH_KERNEL_WORDS], b_bbits[ARITH_KERNEL_WORDS];
+      uint32_t out_abits[ARITH_KERNEL_WORDS], out_bbits[ARITH_KERNEL_WORDS];
+      pack_vec4_fixed(op_a_, a_abits, a_bbits);
+      pack_vec4_fixed(op_b_, b_abits, b_bbits);
+
+      uint32_t sizes = (op_a_.size() & 0xFFFFu)
+                     | ((op_b_.size() & 0xFFFFu) << 16);
+
+      int x_flag = vvp_arith_sum_kernel(wid_, sizes,
+                                        a_abits, a_bbits, b_abits, b_bbits,
+                                        out_abits, out_bbits);
+      if (x_flag) {
+            net->send_vec4(x_val_, 0);
+            return;
+      }
+
       vvp_vector4_t value (wid_);
-
-	/* Pad input vectors with this value to widen to the desired
-	   output width. */
-      const vvp_bit4_t pad = BIT4_0;
-
-      vvp_bit4_t carry = BIT4_0;
-      for (unsigned idx = 0 ;  idx < wid_ ;  idx += 1) {
-	    vvp_bit4_t a = (idx >= op_a_.size())? pad : op_a_.value(idx);
-	    vvp_bit4_t b = (idx >= op_b_.size())? pad : op_b_.value(idx);
-	    vvp_bit4_t cur = add_with_carry(a, b, carry);
-
-	    if (cur == BIT4_X) {
-		  net->send_vec4(x_val_, 0);
-		  return;
-	    }
-
-	    value.set_bit(idx, cur);
+      for (unsigned i = 0; i < wid_; i++) {
+            uint32_t aw = i >> 5, ab = i & 31u;
+            unsigned ba = (out_abits[aw] >> ab) & 1u;
+            unsigned bb = (out_bbits[aw] >> ab) & 1u;
+            value.set_bit(i, (vvp_bit4_t)((bb << 1) | ba));
       }
 
       net->send_vec4(value, 0);

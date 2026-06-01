@@ -81,7 +81,7 @@ VPI = vpi_modules.o vpi_bit.o vpi_callback.o vpi_cobject.o vpi_const.o vpi_darra
       vpip_to_dec.o vpip_format.o vvp_vpi.o
 
 O = lib_main.o \
-    parse.o parse_misc.o lexor.o arith.o array_common.o array.o bufif.o compile.o \
+    parse.o parse_misc.o lexor.o arith.o arith_kernel.o array_common.o array.o bufif.o compile.o \
     concat.o dff.o class_type.o enum_type.o extend.o file_line.o latch.o npmos.o part.o \
     permaheap.o reduce.o resolv.o \
     sfunc.o stop.o \
