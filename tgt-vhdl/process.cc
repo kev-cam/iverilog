@@ -421,7 +421,11 @@ static int generate_vhdl_process(vhdl_entity *ent, ivl_process_t proc)
    // However, if no statements were added to the container
    // by draw_stmt, don't bother adding a wait as `emit'
    // will optimise the process out of the output
-   bool is_initial = ivl_process_type(proc) == IVL_PR_INITIAL;
+   // IVL_PR_FINAL (SystemVerilog `final`) also runs its body once and must
+   // then suspend; without the trailing wait it becomes a free-running VHDL
+   // process that infinite-loops at time 0 and deadlocks the simulation.
+   bool is_initial = ivl_process_type(proc) == IVL_PR_INITIAL
+                  || ivl_process_type(proc) == IVL_PR_FINAL;
    bool is_empty = vhdl_proc->get_container()->empty();
 
    if (is_initial && !is_empty) {
@@ -469,18 +473,6 @@ static int generate_vhdl_process(vhdl_entity *ent, ivl_process_t proc)
  * Escape a string for use inside a VHDL string literal.
  * Doubles any embedded quote characters.
  */
-static std::string vhdl_escape_string(const std::string &s)
-{
-   std::string result;
-   result.reserve(s.size());
-   for (size_t i = 0; i < s.size(); i++) {
-      result += s[i];
-      if (s[i] == '"')
-         result += '"';
-   }
-   return result;
-}
-
 /*
  * Generate a concurrent sv_analog() procedure call for an
  * analog process. The analog block body is reconstructed as
@@ -513,12 +505,12 @@ static int generate_analog_call(vhdl_entity *ent, ivl_process_t proc,
    ivl_statement_t stmt = ivl_process_stmt(proc);
    std::string body = analog_stmt_to_str(stmt);
 
-   // Combine metadata + body, escape for VHDL string
+   // Combine metadata + body. Embedded-quote escaping is handled uniformly by
+   // vhdl_const_string::emit, so pass the raw string here.
    std::string full = meta.str() + body;
-   std::string escaped = vhdl_escape_string(full);
 
    vhdl_conc_pcall_stmt *pcall = new vhdl_conc_pcall_stmt("sv_analog");
-   pcall->add_expr(new vhdl_const_string(escaped));
+   pcall->add_expr(new vhdl_const_string(full));
 
    // Add source location comment
    std::ostringstream ss;

@@ -321,6 +321,73 @@ static int draw_stask_set_val(vhdl_procedural *proc,
 }
 
 /*
+ * SystemVerilog queue methods, lowered by iverilog to system tasks named
+ * "$ivl_queue_method$<method>". The queue signal is parm 0 (see scope.cc for
+ * the bounded ring-buffer model: <q> array + <q>_head + <q>_tail).
+ *   push_back(v): <q>(<q>_tail mod DEPTH) <= v;  <q>_tail <= <q>_tail + 1
+ *   delete(0)/pop_front: <q>_head <= <q>_head + 1   (drop the front element)
+ * push touches only tail and delete only head, so a same-cycle push+pop
+ * needs no read-modify-write and composes correctly under NBA.
+ */
+static int draw_queue_method(vhdl_procedural *proc, stmt_container *container,
+                             ivl_statement_t stmt)
+{
+   const int qdepth = 64;
+   const char *dollar = strrchr(ivl_stmt_name(stmt), '$');
+   const char *method = dollar ? dollar + 1 : ivl_stmt_name(stmt);
+
+   ivl_expr_t qe = ivl_stmt_parm(stmt, 0);
+   if (!qe || ivl_expr_type(qe) != IVL_EX_SIGNAL) {
+      error("queue method %s: first arg must be a signal", method);
+      return 1;
+   }
+   string q(get_renamed_signal(ivl_expr_signal(qe)));
+   vhdl_decl *adecl = proc->get_scope()->get_decl(q);
+   if (!adecl) {
+      error("queue method %s: signal %s not declared", method, q.c_str());
+      return 1;
+   }
+
+   if (strcmp(method, "push_back") == 0) {
+      ivl_expr_t ve = ivl_stmt_parm(stmt, ivl_stmt_parm_count(stmt) - 1);
+      vhdl_expr *val = translate_expr(ve);
+      if (!val) return 1;
+
+      // <q>(<q>_tail mod DEPTH) <= val
+      vhdl_var_ref *aref =
+         new vhdl_var_ref(q.c_str(), new vhdl_type(*adecl->get_type()));
+      vhdl_expr *idx = new vhdl_binop_expr(
+         new vhdl_var_ref((q + "_tail").c_str(), new vhdl_type(VHDL_TYPE_INTEGER)),
+         VHDL_BINOP_MOD, new vhdl_const_int(qdepth),
+         new vhdl_type(VHDL_TYPE_INTEGER));
+      aref->set_slice(idx);
+      container->add_stmt(new vhdl_nbassign_stmt(aref, val));
+
+      // <q>_tail <= <q>_tail + 1
+      container->add_stmt(new vhdl_nbassign_stmt(
+         new vhdl_var_ref((q + "_tail").c_str(), new vhdl_type(VHDL_TYPE_INTEGER)),
+         new vhdl_binop_expr(
+            new vhdl_var_ref((q + "_tail").c_str(), new vhdl_type(VHDL_TYPE_INTEGER)),
+            VHDL_BINOP_ADD, new vhdl_const_int(1),
+            new vhdl_type(VHDL_TYPE_INTEGER))));
+      return 0;
+   }
+   else if (strcmp(method, "delete") == 0 || strcmp(method, "pop_front") == 0) {
+      // <q>_head <= <q>_head + 1
+      container->add_stmt(new vhdl_nbassign_stmt(
+         new vhdl_var_ref((q + "_head").c_str(), new vhdl_type(VHDL_TYPE_INTEGER)),
+         new vhdl_binop_expr(
+            new vhdl_var_ref((q + "_head").c_str(), new vhdl_type(VHDL_TYPE_INTEGER)),
+            VHDL_BINOP_ADD, new vhdl_const_int(1),
+            new vhdl_type(VHDL_TYPE_INTEGER))));
+      return 0;
+   }
+
+   error("queue method %s not supported", method);
+   return 1;
+}
+
+/*
  * Generate VHDL for system tasks (like $display). Not all of
  * these are supported.
  */
@@ -337,6 +404,9 @@ static int draw_stask(vhdl_procedural *proc, stmt_container *container,
       return draw_stask_finish(proc, container, stmt);
    else if (strcmp(name, "$set_val") == 0)
       return draw_stask_set_val(proc, container, stmt);
+   else if (strncmp(name, "$ivl_queue_method$", 18) == 0
+            || strncmp(name, "$ivl_darray_method$", 19) == 0)
+      return draw_queue_method(proc, container, stmt);
    else {
       vhdl_seq_stmt *result = new vhdl_null_stmt();
       ostringstream ss;
@@ -794,6 +864,22 @@ static int draw_nbassign(vhdl_procedural *proc, stmt_container *container,
 static int draw_assign(vhdl_procedural *proc, stmt_container *container,
                        ivl_statement_t stmt)
 {
+   // SystemVerilog queue clear: q = {}  ->  reset ring-buffer cursors.
+   if (ivl_stmt_lvals(stmt) == 1) {
+      ivl_lval_t lv0 = ivl_stmt_lval(stmt, 0);
+      ivl_signal_t lsig = lv0 ? ivl_lval_sig(lv0) : 0;
+      if (lsig && ivl_signal_data_type(lsig) == IVL_VT_QUEUE) {
+         string q(get_renamed_signal(lsig));
+         container->add_stmt(new vhdl_nbassign_stmt(
+            new vhdl_var_ref((q + "_head").c_str(), new vhdl_type(VHDL_TYPE_INTEGER)),
+            new vhdl_const_int(0)));
+         container->add_stmt(new vhdl_nbassign_stmt(
+            new vhdl_var_ref((q + "_tail").c_str(), new vhdl_type(VHDL_TYPE_INTEGER)),
+            new vhdl_const_int(0)));
+         return 0;
+      }
+   }
+
    vhdl_decl::assign_type_t assign_type = vhdl_decl::ASSIGN_NONBLOCK;
    bool emulate_blocking = proc->get_scope()->allow_signal_assignment();
 

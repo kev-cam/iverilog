@@ -141,6 +141,7 @@ void vhdl_entity::emit(std::ostream &of, int level) const
    if (get_sv2vhdl_mode()) {
       of << "use sv2vhdl.logic3d_types_pkg.all;" << std::endl;
       of << "use sv2vhdl.sv_analog_pkg.all;" << std::endl;
+      of << "use sv2vhdl.sv_math_pkg.all;" << std::endl;
    }
    of << std::endl;
 
@@ -764,7 +765,16 @@ void vhdl_var_ref::emit(std::ostream &of, int level) const
 
 void vhdl_const_string::emit(std::ostream &of, int) const
 {
-   of << "\"" << value_ << "\"";
+   // VHDL string literals escape an embedded double-quote by doubling it.
+   of << "\"";
+   for (std::string::const_iterator it = value_.begin();
+        it != value_.end(); ++it) {
+      if (*it == '"')
+         of << "\"\"";
+      else
+         of << *it;
+   }
+   of << "\"";
 }
 
 void vhdl_null_stmt::emit(std::ostream &of, int level) const
@@ -787,7 +797,10 @@ void vhdl_fcall::find_vars(vhdl_var_set_t& read)
 void vhdl_fcall::emit(std::ostream &of, int level) const
 {
    of << name_;
-   exprs_.emit(of, level);
+   // A parameterless function (e.g. SV $urandom -> random) is called as a
+   // bare name in VHDL; emitting "name()" is a syntax error.
+   if (!exprs_.empty())
+      exprs_.emit(of, level);
 }
 
 vhdl_abstract_assign_stmt::~vhdl_abstract_assign_stmt()

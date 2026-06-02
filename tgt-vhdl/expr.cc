@@ -517,6 +517,38 @@ static vhdl_expr *translate_select(ivl_expr_t e)
                                        from->get_type());
 
       }
+      else if (ivl_expr_type(ivl_expr_oper1(e)) == IVL_EX_SIGNAL
+               && ivl_signal_data_type(ivl_expr_signal(ivl_expr_oper1(e)))
+                     == IVL_VT_QUEUE) {
+         // SystemVerilog queue element select q[i]: emit an array-element
+         // access into the ring buffer, q((head + i) mod DEPTH) — NOT a bit
+         // slice. Return a fresh ref typed as the element (logic3d_vector) so
+         // operators on q[i] (e.g. q[0] + ...) resolve against the element.
+         delete from_var_ref;
+         string q(get_renamed_signal(ivl_expr_signal(ivl_expr_oper1(e))));
+         vhdl_type integer(VHDL_TYPE_INTEGER);
+         vhdl_expr *ofs = new vhdl_binop_expr(
+            new vhdl_var_ref((q + "_head").c_str(), new vhdl_type(VHDL_TYPE_INTEGER)),
+            VHDL_BINOP_ADD, base->cast(&integer),
+            new vhdl_type(VHDL_TYPE_INTEGER));
+         vhdl_expr *idx = new vhdl_binop_expr(
+            ofs, VHDL_BINOP_MOD, new vhdl_const_int(64),
+            new vhdl_type(VHDL_TYPE_INTEGER));
+         // Use the queue's true element width (not ivl_expr_width, which can be
+         // 1 in some contexts) so the element type is consistently a vector.
+         ivl_signal_t qsig = ivl_expr_signal(ivl_expr_oper1(e));
+         ivl_type_t et = ivl_type_element(ivl_signal_net_type(qsig));
+         int ew = et ? ivl_type_packed_width(et) : ivl_expr_width(e);
+         if (ew < 1) ew = 1;
+         // Type the ref as the queue ARRAY: set_slice on an array yields the
+         // element type (logic3d_vector) via get_base(); a vector-typed ref
+         // would instead degrade to a bit (logic3d) and mistype q[i].
+         vhdl_type *elem = vhdl_type::logic3d_vector(ew - 1, 0);
+         vhdl_type *arr = vhdl_type::array_of(elem, q + "_QType", 63, 0);
+         vhdl_var_ref *qref = new vhdl_var_ref(q.c_str(), arr);
+         qref->set_slice(idx);
+         return qref;
+      }
       else if (from_var_ref->get_type()->get_name() != VHDL_TYPE_STD_LOGIC) {
          // We can use the more idiomatic VHDL slice notation on a
          // single variable reference
@@ -792,6 +824,48 @@ vhdl_expr *translate_sfunc(ivl_expr_t e)
       return translate_sfunc_random(e);
    else if (strcmp(name, "$get_val") == 0)
       return translate_sfunc_get_val(e);
+   else if (strcmp(name, "$urandom") == 0 || strcmp(name, "$urandom_range") == 0) {
+      // Map to SV2VHDL.SV_MATH_PKG.random (iverilog's own RNG via VHPIDIRECT).
+      // It returns integer; for a multi-bit context wrap it as a logic3d_vector
+      // of the context width so the assign target type matches.
+      vhdl_fcall *r = new vhdl_fcall("random", new vhdl_type(VHDL_TYPE_INTEGER));
+      const int w = ivl_expr_width(e);
+      if (w <= 1)
+         return r;   // integer is fine in 1-bit / comparison contexts
+      vhdl_fcall *tu = new vhdl_fcall("to_unsigned", vhdl_type::nunsigned(w));
+      tu->add_expr(r);
+      tu->add_expr(new vhdl_const_int(w));
+      vhdl_fcall *l3 = new vhdl_fcall("unsigned_to_l3d",
+                                      vhdl_type::logic3d_vector(w - 1, 0));
+      l3->add_expr(tu);
+      return l3;
+   }
+   else if (strcmp(name, "$size") == 0) {
+      // SystemVerilog queue.size() -> ring-buffer (tail - head). Return it as a
+      // logic3d_vector of the expression width so it composes with the logic3d
+      // arithmetic the rest of the (sv2vhdl-mode) testbench is built from.
+      ivl_expr_t qe = ivl_expr_parm(e, 0);
+      if (!qe || ivl_expr_type(qe) != IVL_EX_SIGNAL) {
+         error("$size argument must be a signal");
+         return NULL;
+      }
+      string q(get_renamed_signal(ivl_expr_signal(qe)));
+      vhdl_expr *diff = new vhdl_binop_expr(
+         new vhdl_var_ref((q + "_tail").c_str(), new vhdl_type(VHDL_TYPE_INTEGER)),
+         VHDL_BINOP_SUB,
+         new vhdl_var_ref((q + "_head").c_str(), new vhdl_type(VHDL_TYPE_INTEGER)),
+         new vhdl_type(VHDL_TYPE_INTEGER));
+      const int w = ivl_expr_width(e);
+      if (w <= 1)
+         return diff;
+      vhdl_fcall *tu = new vhdl_fcall("to_unsigned", vhdl_type::nunsigned(w));
+      tu->add_expr(diff);
+      tu->add_expr(new vhdl_const_int(w));
+      vhdl_fcall *l3 = new vhdl_fcall("unsigned_to_l3d",
+                                      vhdl_type::logic3d_vector(w - 1, 0));
+      l3->add_expr(tu);
+      return l3;
+   }
    else {
       error("No translation for system function %s", name);
       return NULL;

@@ -591,6 +591,43 @@ static void declare_one_signal(vhdl_entity *ent, ivl_signal_t sig,
 
    rename_signal(sig, name);
 
+   // SystemVerilog dynamic queue ([$]): model as a bounded ring buffer —
+   // a fixed array plus head/tail integer cursors. push_back advances tail,
+   // delete(0)/pop_front advances head; because they touch *different*
+   // signals a same-cycle push+pop composes correctly under NBA semantics.
+   // size = tail-head; element i = arr((head+i) mod DEPTH). See expr.cc
+   // ($size, indexing) and stmt.cc ($ivl_queue_method$*, "= {}" clear).
+   if (ivl_signal_data_type(sig) == IVL_VT_QUEUE) {
+      const int qdepth = 64;   // bound: max in-flight items (>= FIFO capacity)
+      // ivl_signal_width() is 1 for a queue; the element width comes from the
+      // queue's element type (e.g. logic [3:0] q[$] -> element width 4).
+      int elem_w = 1;
+      ivl_type_t qtype = ivl_signal_net_type(sig);
+      ivl_type_t etype = qtype ? ivl_type_element(qtype) : 0;
+      if (etype)
+         elem_w = ivl_type_packed_width(etype);
+      if (elem_w < 1) elem_w = 1;
+      vhdl_type *base =
+         vhdl_type::type_for(elem_w, ivl_signal_signed(sig) != 0);
+      string type_name = name + "_QType";
+      const vhdl_type *arr_type =
+         vhdl_type::array_of(base, type_name, qdepth - 1, 0);
+      ent->get_arch()->get_scope()->add_decl(
+         new vhdl_type_decl(type_name, arr_type));
+      ent->get_arch()->get_scope()->add_decl(
+         new vhdl_signal_decl(name, new vhdl_type(*arr_type)));
+
+      vhdl_signal_decl *qhead =
+         new vhdl_signal_decl(name + "_head", new vhdl_type(VHDL_TYPE_INTEGER));
+      qhead->set_initial(new vhdl_const_int(0));
+      ent->get_arch()->get_scope()->add_decl(qhead);
+      vhdl_signal_decl *qtail =
+         new vhdl_signal_decl(name + "_tail", new vhdl_type(VHDL_TYPE_INTEGER));
+      qtail->set_initial(new vhdl_const_int(0));
+      ent->get_arch()->get_scope()->add_decl(qtail);
+      return;
+   }
+
    const vhdl_type *sig_type;
    unsigned dimensions = ivl_signal_dimensions(sig);
    if (dimensions > 0) {
