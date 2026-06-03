@@ -165,6 +165,15 @@ void vhdl_entity::emit(std::ostream &of, int level) const
          << " : entity is \"" << verilog_src_ << "\";";
    }
 
+   // Parameter actuals, for --accel re-synthesis with matching generics.
+   if (!verilog_params_.empty()) {
+      newline(of, indent(level));
+      of << "attribute nvc_verilog_params : string;";
+      newline(of, indent(level));
+      of << "attribute nvc_verilog_params of " << name_
+         << " : entity is \"" << verilog_params_ << "\";";
+   }
+
    newline(of, level);
    of << "end entity; ";
    blank_line(of, level);  // Extra blank line after entities

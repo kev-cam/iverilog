@@ -1024,6 +1024,10 @@ public:
    // can recover the original Verilog to feed yosys/gen_statemachine).
    void set_verilog_src(const std::string &s) { verilog_src_ = s; }
 
+   // Integer parameter actuals ("name=value name=value"), emitted as a VHDL
+   // attribute so --accel can re-synthesize with the same generics.
+   void set_verilog_params(const std::string &s) { verilog_params_ = s; }
+
    // Each entity has an associated depth which is how deep in
    // the Verilog module hierarchy it was found
    // This is used to limit the maximum depth of modules emitted
@@ -1033,6 +1037,7 @@ private:
    vhdl_arch *arch_;  // Entity may only have a single architecture
    vhdl_scope ports_;
    std::string verilog_src_;
+   std::string verilog_params_;
 
    // Entities have an associated VHDL time unit
    // This is used to implement the Verilog timescale directive

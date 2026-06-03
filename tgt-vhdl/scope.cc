@@ -1104,6 +1104,11 @@ static void create_skeleton_entity_for(ivl_scope_t scope, int depth)
       << " (" << ivl_scope_def_file(scope) << ":"
       << ivl_scope_def_lineno(scope) << ")";
 
+   // Integer parameter actuals, "name=value name=value", recorded as an
+   // attribute so --accel can re-synthesize the module with the SAME generics
+   // the elaboration used (iverilog monomorphises, so these are the real ones).
+   ostringstream params;
+
    unsigned nparams = ivl_scope_params(scope);
    for (unsigned i = 0; i < nparams; i++) {
       ivl_parameter_t param = ivl_scope_param(scope, i);
@@ -1123,6 +1128,9 @@ static void create_skeleton_entity_for(ivl_scope_t scope, int depth)
 
          case IVL_EX_NUMBER:
             ss << ivl_expr_uvalue(value);
+            if (!params.str().empty()) params << " ";
+            params << ivl_parameter_basename(param) << "="
+                   << ivl_expr_uvalue(value);
             break;
 
          case IVL_EX_REALNUM:
@@ -1133,6 +1141,8 @@ static void create_skeleton_entity_for(ivl_scope_t scope, int depth)
          assert(false);
       }
    }
+
+   ent->set_verilog_params(params.str());
 
    arch->set_comment(ss.str());
    ent->set_comment(ss.str());
