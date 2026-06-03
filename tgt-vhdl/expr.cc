@@ -832,9 +832,14 @@ vhdl_expr *translate_sfunc(ivl_expr_t e)
       const int w = ivl_expr_width(e);
       if (w <= 1)
          return r;   // integer is fine in 1-bit / comparison contexts
-      vhdl_fcall *tu = new vhdl_fcall("to_unsigned", vhdl_type::nunsigned(w));
-      tu->add_expr(r);
-      tu->add_expr(new vhdl_const_int(w));
+      // random returns a SIGNED int32 that may be negative, so to_unsigned()
+      // would raise a NATURAL-range error. Reinterpret the bits instead:
+      // unsigned(to_signed(random, w)).
+      vhdl_fcall *ts = new vhdl_fcall("to_signed", vhdl_type::nsigned(w));
+      ts->add_expr(r);
+      ts->add_expr(new vhdl_const_int(w));
+      vhdl_fcall *tu = new vhdl_fcall("unsigned", vhdl_type::nunsigned(w));
+      tu->add_expr(ts);
       vhdl_fcall *l3 = new vhdl_fcall("unsigned_to_l3d",
                                       vhdl_type::logic3d_vector(w - 1, 0));
       l3->add_expr(tu);
