@@ -1019,6 +1019,11 @@ public:
    void set_time_units(int units, int precision);
    friend vhdl_const_time* scale_time(const vhdl_entity* ent, uint64_t t);
 
+   // Original Verilog source location ("file:line"), emitted as a VHDL
+   // attribute so the source survives translation (for debug, and so --accel
+   // can recover the original Verilog to feed yosys/gen_statemachine).
+   void set_verilog_src(const std::string &s) { verilog_src_ = s; }
+
    // Each entity has an associated depth which is how deep in
    // the Verilog module hierarchy it was found
    // This is used to limit the maximum depth of modules emitted
@@ -1027,6 +1032,7 @@ private:
    std::string name_;
    vhdl_arch *arch_;  // Entity may only have a single architecture
    vhdl_scope ports_;
+   std::string verilog_src_;
 
    // Entities have an associated VHDL time unit
    // This is used to implement the Verilog timescale directive

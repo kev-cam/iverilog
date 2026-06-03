@@ -1086,6 +1086,14 @@ static void create_skeleton_entity_for(ivl_scope_t scope, int depth)
    vhdl_arch *arch = new vhdl_arch(tname, "from_verilog");
    vhdl_entity *ent = new vhdl_entity(tname, arch, depth);
 
+   // Record the original Verilog source location as a VHDL attribute so it
+   // survives translation (debug, and --accel recovering the Verilog source).
+   {
+      std::ostringstream vsrc;
+      vsrc << ivl_scope_def_file(scope) << ":" << ivl_scope_def_lineno(scope);
+      ent->set_verilog_src(vsrc.str());
+   }
+
    // Calculate the VHDL units to use for time values
    ent->set_time_units(ivl_scope_time_units(scope),
                        ivl_scope_time_precision(scope));

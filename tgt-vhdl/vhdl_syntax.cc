@@ -155,6 +155,16 @@ void vhdl_entity::emit(std::ostream &of, int level) const
       of << ");";
    }
 
+   // Carry the original Verilog source location as a VHDL attribute so it
+   // survives translation (for debug and for --accel source recovery).
+   if (!verilog_src_.empty()) {
+      newline(of, indent(level));
+      of << "attribute nvc_verilog_src : string;";
+      newline(of, indent(level));
+      of << "attribute nvc_verilog_src of " << name_
+         << " : entity is \"" << verilog_src_ << "\";";
+   }
+
    newline(of, level);
    of << "end entity; ";
    blank_line(of, level);  // Extra blank line after entities
