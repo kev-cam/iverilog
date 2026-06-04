@@ -55,6 +55,8 @@ struct scope_nexus_t {
 struct nexus_private_t {
    list<scope_nexus_t> signals;
    vhdl_expr *const_driver;
+   bool has_inout = false;     // nexus touches an inout port => bidirectional
+   string inout_module;        // module type of that inout (for origin markup)
 };
 
 /*
@@ -181,6 +183,17 @@ void draw_nexus(ivl_nexus_t nexus)
          if (ivl_signal_port(sig) == IVL_SIP_OUTPUT
              || ivl_signal_port(sig) == IVL_SIP_INOUT)
             ndrivers++;
+
+         // An inout endpoint makes this a bidirectional net: signals sharing
+         // it are a true wire join (e.g. b,c shorted through module id(a,a)),
+         // which must be modelled as sv_alias, not a one-directional assign.
+         // Record the inout's module type so the alias can be marked up.
+         if (ivl_signal_port(sig) == IVL_SIP_INOUT) {
+            priv->has_inout = true;
+            ivl_scope_t ssc = ivl_signal_scope(sig);
+            if (ssc != 0)
+               priv->inout_module = ivl_scope_tname(ssc);
+         }
       }
    }
 
@@ -1301,15 +1314,38 @@ extern "C" int draw_constant_drivers(ivl_scope_t scope, void *)
                      vhdl_type::type_for(ivl_signal_width(*it),
                                          ivl_signal_signed(*it));
 
-                  vhdl_var_ref *rref =
-                     new vhdl_var_ref(get_renamed_signal(sn->sig).c_str(), rtype);
-                  vhdl_var_ref *lref =
-                     new vhdl_var_ref(get_renamed_signal(*it).c_str(), ltype);
+                  if (priv->has_inout) {
+                     // Bidirectional short: the two signals are the same net,
+                     // joined through an inout port (e.g. module id(a,a)). A
+                     // one-directional assign can't model that, so instantiate
+                     // sv_alias -- the resolver then wires both endpoints
+                     // together (a true wire join). Mark the instance with the
+                     // origin module so the short is traceable (e.g. to `id`).
+                     static int alias_seq = 0;
+                     char inst[64];
+                     snprintf(inst, sizeof inst, "sv_alias_%d_inst", alias_seq++);
+                     vhdl_entity_inst *ai =
+                        new vhdl_entity_inst(inst, "sv2vhdl", "sv_alias", "strength");
+                     ai->map_port("a",
+                        new vhdl_var_ref(get_renamed_signal(sn->sig).c_str(), rtype));
+                     ai->map_port("b",
+                        new vhdl_var_ref(get_renamed_signal(*it).c_str(), ltype));
+                     ent->get_arch()->add_stmt(ai);
+                     if (!priv->inout_module.empty())
+                        ent->get_arch()->add_attribute_spec(
+                           "nvc_alias_origin", inst, "label", priv->inout_module);
+                  }
+                  else {
+                     vhdl_var_ref *rref =
+                        new vhdl_var_ref(get_renamed_signal(sn->sig).c_str(), rtype);
+                     vhdl_var_ref *lref =
+                        new vhdl_var_ref(get_renamed_signal(*it).c_str(), ltype);
 
-                  // Make sure the LHS and RHS have the same type
-                  vhdl_expr* rhs = rref->cast(lref->get_type());
+                     // Make sure the LHS and RHS have the same type
+                     vhdl_expr* rhs = rref->cast(lref->get_type());
 
-                  ent->get_arch()->add_stmt(new vhdl_cassign_stmt(lref, rhs));
+                     ent->get_arch()->add_stmt(new vhdl_cassign_stmt(lref, rhs));
+                  }
                }
             }
             sn->connect.clear();
