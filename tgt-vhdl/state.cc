@@ -280,23 +280,6 @@ static bool same_scope_type_name(ivl_scope_t a, ivl_scope_t b)
    if (strcmp(ta, tb) != 0)
       return false;
 
-   // For GENERATE scopes the type name alone doesn't capture the
-   // enclosing parameterized context: a `genblock` inside rvdffe(WIDTH=8)
-   // shares its tname with the `genblock` inside rvdffe(WIDTH=31), but
-   // their child sub-instances elaborate at different widths.  Walk up
-   // to the enclosing MODULE on both sides and compare those instead;
-   // the recursive call disambiguates by the module's parameter values.
-   if (ivl_scope_type(a) == IVL_SCT_GENERATE) {
-      ivl_scope_t pa = ivl_scope_parent(a);
-      ivl_scope_t pb = ivl_scope_parent(b);
-      while (pa && ivl_scope_type(pa) == IVL_SCT_GENERATE)
-         pa = ivl_scope_parent(pa);
-      while (pb && ivl_scope_type(pb) == IVL_SCT_GENERATE)
-         pb = ivl_scope_parent(pb);
-      if (pa != NULL && pb != NULL)
-         return same_scope_type_name(pa, pb);
-   }
-
    unsigned nparams_a = ivl_scope_params(a);
    unsigned nparams_b = ivl_scope_params(b);
 
@@ -343,6 +326,27 @@ static bool same_scope_type_name(ivl_scope_t a, ivl_scope_t b)
       default:
          assert(false);
       }
+   }
+
+   // For GENERATE scopes, matching type name + own parameters is not
+   // sufficient: the enclosing context must match too.  Two cases:
+   //   * loop iterations B[0], B[1], ... share a tname but carry a
+   //     distinct genvar value as a scope parameter -- handled by the
+   //     parameter comparison above (so we never reach here for them).
+   //   * a nested genblk B[i].G[0] has the SAME local genvar (k=0) in
+   //     every outer iteration, and a `genblock` inside rvdffe(WIDTH=8)
+   //     shares its tname/params with the one inside rvdffe(WIDTH=31).
+   // Recurse into the immediate parent so the outer genvar AND the
+   // enclosing module's parameters are compared.  (Recursing to the
+   // immediate parent -- not jumping to the module -- is what keeps the
+   // per-iteration outer genvar in the comparison; jumping straight to
+   // the module collapsed B[0].G[0]..B[7].G[0] to one "default" scope,
+   // so only B[0]'s child logic got drawn.)
+   if (ivl_scope_type(a) == IVL_SCT_GENERATE) {
+      ivl_scope_t pa = ivl_scope_parent(a);
+      ivl_scope_t pb = ivl_scope_parent(b);
+      if (pa != NULL && pb != NULL)
+         return same_scope_type_name(pa, pb);
    }
 
    return true;
