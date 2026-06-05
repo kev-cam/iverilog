@@ -151,6 +151,9 @@ static ivl_signal_type_t signal_type_of_nexus(ivl_nexus_t nex, int &width)
    return out;
 }
 
+// Forward decl: per-generate-iteration name suffix (defined below).
+static string genvar_unique_suffix(ivl_scope_t scope);
+
 /*
  * Generates VHDL code to fully represent a nexus.
  */
@@ -223,7 +226,13 @@ void draw_nexus(ivl_nexus_t nexus)
                vhdl_type::type_for(ivl_logic_width(log), false);
 
             ostringstream ss;
-            ss << "LO" << ivl_logic_basename(log);
+            // Append the generate-iteration suffix so the temp net for a
+            // logic gate replicated across generate iterations gets a unique
+            // name per iteration (matching declare_one_signal).  Without this,
+            // every iteration's gate drives the SAME "LO_ivl_N" net -> multiple
+            // drivers -> wrong resolution (e.g. VeeR BTB write-enable nets).
+            ss << "LO" << ivl_logic_basename(log)
+               << genvar_unique_suffix(log_scope);
             // Skip if a signal with this name was already declared
             // (a different nexus connected to the same logic gate)
             if (!vhdl_scope->have_declared(ss.str()))
