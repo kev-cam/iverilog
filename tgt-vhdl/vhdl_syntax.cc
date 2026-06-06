@@ -157,6 +157,9 @@ void vhdl_entity::emit(std::ostream &of, int level) const
 
    // Carry the original Verilog source location as a VHDL attribute so it
    // survives translation (for debug and for --accel source recovery).
+   // NB: the `of <name_>` target is the pre-dedup entity name; the downstream
+   // sv2vhdl-modules dedup (sv-rename-variants) rewrites it in lockstep with
+   // the entity rename, so the reference stays valid.
    if (!verilog_src_.empty()) {
       newline(of, indent(level));
       of << "attribute nvc_verilog_src : string;";
