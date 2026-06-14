@@ -167,6 +167,14 @@ endif
 	$(CC) $(CPPFLAGS) $(MDIR1) $(MDIR2) $(CFLAGS) @DEPENDENCY_FLAG@ -c $< -o $*.o
 	mv $*.d dep/$*.d
 
+# arith_kernel is the only C (not C++) source in $O. Both %.o:%.cc and
+# %.o:%.c match arith_kernel.o; make prefers the .cc rule listed first and
+# then fails looking for a nonexistent arith_kernel.cc. Pin it to C with an
+# explicit rule (an explicit recipe always wins over the pattern rules).
+arith_kernel.o: arith_kernel.c config.h
+	$(CC) $(CPPFLAGS) $(MDIR1) $(MDIR2) $(CFLAGS) @DEPENDENCY_FLAG@ -c $< -o $@
+	mv arith_kernel.d dep/arith_kernel.d
+
 tables.cc: $(srcdir)/draw_tt.c
 	$(BUILDCC) $(CFLAGS) -o draw_tt$(BUILDEXT) $(srcdir)/draw_tt.c
 	./draw_tt$(BUILDEXT) > tables.cc
