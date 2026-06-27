@@ -375,8 +375,64 @@ NetExpr *normalize_variable_base(NetExpr *base, long msb, long lsb,
       return msb_lo ? make_sub_expr(offset, base) : make_add_expr(base, offset);
 }
 
+/*
+ * Build the runtime bit-offset contributed by the VARIABLE prefix indices of a
+ * chained packed select. prefix_exprs is one entry per prefix (all-but-final)
+ * packed dimension, outer-first; a null entry is a constant index already
+ * accounted for in the constant offset (sb_to_idx), a non-null entry is a
+ * variable index whose contribution is idx_k * slice_width(k+1). This mirrors
+ * the stride loop in collapse_array_exprs but only over the prefix positions.
+ * Returns 0 when every prefix index is constant.
+ */
+NetExpr* make_prefix_var_offset(const NetNet*reg,
+				const list<NetExpr*>&prefix_exprs,
+				long const_off)
+{
+      const netranges_t&pdims = reg->packed_dims();
+      netranges_t::const_iterator pcur = pdims.begin();
+      list<NetExpr*>::const_iterator ecur = prefix_exprs.begin();
+      NetExpr*base = 0;
+      for (size_t idx = 0 ; ecur != prefix_exprs.end() ; ++idx, ++pcur, ++ecur) {
+	    if (*ecur == 0) continue;   // constant prefix position
+	    unsigned long stride = reg->slice_width(idx+1);
+	    long lsb = pcur->get_lsb();
+	    long msb = pcur->get_msb();
+	      // Canonicalize the index to a 0-based slice number.
+	    NetExpr*tmp = normalize_variable_base(*ecur, msb, lsb, stride, msb > lsb);
+	    if (stride != 1) {
+		  unsigned min_wid = tmp->expr_width();
+		  if (num_bits(stride) >= min_wid) {
+			min_wid = num_bits(stride) + 1;
+			tmp = pad_to_width(tmp, min_wid, *tmp);
+		  }
+		  tmp = make_mult_expr(tmp, stride);
+	    }
+	    base = base ? make_add_expr(tmp, base, tmp) : tmp;
+      }
+	// Every prefix index was constant -> no runtime offset.
+      if (base == 0) return 0;
+	// Fold in the constant part of the base (constant prefix indices and
+	// the final index's lsb position) so the caller gets a ready-to-use
+	// indexed-part-select base.
+      if (const_off != 0) base = make_add_expr(base, const_off);
+      return base;
+}
+
+  // Add the runtime contribution of any VARIABLE prefix indices (positions in
+  // prefix_exprs that are non-null) to a normalized base. A no-op when there
+  // are no variable prefixes (prefix_exprs null or all-constant).
+static NetExpr* add_prefix_var_offset(NetExpr*res, const NetNet*reg,
+				      const list<NetExpr*>*prefix_exprs)
+{
+      if (prefix_exprs == 0) return res;
+      NetExpr*voff = make_prefix_var_offset(reg, *prefix_exprs);
+      if (voff == 0) return res;
+      return make_add_expr(res, res, voff);
+}
+
 NetExpr *normalize_variable_bit_base(const list<long>&indices, NetExpr*base,
-				     const NetNet*reg)
+				     const NetNet*reg,
+				     const list<NetExpr*>*prefix_exprs)
 {
       const netranges_t&packed_dims = reg->packed_dims();
       ivl_assert(*base, indices.size()+1 == packed_dims.size());
@@ -387,12 +443,14 @@ NetExpr *normalize_variable_bit_base(const list<long>&indices, NetExpr*base,
       const netrange_t&rng = packed_dims.back();
       long slice_off = reg->sb_to_idx(indices, rng.get_lsb());
 
-      return normalize_variable_base(base, rng.get_msb(), rng.get_lsb(), 1, true, slice_off);
+      NetExpr*res = normalize_variable_base(base, rng.get_msb(), rng.get_lsb(), 1, true, slice_off);
+      return add_prefix_var_offset(res, reg, prefix_exprs);
 }
 
 NetExpr *normalize_variable_part_base(const list<long>&indices, NetExpr*base,
 				      const NetNet*reg,
-				      unsigned long wid, bool is_up)
+				      unsigned long wid, bool is_up,
+				      const list<NetExpr*>*prefix_exprs)
 {
       const netranges_t&packed_dims = reg->packed_dims();
       ivl_assert(*base, indices.size()+1 == packed_dims.size());
@@ -403,11 +461,13 @@ NetExpr *normalize_variable_part_base(const list<long>&indices, NetExpr*base,
       const netrange_t&rng = packed_dims.back();
       long slice_off = reg->sb_to_idx(indices, rng.get_lsb());
 
-      return normalize_variable_base(base, rng.get_msb(), rng.get_lsb(), wid, is_up, slice_off);
+      NetExpr*res = normalize_variable_base(base, rng.get_msb(), rng.get_lsb(), wid, is_up, slice_off);
+      return add_prefix_var_offset(res, reg, prefix_exprs);
 }
 
 NetExpr *normalize_variable_slice_base(const list<long>&indices, NetExpr*base,
-				       const NetNet*reg, unsigned long&lwid)
+				       const NetNet*reg, unsigned long&lwid,
+				       const list<NetExpr*>*prefix_exprs)
 {
       const netranges_t&packed_dims = reg->packed_dims();
       ivl_assert(*base, indices.size() < packed_dims.size());
@@ -452,7 +512,7 @@ NetExpr *normalize_variable_slice_base(const list<long>&indices, NetExpr*base,
 	    base = pad_to_width(base, min_wid, *base);
 	    base = make_sub_expr(loff, base);
       }
-      return base;
+      return add_prefix_var_offset(base, reg, prefix_exprs);
 }
 
 ostream& operator << (ostream&o, __IndicesManip<long> val)
@@ -1495,7 +1555,8 @@ void collapse_partselect_pv_to_concat(Design*des, NetNet*sig)
  */
 bool evaluate_index_prefix(Design*des, NetScope*scope,
 			   list<long>&prefix_indices,
-			   const list<index_component_t>&indices)
+			   const list<index_component_t>&indices,
+			   list<NetExpr*>*prefix_exprs)
 {
       list<index_component_t>::const_iterator icur = indices.begin();
       for (size_t idx = 0 ; (idx+1) < indices.size() ; idx += 1, ++icur) {
@@ -1507,18 +1568,30 @@ bool evaluate_index_prefix(Design*des, NetScope*scope,
 		  des->errors += 1;
 		  return false;
 	    }
-	    NetExpr*texpr = elab_and_eval(des, scope, icur->msb, -1, true);
+	      // When the caller can accept a VARIABLE prefix index (prefix_exprs
+	      // != 0), do not force a constant; otherwise keep the historical
+	      // need_const=true so callers that can't handle a variable prefix
+	      // still error as before.
+	    NetExpr*texpr = elab_and_eval(des, scope, icur->msb, -1,
+					  prefix_exprs == 0);
 
 	    long tmp;
-	    if (texpr == 0 || !eval_as_long(tmp, texpr)) {
+	    if (texpr != 0 && eval_as_long(tmp, texpr)) {
+		    // Constant prefix index: fold it into the constant offset.
+		  prefix_indices.push_back(tmp);
+		  if (prefix_exprs) prefix_exprs->push_back(0);
+		  delete texpr;
+	    } else if (prefix_exprs != 0 && texpr != 0) {
+		    // Variable prefix index: keep the expression. Its constant
+		    // contribution is 0 (handled instead by make_prefix_var_offset).
+		  prefix_indices.push_back(0);
+		  prefix_exprs->push_back(texpr);
+	    } else {
 		  cerr << icur->msb->get_fileline() << ": error: "
 			"Array index expressions must be constant here." << endl;
 		  des->errors += 1;
 		  return false;
 	    }
-
-	    prefix_indices.push_back(tmp);
-	    delete texpr;
       }
 
       return true;

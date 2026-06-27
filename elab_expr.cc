@@ -4124,7 +4124,8 @@ NetExpr* PEFNumber::elaborate_expr(Design*, NetScope*, unsigned, unsigned) const
 }
 
 bool PEIdent::calculate_packed_indices_(Design*des, NetScope*scope, const NetNet*net,
-					list<long>&prefix_indices) const
+					list<long>&prefix_indices,
+					list<NetExpr*>*prefix_exprs) const
 {
       unsigned dimensions = net->unpacked_dimensions() + net->packed_dimensions();
       switch (net->data_type()) {
@@ -4151,7 +4152,7 @@ bool PEIdent::calculate_packed_indices_(Design*des, NetScope*scope, const NetNet
       for (size_t idx = 0 ; idx < net->unpacked_dimensions() ; idx += 1)
 	    index.pop_front();
 
-      return evaluate_index_prefix(des, scope, prefix_indices, index);
+      return evaluate_index_prefix(des, scope, prefix_indices, index, prefix_exprs);
 }
 
 
@@ -5959,7 +5960,9 @@ NetExpr* PEIdent::elaborate_expr_net_part_(Design*des, NetScope*scope,
       }
 
       list<long> prefix_indices;
-      bool rc = calculate_packed_indices_(des, scope, net->sig(), prefix_indices);
+      list<NetExpr*> prefix_exprs;
+      bool rc = calculate_packed_indices_(des, scope, net->sig(), prefix_indices,
+					  &prefix_exprs);
       if (!rc)
 	    return 0;
 
@@ -6063,10 +6066,17 @@ NetExpr* PEIdent::elaborate_expr_net_part_(Design*des, NetScope*scope,
 
       unsigned long wid = sb_msb - sb_lsb + 1;
 
+	// A VARIABLE prefix index (e.g. arr[var][3:0]) turns the constant
+	// base sb_lsb into a runtime base = var_offset + sb_lsb, and the whole
+	// constant part select into an indexed part select [base +: wid]. The
+	// constant-only shortcuts below assume a compile-time position, so skip
+	// them when there is a variable prefix.
+      NetExpr*prefix_off = make_prefix_var_offset(net->sig(), prefix_exprs, sb_lsb);
+
 	// If the part select covers exactly the entire
 	// vector, then do not bother with it. Return the
 	// signal itself, casting to unsigned if necessary.
-      if (sb_lsb == 0 && wid == net->vector_width()) {
+      if (prefix_off == 0 && sb_lsb == 0 && wid == net->vector_width()) {
 	    net->cast_signed(false);
 	    return net;
       }
@@ -6074,10 +6084,18 @@ NetExpr* PEIdent::elaborate_expr_net_part_(Design*des, NetScope*scope,
 	// If the part select covers NONE of the vector, then return a
 	// constant X.
 
-      if ((sb_lsb >= (signed) net->vector_width()) || (sb_msb < 0)) {
+      if (prefix_off == 0
+	  && ((sb_lsb >= (signed) net->vector_width()) || (sb_msb < 0))) {
 	    NetEConst*tmp = make_const_x(wid);
 	    tmp->set_line(*this);
 	    return tmp;
+      }
+
+      if (prefix_off != 0) {
+	      // prefix_off already includes the constant base sb_lsb.
+	    NetESelect*ss = new NetESelect(net, prefix_off, wid, IVL_SEL_IDX_UP);
+	    ss->set_line(*this);
+	    return ss;
       }
 
       NetExpr*ex = new NetEConst(verinum(sb_lsb));
@@ -6101,7 +6119,9 @@ NetExpr* PEIdent::elaborate_expr_net_idx_up_(Design*des, NetScope*scope,
       }
 
       list<long>prefix_indices;
-      bool rc = calculate_packed_indices_(des, scope, net->sig(), prefix_indices);
+      list<NetExpr*> prefix_exprs;
+      bool rc = calculate_packed_indices_(des, scope, net->sig(), prefix_indices,
+					  &prefix_exprs);
       if (!rc)
 	    return 0;
 
@@ -6240,7 +6260,7 @@ NetExpr* PEIdent::elaborate_expr_net_idx_up_(Design*des, NetScope*scope,
 
 	// Convert the non-constant part select index expression into
 	// an expression that returns a canonical base.
-      base = normalize_variable_part_base(prefix_indices, base, net->sig(), wid, true);
+      base = normalize_variable_part_base(prefix_indices, base, net->sig(), wid, true, &prefix_exprs);
 
       NetESelect*ss = new NetESelect(net, base, wid, IVL_SEL_IDX_UP);
       ss->set_line(*this);
@@ -6268,7 +6288,9 @@ NetExpr* PEIdent::elaborate_expr_net_idx_do_(Design*des, NetScope*scope,
       }
 
       list<long>prefix_indices;
-      bool rc = calculate_packed_indices_(des, scope, net->sig(), prefix_indices);
+      list<NetExpr*> prefix_exprs;
+      bool rc = calculate_packed_indices_(des, scope, net->sig(), prefix_indices,
+					  &prefix_exprs);
       if (!rc)
 	    return 0;
 
@@ -6406,7 +6428,7 @@ NetExpr* PEIdent::elaborate_expr_net_idx_do_(Design*des, NetScope*scope,
 
 	// Convert the non-constant part select index expression into
 	// an expression that returns a canonical base.
-      base = normalize_variable_part_base(prefix_indices, base, net->sig(), wid, false);
+      base = normalize_variable_part_base(prefix_indices, base, net->sig(), wid, false, &prefix_exprs);
 
       NetESelect*ss = new NetESelect(net, base, wid, IVL_SEL_IDX_DOWN);
       ss->set_line(*this);
@@ -6424,7 +6446,9 @@ NetExpr* PEIdent::elaborate_expr_net_bit_(Design*des, NetScope*scope,
                                           bool need_const) const
 {
       list<long>prefix_indices;
-      bool rc = calculate_packed_indices_(des, scope, net->sig(), prefix_indices);
+      list<NetExpr*> prefix_exprs;
+      bool rc = calculate_packed_indices_(des, scope, net->sig(), prefix_indices,
+					  &prefix_exprs);
       if (!rc)
 	    return 0;
 
@@ -6559,6 +6583,17 @@ NetExpr* PEIdent::elaborate_expr_net_bit_(Design*des, NetScope*scope,
 
 	    long idx = net->sig()->sb_to_idx(prefix_indices,msv);
 
+	      // A VARIABLE prefix index with a constant final bit makes the
+	      // overall position runtime: select [var_offset + idx +: 1]. The
+	      // constant out-of-range checks below don't apply.
+	    NetExpr*pre_off = make_prefix_var_offset(net->sig(), prefix_exprs, idx);
+	    if (pre_off != 0) {
+		  NetESelect*res = new NetESelect(net, pre_off, 1, IVL_SEL_IDX_UP);
+		  res->set_line(*net);
+		  delete mux;
+		  return res;
+	    }
+
 	    if (idx >= (long)net->vector_width() || idx < 0) {
 		    /* The bit select is out of range of the
 		       vector. This is legal, but returns a
@@ -6619,7 +6654,7 @@ NetExpr* PEIdent::elaborate_expr_net_bit_(Design*des, NetScope*scope,
 	      // here is convert to a "slice" of the vector.
 	    unsigned long lwid;
 	    mux = normalize_variable_slice_base(prefix_indices, mux,
-						net->sig(), lwid);
+						net->sig(), lwid, &prefix_exprs);
 	    mux->set_line(*net);
 
 	      // Make a PART select with the canonical index
@@ -6646,7 +6681,7 @@ NetExpr* PEIdent::elaborate_expr_net_bit_(Design*des, NetScope*scope,
 	// complicated task because we need to generate
 	// expressions to convert calculated bit select
 	// values to canonical values that are used internally.
-      mux = normalize_variable_bit_base(prefix_indices, mux, net->sig());
+      mux = normalize_variable_bit_base(prefix_indices, mux, net->sig(), &prefix_exprs);
 
       NetESelect*ss = new NetESelect(net, mux, 1);
       ss->set_line(*this);
@@ -6715,7 +6750,13 @@ NetExpr* PEIdent::elaborate_expr_net(Design*des, NetScope*scope,
       }
 
       list<long> prefix_indices;
-      bool rc = evaluate_index_prefix(des, scope, prefix_indices, path_.back().index);
+	// This is an early validity check before dispatching to the specific
+	// handler (which re-evaluates the prefix itself). Tolerate a VARIABLE
+	// prefix index here so the handler gets a chance to lower it into an
+	// indexed part select; the throwaway expressions are re-elaborated below.
+      list<NetExpr*> tmp_prefix_exprs;
+      bool rc = evaluate_index_prefix(des, scope, prefix_indices,
+				      path_.back().index, &tmp_prefix_exprs);
       if (!rc) return 0;
 
 	// If this is a part select of a signal, then make a new

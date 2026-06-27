@@ -528,8 +528,9 @@ bool PEIdent::elaborate_lval_net_bit_(Design*des,
 				      bool need_const_idx,
 				      bool is_force) const
 {
+      list<NetExpr*> prefix_exprs;
       list<long>prefix_indices;
-      bool rc = calculate_packed_indices_(des, scope, lv->sig(), prefix_indices);
+      bool rc = calculate_packed_indices_(des, scope, lv->sig(), prefix_indices, &prefix_exprs);
       if (!rc) return false;
 
       const name_component_t&name_tail = path_.back();
@@ -624,7 +625,7 @@ bool PEIdent::elaborate_lval_net_bit_(Design*des,
 	    } else {
 		  unsigned long lwid;
 		  mux = normalize_variable_slice_base(prefix_indices, mux,
-						      reg, lwid);
+						      reg, lwid, &prefix_exprs);
 
 		  if ((reg->type()==NetNet::UNRESOLVED_WIRE) && !is_force) {
 			ivl_assert(*this, reg->coerced_to_uwire());
@@ -663,7 +664,7 @@ bool PEIdent::elaborate_lval_net_bit_(Design*des,
 		  des->errors += 1;
 		  return false;
 	    }
-	    mux = normalize_variable_bit_base(prefix_indices, mux, reg);
+	    mux = normalize_variable_bit_base(prefix_indices, mux, reg, &prefix_exprs);
 
 	    if ((reg->type()==NetNet::UNRESOLVED_WIRE) && !is_force) {
 		  ivl_assert(*this, reg->coerced_to_uwire());
@@ -688,6 +689,14 @@ bool PEIdent::elaborate_lval_net_bit_(Design*des,
       } else {
 	      // Constant bit select that does something useful.
 	    long loff = reg->sb_to_idx(prefix_indices,lsb);
+
+	      // A VARIABLE prefix index makes the bit position runtime:
+	      // assign to [var_offset + loff +: 1] (an indexed part select).
+	    NetExpr*pre_off = make_prefix_var_offset(reg, prefix_exprs, loff);
+	    if (pre_off != 0) {
+		  lv->set_part(pre_off, 1, IVL_SEL_IDX_UP);
+		  return true;
+	    }
 
 	    if (warn_ob_select && (loff < 0 || loff >= (long)reg->vector_width())) {
 		  cerr << get_fileline() << ": warning: bit select "
@@ -752,8 +761,9 @@ bool PEIdent::elaborate_lval_net_part_(Design*des,
            return false;
       }
 
+      list<NetExpr*> prefix_exprs;
       list<long> prefix_indices;
-      bool rc = calculate_packed_indices_(des, scope, lv->sig(), prefix_indices);
+      bool rc = calculate_packed_indices_(des, scope, lv->sig(), prefix_indices, &prefix_exprs);
       ivl_assert(*this, rc);
 
 	// The range expressions of a part select must be
@@ -827,6 +837,14 @@ bool PEIdent::elaborate_lval_net_part_(Design*des,
 
       unsigned long wid = moff - loff + 1;
 
+	// A VARIABLE prefix index makes the base runtime: assign to
+	// [var_offset + loff +: wid]. The constant shortcuts below don't apply.
+      NetExpr*pre_off = make_prefix_var_offset(reg, prefix_exprs, loff);
+      if (pre_off != 0) {
+	    lv->set_part(pre_off, wid, IVL_SEL_IDX_UP);
+	    return true;
+      }
+
 	// Special case: The range winds up selecting the entire
 	// vector. Treat this as no part select at all.
       if (loff == 0 && wid == reg->vector_width()) {
@@ -863,8 +881,9 @@ bool PEIdent::elaborate_lval_net_idx_(Design*des,
            return false;
       }
 
+      list<NetExpr*> prefix_exprs;
       list<long>prefix_indices;
-      bool rc = calculate_packed_indices_(des, scope, lv->sig(), prefix_indices);
+      bool rc = calculate_packed_indices_(des, scope, lv->sig(), prefix_indices, &prefix_exprs);
       ivl_assert(*this, rc);
 
       const name_component_t&name_tail = path_.back();;
@@ -1033,12 +1052,12 @@ bool PEIdent::elaborate_lval_net_idx_(Design*des,
 	      /* Correct the mux for the range of the vector. */
 	    if (use_sel == index_component_t::SEL_IDX_UP) {
 		  base = normalize_variable_part_base(prefix_indices, base,
-						      reg, wid, true);
+					      reg, wid, true, &prefix_exprs);
 		  sel_type = IVL_SEL_IDX_UP;
 	    } else {
 		    // This is assumed to be a SEL_IDX_DO.
 		  base = normalize_variable_part_base(prefix_indices, base,
-						      reg, wid, false);
+					      reg, wid, false, &prefix_exprs);
 		  sel_type = IVL_SEL_IDX_DOWN;
 	    }
       }

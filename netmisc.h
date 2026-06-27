@@ -208,7 +208,8 @@ extern NetExpr*normalize_variable_base(NetExpr *base, long msb, long lsb,
  * base is (x) and the generated expression will be (x+8).
  */
 extern NetExpr*normalize_variable_bit_base(const std::list<long>&indices, NetExpr *base,
-					   const NetNet*reg);
+					   const NetNet*reg,
+					   const std::list<NetExpr*>*prefix_exprs = 0);
 
 /*
  * This is similar to normalize_variable_bit_base, but the tail index
@@ -221,7 +222,8 @@ extern NetExpr*normalize_variable_bit_base(const std::list<long>&indices, NetExp
  */
 extern NetExpr *normalize_variable_part_base(const std::list<long>&indices, NetExpr*base,
 					     const NetNet*reg,
-					     unsigned long wid, bool is_up);
+					     unsigned long wid, bool is_up,
+					     const std::list<NetExpr*>*prefix_exprs = 0);
 /*
  * Calculate a canonicalizing expression for a slice select. The
  * indices array is less than needed to fully address a bit, so the
@@ -234,7 +236,19 @@ extern NetExpr *normalize_variable_part_base(const std::list<long>&indices, NetE
  * lwid set to (8).
  */
 extern NetExpr*normalize_variable_slice_base(const std::list<long>&indices, NetExpr *base,
-					     const NetNet*reg, unsigned long&lwid);
+					     const NetNet*reg, unsigned long&lwid,
+					     const std::list<NetExpr*>*prefix_exprs = 0);
+
+/*
+ * Build the runtime bit-offset contributed by the VARIABLE prefix indices of a
+ * chained packed select (the non-null positions in prefix_exprs, as gathered by
+ * evaluate_index_prefix). This is the NetExpr form of NetNet::sb_to_idx's stride
+ * sum (idx_k * slice_width). Returns 0 when every prefix index was constant, so
+ * a caller can keep its existing constant-only path unchanged.
+ */
+extern NetExpr*make_prefix_var_offset(const NetNet*reg,
+				      const std::list<NetExpr*>&prefix_exprs,
+				      long const_off = 0);
 
 /*
  * The as_indices() manipulator is a convenient way to emit a list of
@@ -462,7 +476,8 @@ extern void collapse_partselect_pv_to_concat(Design*des, NetNet*sig);
 
 extern bool evaluate_index_prefix(Design*des, NetScope*scope,
 				  std::list<long>&prefix_indices,
-				  const std::list<index_component_t>&indices);
+				  const std::list<index_component_t>&indices,
+				  std::list<NetExpr*>*prefix_exprs = 0);
 
 extern NetExpr*collapse_array_indices(Design*des, NetScope*scope, const NetNet*net,
 				      const std::list<index_component_t>&indices);
