@@ -25,6 +25,7 @@
 # include  "compiler.h"
 # include  "PExpr.h"
 # include  "PWire.h"
+# include  "PGenerate.h"
 # include  "Module.h"
 # include  "ivl_assert.h"
 # include  "netmisc.h"
@@ -410,6 +411,17 @@ void PEIdent::declare_implicit_nets(LexicalScope*scope, NetNet::Type type)
                         return;
                   if (ss->genvars.find(name) != ss->genvars.end())
                         return;
+                  /* A generate "for" loop index is a genvar. An inline
+                     `for (genvar i = ...)` index is tracked via loop_index
+                     rather than the genvars map, so check it explicitly here.
+                     Without this, an implicit wire is declared that shadows
+                     the genvar, breaking constant folding of genvar
+                     expressions used in a sibling port's bit-select. */
+                  if (const PGenerate*gen = dynamic_cast<const PGenerate*>(ss)) {
+                        if (gen->scheme_type == PGenerate::GS_LOOP
+                            && gen->loop_index == name)
+                              return;
+                  }
                   if (ss->events.find(name) != ss->events.end())
                         return;
                   if (find_enum_constant(ss, name))
