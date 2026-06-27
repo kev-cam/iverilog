@@ -260,6 +260,7 @@ static int draw_stask_set_val(vhdl_procedural *proc,
    vhdl_type integer(VHDL_TYPE_INTEGER);
    const int nidx = count - 2;
    const unsigned packed_dims = ivl_signal_packed_dimensions(sig);
+   int lhs_slice_width = 1;   // width of the LHS slice (>1 if inner dims unindexed)
    if (nidx >= 1 && (unsigned)nidx <= packed_dims) {
       // Build per-index dimension widths: dim 0 is innermost, dim packed_dims-1
       // is outermost. For an outer index `i`, its weight is the product of
@@ -295,7 +296,15 @@ static int draw_stask_set_val(vhdl_procedural *proc,
             flat = new vhdl_binop_expr(flat, VHDL_BINOP_ADD, term,
                                        new vhdl_type(VHDL_TYPE_INTEGER));
       }
-      lhs->set_slice(flat, 0);
+      // If only the outer dims were indexed (nidx < packed_dims), the LHS is
+      // not a single bit but a slice spanning the un-indexed inner dims:
+      // arr[i][j] on [..][..][W] -> arr(flat + W-1 downto flat). Width = the
+      // product of the inner (un-indexed) dimension sizes; 1 when fully indexed.
+      int inner_w = 1;
+      for (int d = nidx; d < (int)packed_dims; d++)
+         inner_w *= dim_size[d];
+      lhs->set_slice(flat, inner_w - 1);
+      lhs_slice_width = inner_w;
    }
    else {
       // Fallback: chained slice (works when iverilog kept the array shape).
@@ -314,6 +323,13 @@ static int draw_stask_set_val(vhdl_procedural *proc,
    ivl_expr_t val_e = ivl_stmt_parm(stmt, count - 1);
    vhdl_expr *val = translate_expr(val_e);
    if (!val) return 1;
+
+   // When the LHS is a multi-bit slice (inner dims left unindexed) but the
+   // value is narrower (e.g. arr[i][j] = '0 -> a scalar L3D_0), widen the
+   // value to the slice width — Verilog pads the MSBs with 0.
+   if (lhs_slice_width > 1 && val->get_type() != NULL
+       && val->get_type()->get_width() != lhs_slice_width)
+      val = val->cast(vhdl_type::logic3d_vector(lhs_slice_width - 1, 0));
 
    vhdl_assign_stmt *assign = new vhdl_assign_stmt(lhs, val);
    container->add_stmt(assign);

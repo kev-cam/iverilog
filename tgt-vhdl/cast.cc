@@ -99,10 +99,26 @@ vhdl_expr *vhdl_expr::cast(const vhdl_type *to)
          return to_string();
       case VHDL_TYPE_LOGIC3D:
          return to_std_logic();  // logic3d is the sv2vhdl equivalent
-      case VHDL_TYPE_LOGIC3D_VECTOR:
-         // Cast to logic3d vector — for now just return self and hope
-         // the widths match. TODO: proper resize for logic3d_vector.
-         return this;
+      case VHDL_TYPE_LOGIC3D_VECTOR: {
+         // Zero-extend a single logic3d bit into a logic3d_vector of the
+         // target width. Verilog widens a narrow value to the lvalue by
+         // padding the MSBs with 0. Only valid when the source is a SCALAR
+         // bit; multi-bit sources (e.g. a signed multiply) are left as-is.
+         // Round-trip via unsigned so the result is a self-ranged (w-1 downto
+         // 0) value — a positional aggregate would clash with a shifted target
+         // slice range: unsigned_to_l3d(Resize(l3d_to_unsigned(this), w)).
+         int w = to->get_width();
+         if (w <= 1 || type_->get_width() != 1)
+            return this;
+         vhdl_fcall *as_u = new vhdl_fcall("l3d_to_unsigned",
+                                           vhdl_type::nunsigned(1));
+         as_u->add_expr(this);
+         vhdl_expr *wide_u = as_u->resize(w);   // Resize(unsigned,w): zero-extend
+         vhdl_fcall *back = new vhdl_fcall("unsigned_to_l3d",
+                                           vhdl_type::logic3d_vector(w - 1, 0));
+         back->add_expr(wide_u);
+         return back;
+      }
       default:
          assert(false);
       }

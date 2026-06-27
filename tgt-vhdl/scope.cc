@@ -286,11 +286,34 @@ void draw_nexus(ivl_nexus_t nexus)
                }
             }
             ss << ivl_lpm_basename(lpm);
+            // Append the generate-iteration suffix so an LPM temp net (e.g. a
+            // synthesized FF q/d or enable) replicated across generate
+            // iterations gets a unique name per iteration — mirroring the logic
+            // gate ("LO") case above.  Without this, every iteration's LPM
+            // shares the SAME "LPM_*_ivl_N" net, so distinct nets (a 1-bit FF
+            // enable and a wide FF din) alias to one signal -> width/type
+            // mismatch + multiple drivers (VeeR EH2 IC_TAG/BTB write-bypass).
+            ss << genvar_unique_suffix(lpm_scope);
 
-            if (!vhdl_scope->have_declared(ss.str()))
-               vhdl_scope->add_decl(new vhdl_signal_decl(ss.str(), type));
+            // The genvar suffix disambiguates LPM temps replicated across
+            // generate iterations, but synthesized FF q-nets can be re-parented
+            // to a non-generate scope (empty suffix) and still collide — two
+            // DISTINCT nets sharing one basename.  We only reach here when this
+            // nexus is NEW to the scope (visible_nexus was false above), so a
+            // name already declared belongs to a DIFFERENT nexus: uniquify it
+            // rather than alias both nets onto one signal (which produced the
+            // 1-bit-enable vs wide-din width clashes in VeeR EH2 IC_TAG/BTB).
+            string tname = ss.str();
+            if (vhdl_scope->have_declared(tname)) {
+               ostringstream uq;
+               int u = 1;
+               do { uq.str(""); uq << ss.str() << "_u" << u++; }
+               while (vhdl_scope->have_declared(uq.str()));
+               tname = uq.str();
+            }
+            vhdl_scope->add_decl(new vhdl_signal_decl(tname, type));
 
-            link_scope_to_nexus_tmp(priv, vhdl_scope, ss.str());
+            link_scope_to_nexus_tmp(priv, vhdl_scope, tname);
          }
 
          // If this is connected to the LPM output then this nexus
