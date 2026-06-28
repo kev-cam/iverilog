@@ -183,8 +183,35 @@ static int draw_stask_display(vhdl_procedural *proc,
                         } else if (tn == VHDL_TYPE_STD_LOGIC_VECTOR
                                    && !base->constant()) {
                            // Already std_logic_vector: use directly
+                        } else if (tn == VHDL_TYPE_INTEGER
+                                   || ((tn == VHDL_TYPE_UNSIGNED
+                                        || tn == VHDL_TYPE_SIGNED)
+                                       && base->constant())) {
+                           // A sized integer / vector constant reaches us as a
+                           // vhdl_const_int (e.g. 16'd3 is typed UNSIGNED but
+                           // holds an integer literal, so std_logic_vector() of
+                           // it would be illegal). Verilog formats %h/%x/%b/%o
+                           // as the radix, NEVER decimal, so rebuild a
+                           // width-correct std_logic_vector via to_unsigned/
+                           // to_signed and let the radix formatter run, instead
+                           // of falling through to integer'image (which printed
+                           // decimal -- %h of 16'd3 wrongly gave "3" not "0003").
+                           int w = ivl_expr_width(netp);
+                           if (w < 1) w = 1;
+                           vhdl_type itype(VHDL_TYPE_INTEGER);
+                           const bool sgn = ivl_expr_signed(netp) != 0;
+                           vhdl_fcall *num = new vhdl_fcall(
+                              sgn ? "to_signed" : "to_unsigned",
+                              sgn ? vhdl_type::nsigned(w)
+                                  : vhdl_type::nunsigned(w));
+                           num->add_expr(base->cast(&itype));
+                           num->add_expr(new vhdl_const_int(w));
+                           vhdl_fcall *slv = new vhdl_fcall("std_logic_vector",
+                              vhdl_type::std_logic_vector(w - 1, 0));
+                           slv->add_expr(num);
+                           base = slv;
                         } else {
-                           // Integer, single-bit, constant, etc.: fall back
+                           // Single-bit, real, etc.: fall back
                            text->add_expr(base->cast(text->get_type()));
                            break;
                         }
