@@ -4152,7 +4152,7 @@ bool PEIdent::calculate_packed_indices_(Design*des, NetScope*scope, const NetNet
       for (size_t idx = 0 ; idx < net->unpacked_dimensions() ; idx += 1)
 	    index.pop_front();
 
-      return evaluate_index_prefix(des, scope, prefix_indices, index, prefix_exprs);
+      return evaluate_index_prefix(des, scope, prefix_indices, index, prefix_exprs, net);
 }
 
 

@@ -1556,8 +1556,10 @@ void collapse_partselect_pv_to_concat(Design*des, NetNet*sig)
 bool evaluate_index_prefix(Design*des, NetScope*scope,
 			   list<long>&prefix_indices,
 			   const list<index_component_t>&indices,
-			   list<NetExpr*>*prefix_exprs)
+			   list<NetExpr*>*prefix_exprs,
+			   const NetNet*prefix_reg)
 {
+      const netranges_t*pdims = prefix_reg ? &prefix_reg->packed_dims() : 0;
       list<index_component_t>::const_iterator icur = indices.begin();
       for (size_t idx = 0 ; (idx+1) < indices.size() ; idx += 1, ++icur) {
 	    assert(icur != indices.end());
@@ -1582,9 +1584,18 @@ bool evaluate_index_prefix(Design*des, NetScope*scope,
 		  if (prefix_exprs) prefix_exprs->push_back(0);
 		  delete texpr;
 	    } else if (prefix_exprs != 0 && texpr != 0) {
-		    // Variable prefix index: keep the expression. Its constant
-		    // contribution is 0 (handled instead by make_prefix_var_offset).
-		  prefix_indices.push_back(0);
+		    // Variable prefix index: keep the expression. Its full
+		    // contribution (j - lsb)*stride is handled by
+		    // make_prefix_var_offset, so this position must add 0 to the
+		    // constant sb_to_idx offset. sb_to_idx computes
+		    // (placeholder - lsb)*stride here, so the placeholder must be
+		    // the dimension's lsb -- NOT 0, which for a non-zero-lsb packed
+		    // dim (e.g. logic [31:1][31:0]) injects a spurious -lsb*stride
+		    // that double-counts against make_prefix_var_offset.
+		  long ph = 0;
+		  if (pdims && idx < pdims->size())
+			ph = (*pdims)[idx].get_lsb();
+		  prefix_indices.push_back(ph);
 		  prefix_exprs->push_back(texpr);
 	    } else {
 		  cerr << icur->msb->get_fileline() << ": error: "
