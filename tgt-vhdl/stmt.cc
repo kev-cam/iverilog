@@ -919,6 +919,38 @@ static int draw_assign(vhdl_procedural *proc, stmt_container *container,
 
    make_assignment(proc, container, stmt, emulate_blocking, assign_type);
 
+   // $random(seed) advances its seed (passed by reference). The value assigned
+   // above is sv_random(seed) (emitted by translate_sfunc_random); re-apply it
+   // to the seed so the next call sees the advanced state. Emitted as a normal
+   // assignment, so it is `:=` for a variable seed and `<=` for a signal seed --
+   // no inout param needed, and it composes with any target lvalue.
+   if (get_sv2vhdl_mode() && ivl_stmt_lvals(stmt) == 1) {
+      ivl_expr_t rval = ivl_stmt_rval(stmt);
+      if (rval && ivl_expr_type(rval) == IVL_EX_SFUNC
+          && strcmp(ivl_expr_name(rval), "$random") == 0
+          && ivl_expr_parms(rval) >= 1
+          && ivl_expr_type(ivl_expr_parm(rval, 0)) == IVL_EX_SIGNAL) {
+         ivl_signal_t ssig = ivl_expr_signal(ivl_expr_parm(rval, 0));
+         string sname = get_renamed_signal(ssig);
+         vhdl_decl *sdecl = proc->get_scope()->get_decl(sname);
+         if (sdecl) {
+            const vhdl_type *st = sdecl->get_type();
+            vhdl_fcall *f = new vhdl_fcall("sv_random", new vhdl_type(*st));
+            f->add_expr(new vhdl_var_ref(sname.c_str(), new vhdl_type(*st)));
+            vhdl_var_ref *seed_lhs =
+               new vhdl_var_ref(sname.c_str(), new vhdl_type(*st));
+            // Mirror make_assignment: in an initial process, deposit (:=) into
+            // a signal rather than a non-blocking <=, so the advance is visible
+            // to the next read in the same process (and avoids a driver).
+            vhdl_decl::assign_type_t satype = sdecl->assignment_type();
+            if (proc->get_scope()->initializing()
+                && satype == vhdl_decl::ASSIGN_NONBLOCK)
+               satype = vhdl_decl::ASSIGN_BLOCK;
+            container->add_stmt(assign_for(satype, seed_lhs, f));
+         }
+      }
+   }
+
    return 0;
 }
 

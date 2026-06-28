@@ -711,8 +711,25 @@ vhdl_expr *translate_sfunc_simtime(ivl_expr_t)
    return result;
 }
 
-vhdl_expr *translate_sfunc_random(ivl_expr_t)
+vhdl_expr *translate_sfunc_random(ivl_expr_t e)
 {
+   // sv2vhdl mode: $random(seed) -> sv_random(seed), a deterministic seeded
+   // value. The seed update (seed = sv_random(seed)) is emitted by draw_assign,
+   // so this stays a plain function (VHDL functions can't have inout params)
+   // and composes with any lvalue and a signal- or variable-class seed.
+   // NB: $fopen also routes here (it reuses the stub-0 path), so gate on the
+   // name actually being $random before treating arg 0 as a seed.
+   if (get_sv2vhdl_mode() && strcmp(ivl_expr_name(e), "$random") == 0
+       && ivl_expr_parms(e) >= 1) {
+      vhdl_expr *seed = translate_expr(ivl_expr_parm(e, 0));
+      if (seed) {
+         const int w = ivl_expr_width(e);
+         vhdl_fcall *f = new vhdl_fcall("sv_random",
+                                        vhdl_type::logic3d_vector(w - 1, 0));
+         f->add_expr(seed);
+         return f;
+      }
+   }
    cerr << "warning: no translation for $random (returning 0)" << endl;
    vhdl_expr *result = new vhdl_const_int(0);
    result->set_comment("$random not supported, returned 0 instead!");
