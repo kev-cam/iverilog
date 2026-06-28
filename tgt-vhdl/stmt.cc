@@ -914,32 +914,6 @@ static int draw_assign(vhdl_procedural *proc, stmt_container *container,
       }
    }
 
-   // $random(seed) advances its seed (passed by reference). VHDL functions
-   // cannot have inout params, so translate_sfunc_random returns a constant 0
-   // and the seed never changes. For the common `x = $random(seed)` form, emit
-   // a procedure call sv_random(seed, x) instead (seed inout, result out).
-   if (get_sv2vhdl_mode() && ivl_stmt_lvals(stmt) == 1) {
-      ivl_expr_t rval = ivl_stmt_rval(stmt);
-      ivl_lval_t lv0  = ivl_stmt_lval(stmt, 0);
-      ivl_signal_t lsig = lv0 ? ivl_lval_sig(lv0) : 0;
-      if (rval && lsig && ivl_expr_type(rval) == IVL_EX_SFUNC
-          && strcmp(ivl_expr_name(rval), "$random") == 0
-          && ivl_expr_parms(rval) >= 1) {
-         vhdl_expr *seed = translate_expr(ivl_expr_parm(rval, 0));
-         if (seed) {
-            const unsigned w = ivl_signal_width(lsig);
-            string lname = get_renamed_signal(lsig);
-            vhdl_var_ref *lref = new vhdl_var_ref(
-               lname.c_str(), vhdl_type::logic3d_vector(w - 1, 0));
-            vhdl_pcall_stmt *p = new vhdl_pcall_stmt("sv_random");
-            p->add_expr(seed);
-            p->add_expr(lref);
-            container->add_stmt(p);
-            return 0;
-         }
-      }
-   }
-
    vhdl_decl::assign_type_t assign_type = vhdl_decl::ASSIGN_NONBLOCK;
    bool emulate_blocking = proc->get_scope()->allow_signal_assignment();
 
