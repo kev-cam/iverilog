@@ -179,7 +179,13 @@ void support_function::emit(std::ostream &of, int level) const
       emit_reduction(of, level, "xnor", '0');
       break;
    case SF_TERNARY_LOGIC:
-      of << "(T : Boolean; X, Y : std_logic) return std_logic is";
+      // sv2vhdl mode operates on logic3d; function_type() already returns
+      // logic3d here, so the definition's signature must match (mirrors
+      // SF_TERNARY_UNSIGNED below). emit_ternary() is type-agnostic.
+      if (get_sv2vhdl_mode())
+         of << "(T : Boolean; X, Y : logic3d) return logic3d is";
+      else
+         of << "(T : Boolean; X, Y : std_logic) return std_logic is";
       emit_ternary(of, level);
       break;
    case SF_TERNARY_SIGNED:
