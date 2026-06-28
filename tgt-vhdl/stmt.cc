@@ -162,6 +162,24 @@ static int draw_stask_display(vhdl_procedural *proc,
                                  base->get_type()->get_lsb()));
                            conv->add_expr(base);
                            base = conv;
+                        } else if (tn == VHDL_TYPE_LOGIC3D_VECTOR
+                                   && !base->constant()) {
+                           // sv2vhdl mode: a logic3d_vector formatted with %x/
+                           // %h/%b/%o must be reduced to its value bits, not
+                           // printed via logic3d_vector'image (a "(2,3,..)"
+                           // tuple). Convert logic3d_vector -> unsigned ->
+                           // std_logic_vector so sv_hstr/sv_bstr/sv_ostr apply
+                           // (mirrors the case-statement selector path).
+                           int w = base->get_type()->get_width();
+                           vhdl_fcall *u = new vhdl_fcall("l3d_to_unsigned",
+                                                          vhdl_type::nunsigned(w));
+                           u->add_expr(base);
+                           vhdl_fcall *conv = new vhdl_fcall("std_logic_vector",
+                              vhdl_type::std_logic_vector(
+                                 base->get_type()->get_msb(),
+                                 base->get_type()->get_lsb()));
+                           conv->add_expr(u);
+                           base = conv;
                         } else if (tn == VHDL_TYPE_STD_LOGIC_VECTOR
                                    && !base->constant()) {
                            // Already std_logic_vector: use directly
