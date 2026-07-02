@@ -669,6 +669,7 @@ NetNet* PEIdent::elaborate_lnet_common_(Design*des, NetScope*scope,
 	    // that.
 	    pform_name_t use_path = member_path;
 
+	    ivl_type_t final_member_type = 0;
 	    while (! use_path.empty()) {
 	          const name_component_t member_comp = use_path.front();
 	          const perm_string&member_name = member_comp.name;
@@ -687,6 +688,7 @@ NetNet* PEIdent::elaborate_lnet_common_(Design*des, NetScope*scope,
 
 		  member_off += tmp_off;
 		  member_width = member->net_type->packed_width();
+		  final_member_type = member->net_type;
 
 		  if (const netstruct_t*tmp_struct = dynamic_cast<const netstruct_t*> (member->net_type)) {
 		        struct_type = tmp_struct;
@@ -716,7 +718,22 @@ NetNet* PEIdent::elaborate_lnet_common_(Design*des, NetScope*scope,
 		  unsigned long tmp_wid;
 		  bool rc = calculate_part(this, des, scope, tail_sel, tmp_off, tmp_wid);
 		  ivl_assert(*this, rc);
-		  member_off += tmp_off;
+		  // calculate_part returns the raw index value from the source
+		  // (e.g. lsb=4 for a "[5:4]" part select). To turn that into an
+		  // offset into the packed member, we must subtract the member's
+		  // own declared LSB. Otherwise a member whose declared range has
+		  // a non-zero LSB (e.g. "logic [5:4] index" or "logic [31:1]
+		  // prett") is mis-placed by exactly that LSB. This mirrors the
+		  // normalization prefix_to_slice() does for the procedural
+		  // (elab_lval.cc) path.
+		  long member_lsb = 0;
+		  if (const netvector_t*mvec =
+			  dynamic_cast<const netvector_t*>(final_member_type)) {
+			const netranges_t&mdims = mvec->packed_dims();
+			if (! mdims.empty())
+			      member_lsb = mdims.back().get_lsb();
+		  }
+		  member_off += tmp_off - member_lsb;
 		  member_width = tmp_wid;
 	    }
 
