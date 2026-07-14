@@ -162,23 +162,30 @@ static int draw_stask_display(vhdl_procedural *proc,
                                  base->get_type()->get_lsb()));
                            conv->add_expr(base);
                            base = conv;
-                        } else if (tn == VHDL_TYPE_LOGIC3D_VECTOR
-                                   && !base->constant()) {
+                        } else if (tn == VHDL_TYPE_LOGIC3D_VECTOR) {
                            // sv2vhdl mode: a logic3d_vector formatted with %x/
-                           // %h/%b/%o must be reduced to its value bits, not
-                           // printed via logic3d_vector'image (a "(2,3,..)"
-                           // tuple). Convert logic3d_vector -> unsigned ->
-                           // std_logic_vector so sv_hstr/sv_bstr/sv_ostr apply
-                           // (mirrors the case-statement selector path).
-                           int w = base->get_type()->get_width();
-                           vhdl_fcall *u = new vhdl_fcall("l3d_to_unsigned",
-                                                          vhdl_type::nunsigned(w));
-                           u->add_expr(base);
-                           vhdl_fcall *conv = new vhdl_fcall("std_logic_vector",
+                           // %h/%b/%o must render each bit's 4-state char (x/z
+                           // preserved), not printed via logic3d_vector'image (a
+                           // "(2,3,..)" tuple). Convert logic3d_vector ->
+                           // std_logic_vector via to_std_logic_vector (per-bit
+                           // to_std_logic, certainty preserving) so sv_hstr/
+                           // sv_bstr/sv_ostr can emit 0/1/x/z. (Note:
+                           // l3d_to_unsigned would drop x/z to value bits.)
+                           vhdl_fcall *conv = new vhdl_fcall("to_std_logic_vector",
                               vhdl_type::std_logic_vector(
                                  base->get_type()->get_msb(),
                                  base->get_type()->get_lsb()));
-                           conv->add_expr(u);
+                           conv->add_expr(base);
+                           base = conv;
+                        } else if (tn == VHDL_TYPE_LOGIC3D) {
+                           // sv2vhdl mode: a scalar logic3d formatted with %x/
+                           // %h/%b/%o. Convert to a 1-element std_logic_vector
+                           // (via to_std_logic_vector) so sv_bstr/sv_hstr renders
+                           // one 4-state char, instead of emitting the raw
+                           // logic3d integer code via 'image (e.g. "3" for 1).
+                           vhdl_fcall *conv = new vhdl_fcall("to_std_logic_vector",
+                              vhdl_type::std_logic_vector(0, 0));
+                           conv->add_expr(base);
                            base = conv;
                         } else if (tn == VHDL_TYPE_STD_LOGIC_VECTOR
                                    && !base->constant()) {
@@ -235,7 +242,34 @@ static int draw_stask_display(vhdl_procedural *proc,
 
                      emit_wait_for_0(proc, container, stmt, base);
 
-                     text->add_expr(base->cast(text->get_type()));
+                     // sv2vhdl mode: %d of a logic3d value must print "x" if any
+                     // bit is unknown (Verilog %d convention), not the raw
+                     // logic3d aggregate "(2,3,..)". Route through sv_dstr on the
+                     // 4-state std_logic_vector. Only for 'd'/'D' — %s/%c/etc.
+                     // keep their normal handling.
+                     bool l3d_dec = false;
+                     if ((*p == 'd' || *p == 'D') && base->get_type()) {
+                        vhdl_type_name_t tn = base->get_type()->get_name();
+                        if (tn == VHDL_TYPE_LOGIC3D_VECTOR
+                            || tn == VHDL_TYPE_LOGIC3D) {
+                           int hi = 0, lo = 0;
+                           if (tn == VHDL_TYPE_LOGIC3D_VECTOR) {
+                              hi = base->get_type()->get_msb();
+                              lo = base->get_type()->get_lsb();
+                           }
+                           vhdl_fcall *conv = new vhdl_fcall(
+                              "to_std_logic_vector",
+                              vhdl_type::std_logic_vector(hi, lo));
+                           conv->add_expr(base);
+                           vhdl_fcall *f = new vhdl_fcall("sv_dstr",
+                                                          vhdl_type::string());
+                           f->add_expr(conv);
+                           text->add_expr(f);
+                           l3d_dec = true;
+                        }
+                     }
+                     if (!l3d_dec)
+                        text->add_expr(base->cast(text->get_type()));
                   }
                }
             }
