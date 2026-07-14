@@ -300,6 +300,29 @@ static int draw_stask_display(vhdl_procedural *proc,
                            l3d_dec = true;
                         }
                      }
+                     // sv2vhdl mode: %s of a logic3d value renders the packed
+                     // 8-bit ASCII (Verilog %s), not the raw aggregate image.
+                     if (!l3d_dec && (*p == 's' || *p == 'S')
+                         && base->get_type()) {
+                        vhdl_type_name_t tn = base->get_type()->get_name();
+                        if (tn == VHDL_TYPE_LOGIC3D_VECTOR
+                            || tn == VHDL_TYPE_LOGIC3D) {
+                           int hi = 0, lo = 0;
+                           if (tn == VHDL_TYPE_LOGIC3D_VECTOR) {
+                              hi = base->get_type()->get_msb();
+                              lo = base->get_type()->get_lsb();
+                           }
+                           vhdl_fcall *conv = new vhdl_fcall(
+                              "to_std_logic_vector",
+                              vhdl_type::std_logic_vector(hi, lo));
+                           conv->add_expr(base);
+                           vhdl_fcall *f = new vhdl_fcall("sv_sstr",
+                                                          vhdl_type::string());
+                           f->add_expr(conv);
+                           text->add_expr(f);
+                           l3d_dec = true;
+                        }
+                     }
                      if (!l3d_dec)
                         text->add_expr(base->cast(text->get_type()));
                   }
