@@ -294,6 +294,13 @@ int active_time_units()
    return g_scope_data[g_active_scope].time_units;
 }
 
+int active_time_precision()
+{
+   if (g_active_scope == NULL)
+      return 0;
+   return g_scope_data[g_active_scope].time_precision;
+}
+
 std::string active_hier_name()
 {
    if (g_active_scope == NULL)

@@ -57,6 +57,8 @@ ivl_scope_t get_active_scope();
 // Time units of the active scope as a signed power of 10 (e.g. -9 = 1 ns),
 // per ivl_scope_time_units; 0 if no active scope.
 int active_time_units();
+// Time precision of the active scope as a signed power of 10; 0 if none.
+int active_time_precision();
 // Verilog hierarchical name of the active scope (ivl_scope_name); "" if none.
 std::string active_hier_name();
 

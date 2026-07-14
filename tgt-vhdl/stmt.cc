@@ -136,6 +136,25 @@ static int draw_stask_display(vhdl_procedural *proc,
                   // $display, from the scope-keyed store (set in draw_process).
                   text->add_expr(new vhdl_const_string(active_hier_name()));
                   break;
+               case 't': case 'T':
+                  {
+                     // %t: format a time value per the current $timeformat.
+                     assert(i < count);
+                     ivl_expr_t netp = ivl_stmt_parm(stmt, i++);
+                     assert(netp);
+                     vhdl_expr *base = translate_expr(netp);
+                     if (NULL == base)
+                        return 1;
+                     emit_wait_for_0(proc, container, stmt, base);
+                     vhdl_type itype(VHDL_TYPE_INTEGER);
+                     vhdl_fcall *f = new vhdl_fcall("sv_tstr",
+                                                    vhdl_type::string());
+                     f->add_expr(base->cast(&itype));
+                     f->add_expr(new vhdl_const_int(active_time_units()));
+                     f->add_expr(new vhdl_const_int(active_time_precision()));
+                     text->add_expr(f);
+                  }
+                  break;
                case 'h': case 'H': case 'x': case 'X':
                case 'b': case 'B':
                case 'o': case 'O':
@@ -600,6 +619,26 @@ static int draw_stask(vhdl_procedural *proc, stmt_container *container,
    else if (strncmp(name, "$ivl_queue_method$", 18) == 0
             || strncmp(name, "$ivl_darray_method$", 19) == 0)
       return draw_queue_method(proc, container, stmt);
+   else if (strcmp(name, "$timeformat") == 0) {
+      // $timeformat(units, precision, suffix, min_width) -> set the global %t
+      // format via sv_set_timeformat. Args are constant in practice.
+      vhdl_pcall_stmt *pc = new vhdl_pcall_stmt("sv_set_timeformat");
+      vhdl_type itype(VHDL_TYPE_INTEGER);
+      for (int a = 0; a < 4; a++) {
+         ivl_expr_t pe = ivl_stmt_parm(stmt, a);
+         vhdl_expr *ve = pe ? translate_expr(pe) : NULL;
+         if (ve == NULL) {   // fall back to a harmless default
+            pc->add_expr(a == 2 ? (vhdl_expr*)new vhdl_const_string("")
+                                : (vhdl_expr*)new vhdl_const_int(0));
+         } else if (a == 2) {
+            pc->add_expr(ve);                 // suffix string
+         } else {
+            pc->add_expr(ve->cast(&itype));   // units/precision/min_width
+         }
+      }
+      container->add_stmt(pc);
+      return 0;
+   }
    else {
       vhdl_seq_stmt *result = new vhdl_null_stmt();
       ostringstream ss;
