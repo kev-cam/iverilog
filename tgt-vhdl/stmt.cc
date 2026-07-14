@@ -237,8 +237,10 @@ static int draw_stask_display(vhdl_procedural *proc,
                      vhdl_fcall *f = new vhdl_fcall(func,
                                                     vhdl_type::string());
                      f->add_expr(base);
-                     if (ld_zero) {
-                        // %0b/%0h/%0o: suppress leading zeros (min width).
+                     if (ld_zero && fw_spec < 0) {
+                        // %0b/%0h/%0o (no explicit width): suppress leading
+                        // zeros (minimum width). %0Nh is zero-PAD to width N,
+                        // not a strip, so it must keep the full rendering.
                         vhdl_fcall *strip = new vhdl_fcall("sv_strip0",
                                                            vhdl_type::string());
                         strip->add_expr(f);
