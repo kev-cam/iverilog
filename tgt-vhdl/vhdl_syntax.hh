@@ -700,11 +700,21 @@ public:
    // Modify this declaration so it can be read from
    // This does nothing for most declaration types
    virtual void ensure_readable() {}
+
+   // Emit this declaration with a resolved logic3d subtype: an inout port or a
+   // multiply-driven/bidirectional net needs resolution for its drivers (incl.
+   // an external one via a port) to combine, rather than reading its own value.
+   void set_resolved(bool r) { resolved_ = r; }
+   bool is_resolved() const { return resolved_; }
 protected:
+   // Emit the (possibly resolved) type name for this declaration.
+   void emit_type_name(std::ostream &of, int level) const;
+
    std::string name_;
    const vhdl_type *type_;
    vhdl_expr *initial_;
    bool has_initial_;
+   bool resolved_ = false;
 };
 
 typedef std::list<vhdl_decl*> decl_list_t;
@@ -787,19 +797,15 @@ class vhdl_port_decl : public vhdl_decl {
 public:
    vhdl_port_decl(const char *name, const vhdl_type *type,
                   vhdl_port_mode_t mode)
-      : vhdl_decl(name, type), resolved_(false), mode_(mode) {}
+      : vhdl_decl(name, type), mode_(mode) {}
 
    void emit(std::ostream &of, int level) const;
    vhdl_port_mode_t get_mode() const { return mode_; }
    void set_mode(vhdl_port_mode_t m) { mode_ = m; }
-   // Emit a resolved logic3d subtype (for an inout port that nvc's all-ports-
-   // are-inout treatment gives both an internal and external driver).
-   void set_resolved(bool r) { resolved_ = r; }
    assign_type_t assignment_type() const { return ASSIGN_NONBLOCK; }
    void ensure_readable();
    bool is_readable() const;
 private:
-   bool resolved_;
    vhdl_port_mode_t mode_;
 };
 

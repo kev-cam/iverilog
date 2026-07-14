@@ -672,6 +672,44 @@ static bool inout_driven_internally(ivl_signal_t sig)
    return false;                         // read-only inside this module
 }
 
+// A net needs a resolved logic3d subtype when several sources can drive it, so
+// their contributions combine (rather than nvc erroring or one silently
+// winning): two or more drivers, a switch/tran endpoint, or a share with an
+// inout port. This is the bidirectional/mixed-signal model -- direction is
+// advisory; the net itself is a resolved meeting point.
+static bool net_needs_resolution(ivl_signal_t sig)
+{
+   if (!get_sv2vhdl_mode())
+      return false;
+   ivl_nexus_t nex = ivl_signal_nex(sig, 0);
+   if (nex == NULL)
+      return false;
+   int nptrs = ivl_nexus_ptrs(nex);
+   int drivers = 0;
+   for (int i = 0; i < nptrs; i++) {
+      ivl_nexus_ptr_t ptr = ivl_nexus_ptr(nex, i);
+      ivl_net_logic_t log = ivl_nexus_ptr_log(ptr);
+      if (log && ivl_logic_pin(log, 0) == nex)
+         drivers++;
+      ivl_lpm_t lpm = ivl_nexus_ptr_lpm(ptr);
+      if (lpm && ivl_lpm_q(lpm) == nex)
+         drivers++;
+      if (ivl_nexus_ptr_con(ptr))
+         drivers++;
+      if (ivl_nexus_ptr_switch(ptr))
+         return true;                    // a tran/relay endpoint
+      ivl_signal_t s2 = ivl_nexus_ptr_sig(ptr);
+      if (s2 && s2 != sig) {
+         ivl_signal_port_t pt = ivl_signal_port(s2);
+         if (pt == IVL_SIP_INOUT)
+            return true;                 // shares the net with an inout port
+         if (pt == IVL_SIP_OUTPUT)
+            drivers++;
+      }
+   }
+   return drivers >= 2;
+}
+
 static void declare_one_signal(vhdl_entity *ent, ivl_signal_t sig,
    ivl_scope_t scope)
 {
@@ -759,6 +797,12 @@ static void declare_one_signal(vhdl_entity *ent, ivl_signal_t sig,
    case IVL_SIP_NONE:
       {
          vhdl_decl *decl = new vhdl_signal_decl(name, sig_type);
+
+         // A multiply-driven / bidirectional net uses the resolved logic3d
+         // subtype so its drivers (and any external one via an inout port)
+         // combine through l3d_resolve.
+         if (net_needs_resolution(sig))
+            decl->set_resolved(true);
 
          ostringstream ss;
          if (ivl_signal_local(sig)) {

@@ -603,9 +603,14 @@ void vhdl_port_decl::emit(std::ostream &of, int level) const
       break;
    }
 
-   // A resolved inout port: emit the resolved logic3d subtype so nvc's
-   // internal + external drivers resolve (an unresolved port would just read
-   // its own default). Keep the constraint for the vector case.
+   emit_type_name(of, level);
+}
+
+// Emit the type name for a declaration, substituting the resolved logic3d
+// subtype when this declaration was marked resolved (inout port or a
+// multiply-driven / bidirectional net).
+void vhdl_decl::emit_type_name(std::ostream &of, int level) const
+{
    if (resolved_ && type_ != NULL
        && type_->get_name() == VHDL_TYPE_LOGIC3D) {
       of << "resolved_logic3d";
@@ -652,7 +657,7 @@ void vhdl_var_decl::emit(std::ostream &of, int level) const
 void vhdl_signal_decl::emit(std::ostream &of, int level) const
 {
    of << "signal " << name_ << " : ";
-   type_->emit(of, level);
+   emit_type_name(of, level);
 
    if (initial_) {
       of << " := ";
