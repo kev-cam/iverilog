@@ -1504,7 +1504,11 @@ void vhdl_with_select_stmt::emit(std::ostream &of, int level) const
 {
    of << "with ";
    test_->emit(of, level);
-   of << " select";
+   // `select?' (VHDL-2008 matching select) makes '-' in the choices a
+   // wildcard, which is how UDP truth-table don't-cares must match. Plain
+   // `select' does exact matching, so '-' rows never match real 0/1 inputs
+   // and everything falls through to `when others'.
+   of << (matching_ ? " select?" : " select");
    emit_comment(of, level, true);
    newline(of, indent(level));
 

@@ -215,8 +215,12 @@ static void comb_udp_logic(vhdl_arch *arch, ivl_net_logic_t log)
    // by reading values out of the table
    ivl_nexus_t output_nex = ivl_logic_pin(log, 0);
    vhdl_var_ref *out = nexus_to_var_ref(arch->get_scope(), output_nex);
+   // In sv2vhdl mode emit a VHDL-2008 matching `select?' so UDP don't-care
+   // rows ('-') act as wildcards. (Plain exact `select' is kept for the
+   // generic -tvhdl target, which may target pre-2008 VHDL.)
    vhdl_with_select_stmt *ws =
-      new vhdl_with_select_stmt(new vhdl_var_ref(*tmp_ref), out);
+      new vhdl_with_select_stmt(new vhdl_var_ref(*tmp_ref), out,
+                                get_sv2vhdl_mode());
 
    // Ensure the select statement completely covers the input space
    // or some strict VHDL compilers will complain
@@ -227,13 +231,23 @@ static void comb_udp_logic(vhdl_arch *arch, ivl_net_logic_t log)
       const char *row = ivl_udp_row(udp, i);
 
       vhdl_expr *value = new vhdl_const_bit(row[nin]);
+      // The selector `<tmp>_Tmp' concatenates the inputs as pin1 & pin2 & ..
+      // (pin1 = MSB).  ivl_udp_row lists the input columns in the same pin
+      // order, but std_logic_vector_bits() places column 0 at the LSB, which
+      // reverses the row relative to the selector.  Reverse the input columns
+      // so the choice bit order matches the selector.  (Harmless before the
+      // matching `select?' change because every real input fell through to
+      // `when others'; now that '-' rows actually match, the order matters.)
+      std::string rrow(nin, '0');
+      for (int b = 0; b < nin; b++)
+         rrow[b] = row[nin - 1 - b];
       // The UDP `<tmp>_Tmp` selector is std_logic_vector even in sv2vhdl
       // mode (VHDL's `with..select` requires a discrete or character-array
       // selector and logic3d_vector is an integer-subtype array), so force
       // the case condition aggregate to std_logic_vector too.  Without this
       // override vhdl_const_bits defaults to logic3d_vector under sv2vhdl
       // and the case-when types mismatch.
-      vhdl_expr *cond = vhdl_const_bits::std_logic_vector_bits(row, nin);
+      vhdl_expr *cond = vhdl_const_bits::std_logic_vector_bits(rrow.c_str(), nin);
 
       ivl_expr_t delay_ex = ivl_logic_delay(log, 1);
       vhdl_expr *delay = NULL;

@@ -357,8 +357,8 @@ private:
 
 class vhdl_with_select_stmt : public vhdl_conc_stmt {
 public:
-   vhdl_with_select_stmt(vhdl_expr *test, vhdl_var_ref *out)
-      : test_(test), out_(out), others_(NULL) {}
+   vhdl_with_select_stmt(vhdl_expr *test, vhdl_var_ref *out, bool matching=false)
+      : test_(test), out_(out), others_(NULL), matching_(matching) {}
    ~vhdl_with_select_stmt();
 
    void emit(std::ostream &of, int level) const;
@@ -369,6 +369,7 @@ private:
    vhdl_var_ref *out_;
    when_list_t whens_;
    vhdl_expr* others_;
+   bool matching_;   // emit `select?` (VHDL-2008 matching) so '-' is a wildcard
 };
 
 
