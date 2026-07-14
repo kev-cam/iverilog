@@ -237,7 +237,14 @@ static int draw_stask_display(vhdl_procedural *proc,
                      vhdl_fcall *f = new vhdl_fcall(func,
                                                     vhdl_type::string());
                      f->add_expr(base);
-                     text->add_expr(f);
+                     if (ld_zero) {
+                        // %0b/%0h/%0o: suppress leading zeros (min width).
+                        vhdl_fcall *strip = new vhdl_fcall("sv_strip0",
+                                                           vhdl_type::string());
+                        strip->add_expr(f);
+                        text->add_expr(strip);
+                     } else
+                        text->add_expr(f);
                   }
                   break;
                default:
