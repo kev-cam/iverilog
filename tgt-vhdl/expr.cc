@@ -269,9 +269,20 @@ static vhdl_expr *translate_logical(vhdl_expr *lhs, vhdl_expr *rhs,
 static vhdl_expr *translate_shift(vhdl_expr *lhs, vhdl_expr *rhs,
                                   vhdl_binop_t op)
 {
-   // The RHS must be an integer
+   // The RHS (shift count) must be an integer. For a logic3d_vector count use
+   // l3d_shcount, which saturates on overflow instead of dropping the high bits
+   // like to_integer -- so a count wider than 32 bits (e.g. 2**64) correctly
+   // clears/sign-fills the operand rather than reading as 0 (shift by nothing).
    vhdl_type integer(VHDL_TYPE_INTEGER);
-   vhdl_expr *r_cast = rhs->cast(&integer);
+   vhdl_expr *r_cast;
+   if (rhs->get_type()
+       && rhs->get_type()->get_name() == VHDL_TYPE_LOGIC3D_VECTOR) {
+      vhdl_fcall *sc = new vhdl_fcall("l3d_shcount", vhdl_type::integer());
+      sc->add_expr(rhs);
+      r_cast = sc;
+   }
+   else
+      r_cast = rhs->cast(&integer);
 
    const vhdl_type *rtype = new vhdl_type(*lhs->get_type());
 
