@@ -82,8 +82,6 @@ static vhdl_expr *binop_lpm_to_expr(vhdl_scope *scope, ivl_lpm_t lpm, vhdl_binop
 
 static vhdl_expr *rel_lpm_to_expr(vhdl_scope *scope, ivl_lpm_t lpm, vhdl_binop_t op)
 {
-   vhdl_binop_expr *expr = new vhdl_binop_expr(op, vhdl_type::boolean());
-
    vhdl_expr *lhs = readable_ref(scope, ivl_lpm_data(lpm, 0));
    if (NULL == lhs)
       return NULL;
@@ -93,6 +91,23 @@ static vhdl_expr *rel_lpm_to_expr(vhdl_scope *scope, ivl_lpm_t lpm, vhdl_binop_t
       delete lhs;
       return NULL;
    }
+
+   // sv2vhdl: the logic3d_vector relational operators are unsigned. A signed
+   // comparator (both operands signed) must honour the sign bit, so route
+   // GT/GE to the signed helpers (numeric_std sign-extends the shorter side).
+   // ivl represents < and <= as GT/GE with swapped operands, so GT/GE cover all.
+   if (get_sv2vhdl_mode() && ivl_lpm_signed(lpm)
+       && lhs->get_type()
+       && lhs->get_type()->get_name() == VHDL_TYPE_LOGIC3D_VECTOR
+       && (op == VHDL_BINOP_GT || op == VHDL_BINOP_GEQ)) {
+      vhdl_fcall *f = new vhdl_fcall(
+         op == VHDL_BINOP_GT ? "l3d_gt_s" : "l3d_ge_s", vhdl_type::boolean());
+      f->add_expr(lhs);
+      f->add_expr(rhs);
+      return f;
+   }
+
+   vhdl_binop_expr *expr = new vhdl_binop_expr(op, vhdl_type::boolean());
 
    // Ensure LHS and RHS are the same type
    if (lhs->get_type() != rhs->get_type())
@@ -184,10 +199,22 @@ static vhdl_expr *reduction_lpm_to_expr(vhdl_scope *scope, ivl_lpm_t lpm,
 static vhdl_expr *sign_extend_lpm_to_expr(vhdl_scope *scope, ivl_lpm_t lpm)
 {
    vhdl_expr *ref = readable_ref(scope, ivl_lpm_data(lpm, 0));
-   if (ref)
-      return ref->resize(ivl_lpm_width(lpm));
-   else
+   if (!ref)
       return NULL;
+
+   // sv2vhdl: a SIGN_EXT node must fill the new high bits with the sign bit,
+   // but the logic3d_vector resize() zero-fills. Use the sign-extending helper
+   // (this node is unconditionally a sign extension, so this is always right).
+   if (get_sv2vhdl_mode() && ref->get_type()
+       && ref->get_type()->get_name() == VHDL_TYPE_LOGIC3D_VECTOR) {
+      vhdl_fcall *f = new vhdl_fcall("l3d_resize_s",
+         vhdl_type::logic3d_vector(ivl_lpm_width(lpm) - 1, 0));
+      f->add_expr(ref);
+      f->add_expr(new vhdl_const_int(ivl_lpm_width(lpm)));
+      return f;
+   }
+
+   return ref->resize(ivl_lpm_width(lpm));
 }
 
 static vhdl_expr *array_lpm_to_expr(vhdl_scope *scope, ivl_lpm_t lpm)

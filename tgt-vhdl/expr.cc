@@ -376,6 +376,36 @@ static vhdl_expr *translate_binary(ivl_expr_t e)
       rhs = correct_signedness(rhs, ivl_expr_oper2(e));
    }
 
+   // sv2vhdl: logic3d_vector relational/div/mod operators are unsigned-only.
+   // A Verilog signed context (BOTH operands signed) needs the sign bit
+   // honoured, so route to the dedicated signed helpers. numeric_std's signed
+   // compare/div sign-extends the shorter operand, so no pre-resize is needed.
+   if (get_sv2vhdl_mode()
+       && ivl_expr_signed(ivl_expr_oper1(e))
+       && ivl_expr_signed(ivl_expr_oper2(e))
+       && lhs->get_type()
+       && lhs->get_type()->get_name() == VHDL_TYPE_LOGIC3D_VECTOR) {
+      const char *cf = 0, *vf = 0;
+      switch (ivl_expr_opcode(e)) {
+      case '<': cf = "l3d_lt_s"; break;
+      case '>': cf = "l3d_gt_s"; break;
+      case 'L': cf = "l3d_le_s"; break;
+      case 'G': cf = "l3d_ge_s"; break;
+      case '/': vf = "l3d_div_s"; break;
+      case '%': vf = "l3d_mod_s"; break;
+      }
+      if (cf) {
+         vhdl_fcall *f = new vhdl_fcall(cf, vhdl_type::boolean());
+         f->add_expr(lhs); f->add_expr(rhs);
+         return f;
+      }
+      if (vf) {
+         vhdl_fcall *f = new vhdl_fcall(vf, new vhdl_type(*lhs->get_type()));
+         f->add_expr(lhs); f->add_expr(rhs);
+         return f;
+      }
+   }
+
    vhdl_expr *result;
    switch (ivl_expr_opcode(e)) {
    case '+':
