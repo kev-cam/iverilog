@@ -534,6 +534,12 @@ extern "C" int draw_process(ivl_process_t proc, void *)
              ivl_scope_tname(scope), ivl_process_file(proc),
              ivl_process_lineno(proc));
 
+   // Record the process's own scope (before skipping up to the module) for
+   // per-scope facts: %m wants the exact scope's hierarchical name (which may
+   // be a generate/begin block, e.g. "main.genblk1"), while $time only needs
+   // the timescale, which such scopes inherit from the module. See state.cc.
+   set_active_scope(scope);
+
    // Skip over any generate and begin scopes until we find
    // the module that contains them - this is where we will
    // generate the process

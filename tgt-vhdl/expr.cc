@@ -23,6 +23,7 @@
 #include "state.hh"
 
 #include <iostream>
+#include <sstream>
 #include <cassert>
 #include <cstring>
 
@@ -740,20 +741,38 @@ static vhdl_expr *translate_concat(ivl_expr_t e)
    return concat;
 }
 
+// A VHDL physical-time literal for 10^`units` seconds (ivl_scope_time_units
+// is a signed power of 10: -9 = 1 ns, -8 = 10 ns, -6 = 1 us, ...).
+static std::string time_unit_literal(int units)
+{
+   static const struct { int exp; const char *name; } bases[] = {
+      {0, "sec"}, {-3, "ms"}, {-6, "us"}, {-9, "ns"}, {-12, "ps"}, {-15, "fs"} };
+   for (unsigned i = 0; i < sizeof(bases)/sizeof(bases[0]); i++) {
+      if (units >= bases[i].exp) {
+         long mult = 1;
+         for (int k = 0; k < units - bases[i].exp; k++) mult *= 10;
+         ostringstream ss;
+         ss << mult << " " << bases[i].name;
+         return ss.str();
+      }
+   }
+   return "1 fs";
+}
+
+// $time / $stime: the current simulation time scaled to the calling scope's
+// time units. VHDL `now` is in the simulation's base precision, so dividing by
+// the scope's unit literal yields the Verilog time count. The scope's units
+// come from the scope-keyed store (set_active_scope in draw_process).
 vhdl_expr *translate_sfunc_time(ivl_expr_t)
 {
-   cerr << "warning: no translation for $time (returning 0)" << endl;
-   vhdl_expr *result = new vhdl_const_int(0);
-   result->set_comment("$time not supported, returned 0 instead!");
-   return result;
+   string e = "(now / (" + time_unit_literal(active_time_units()) + "))";
+   return new vhdl_var_ref(e.c_str(), vhdl_type::integer());
 }
 
 vhdl_expr *translate_sfunc_stime(ivl_expr_t)
 {
-   cerr << "warning: no translation for $stime (returning 0)" << endl;
-   vhdl_expr *result = new vhdl_const_int(0);
-   result->set_comment("$stime not supported, returned 0 instead!");
-   return result;
+   string e = "(now / (" + time_unit_literal(active_time_units()) + "))";
+   return new vhdl_var_ref(e.c_str(), vhdl_type::integer());
 }
 
 vhdl_expr *translate_sfunc_simtime(ivl_expr_t)

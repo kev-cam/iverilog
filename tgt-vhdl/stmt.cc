@@ -132,9 +132,9 @@ static int draw_stask_display(vhdl_procedural *proc,
 
                switch (*p) {
                case 'm':
-                  // TODO: we can get the module name via attributes
-                  cerr << "Warning: no VHDL translation for %m format code"
-                       << endl;
+                  // %m = the hierarchical name of the scope containing this
+                  // $display, from the scope-keyed store (set in draw_process).
+                  text->add_expr(new vhdl_const_string(active_hier_name()));
                   break;
                case 'h': case 'H': case 'x': case 'X':
                case 'b': case 'B':

@@ -261,6 +261,46 @@ void set_active_entity(vhdl_entity *ent)
    g_active_entity = ent;
 }
 
+// ---- Scope-keyed store of per-scope facts (timescale, hierarchical name) ----
+struct scope_data_t {
+   int         time_units;      // signed power of 10 (ivl_scope_time_units)
+   int         time_precision;
+   std::string hier_name;       // ivl_scope_name (Verilog hierarchical path)
+};
+static std::map<ivl_scope_t, scope_data_t> g_scope_data;
+static ivl_scope_t g_active_scope = NULL;
+
+void set_active_scope(ivl_scope_t scope)
+{
+   g_active_scope = scope;
+   if (scope != NULL && g_scope_data.find(scope) == g_scope_data.end()) {
+      scope_data_t d;
+      d.time_units     = ivl_scope_time_units(scope);
+      d.time_precision = ivl_scope_time_precision(scope);
+      d.hier_name      = ivl_scope_name(scope);
+      g_scope_data[scope] = d;
+   }
+}
+
+ivl_scope_t get_active_scope()
+{
+   return g_active_scope;
+}
+
+int active_time_units()
+{
+   if (g_active_scope == NULL)
+      return 0;
+   return g_scope_data[g_active_scope].time_units;
+}
+
+std::string active_hier_name()
+{
+   if (g_active_scope == NULL)
+      return "";
+   return g_scope_data[g_active_scope].hier_name;
+}
+
 void set_sv2vhdl_mode(bool mode)
 {
    g_sv2vhdl_mode = mode;

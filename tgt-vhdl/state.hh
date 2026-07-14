@@ -48,6 +48,18 @@ void free_all_vhdl_objects();
 vhdl_entity *get_active_entity();
 void set_active_entity(vhdl_entity *ent);
 
+// Scope-keyed store of per-scope facts (timescale, hierarchical name) so that
+// deeply-nested translation (e.g. $time, %m) can look up the scope it is in
+// without threading the ivl_scope through every call. set_active_scope() both
+// records the scope's data and marks it current.
+void set_active_scope(ivl_scope_t scope);
+ivl_scope_t get_active_scope();
+// Time units of the active scope as a signed power of 10 (e.g. -9 = 1 ns),
+// per ivl_scope_time_units; 0 if no active scope.
+int active_time_units();
+// Verilog hierarchical name of the active scope (ivl_scope_name); "" if none.
+std::string active_hier_name();
+
 // Manage mapping of scopes to a single VHDL entity
 bool is_default_scope_instance(ivl_scope_t s);
 bool seen_this_scope_type(ivl_scope_t s);
