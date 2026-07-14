@@ -264,51 +264,89 @@ static void comb_udp_logic(vhdl_arch *arch, ivl_net_logic_t log)
    arch->add_stmt(ws);
 }
 
+// Wrap `e` in `to_std_logic(e)` (logic3d -> std_logic).
+static vhdl_expr *to_sl(vhdl_expr *e)
+{
+   vhdl_fcall *f = new vhdl_fcall("to_std_logic", vhdl_type::std_logic());
+   f->add_expr(e);
+   return f;
+}
+
 static void seq_udp_logic(vhdl_arch *arch, ivl_net_logic_t log)
 {
    ivl_udp_t udp = ivl_logic_udp(log);
-
-   // These will be translated to a process with a single
-   // case statement
+   int nin = ivl_udp_nin(udp);
 
    vhdl_process *proc = new vhdl_process(ivl_logic_basename(log));
-
    ostringstream ss;
-   ss << "Generated from UDP " << ivl_udp_name(udp);
+   ss << "Generated from sequential UDP " << ivl_udp_name(udp);
    proc->set_comment(ss.str());
 
-   // Create a variable to hold the concatenation of the inputs
-   int msb = ivl_udp_nin(udp) - 1;
-   const vhdl_type *tmp_type = vhdl_type::std_logic_vector(msb, 0);
-   proc->get_scope()->add_decl(new vhdl_var_decl("UDP_Inputs", tmp_type));
-
-   // Concatenate the inputs into a single expression that can be
-   // used as the test in a case statement (this can't be inserted
-   // directly into the case statement due to the requirement that
-   // the test expression be "locally static")
-   int nin = ivl_udp_nin(udp);
-   vhdl_expr *tmp_rhs = NULL;
-   if (nin == 1) {
-      vhdl_var_ref *ref =
-         nexus_to_var_ref(arch->get_scope(), ivl_logic_pin(log, 1));
-      tmp_rhs = ref->cast(tmp_type);
-      proc->add_sensitivity(ref->get_name());
-   }
-   else {
-      vhdl_binop_expr *concat = new vhdl_binop_expr(VHDL_BINOP_CONCAT, NULL);
-
-      for (int i = 1; i < nin; i++) {
-         vhdl_var_ref *ref =
-            nexus_to_var_ref(arch->get_scope(), ivl_logic_pin(log, i));
-         concat->add_expr(ref);
-         proc->add_sensitivity(ref->get_name());
+   // Build the current-inputs and previous-inputs (each input's 'last_value,
+   // so the input that just changed carries the edge) vectors, in pin order
+   // in1 & in2 & .. so element k is input pin k+1 (matching ivl_udp_row).
+   vhdl_binop_expr *cur  = new vhdl_binop_expr(VHDL_BINOP_CONCAT, NULL);
+   vhdl_binop_expr *prev = new vhdl_binop_expr(VHDL_BINOP_CONCAT, NULL);
+   for (int i = 1; i <= nin; i++) {
+      ivl_nexus_t pin = ivl_logic_pin(log, i);
+      vhdl_expr *cur_e, *prev_e;
+      if (pin == NULL) {
+         // Unconnected input (e.g. an absent timing-check notifier): it never
+         // transitions, so a constant 0 for both current and previous makes
+         // its '*' (any-edge) rows never fire and its '?' rows always match.
+         // Route through to_std_logic so it is std_logic (matches the concat),
+         // not the logic3d L3D_0 that a bare const_bit emits in sv2vhdl mode.
+         cur_e  = to_sl(new vhdl_const_bit('0'));
+         prev_e = to_sl(new vhdl_const_bit('0'));
       }
-
-      tmp_rhs = concat;
+      else {
+         vhdl_var_ref *ref = nexus_to_var_ref(arch->get_scope(), pin);
+         proc->add_sensitivity(ref->get_name());
+         // previous value via the VHDL 'last_value attribute of the signal
+         string lv = ref->get_name();
+         lv += "'last_value";
+         cur_e  = to_sl(ref);
+         prev_e = to_sl(new vhdl_var_ref(lv.c_str(), NULL));
+      }
+      // Wrap the first element so the concatenation is a std_logic_vector even
+      // when the primitive has a single input (a lone `&` operand is scalar).
+      if (i == 1) {
+         vhdl_fcall *cw = new vhdl_fcall("sl1", vhdl_type::std_logic_vector(0, 0));
+         cw->add_expr(cur_e);   cur_e = cw;
+         vhdl_fcall *pw = new vhdl_fcall("sl1", vhdl_type::std_logic_vector(0, 0));
+         pw->add_expr(prev_e);  prev_e = pw;
+      }
+      cur->add_expr(cur_e);
+      prev->add_expr(prev_e);
    }
 
-   proc->get_container()->add_stmt
-      (new vhdl_assign_stmt(new vhdl_var_ref("UDP_Inputs", NULL), tmp_rhs));
+   // Concatenate the whole truth table into one string constant. Each row is
+   // (nin+2) chars: [current-state][in1..inN][next-state].
+   string table;
+   int nrows = ivl_udp_rows(udp);
+   for (int i = 0; i < nrows; i++)
+      table += ivl_udp_row(udp, i);
+
+   // out <= to_logic3d(sv_udp_seq(<table>, nin, to_std_logic(out), prev, cur));
+   if (ivl_logic_pin(log, 0) == NULL) {   // no output net: nothing to drive
+      delete cur; delete prev; delete proc;
+      return;
+   }
+   vhdl_var_ref *out_read = nexus_to_var_ref(arch->get_scope(),
+                                             ivl_logic_pin(log, 0));
+   vhdl_fcall *eval = new vhdl_fcall("sv_udp_seq", vhdl_type::std_logic());
+   eval->add_expr(new vhdl_const_string(table));
+   eval->add_expr(new vhdl_const_int(nin));
+   eval->add_expr(to_sl(out_read));
+   eval->add_expr(prev);
+   eval->add_expr(cur);
+
+   vhdl_fcall *to_l3d = new vhdl_fcall("to_logic3d", vhdl_type::logic3d());
+   to_l3d->add_expr(eval);
+
+   vhdl_var_ref *out_drive = nexus_to_var_ref(arch->get_scope(),
+                                              ivl_logic_pin(log, 0));
+   proc->get_container()->add_stmt(new vhdl_nbassign_stmt(out_drive, to_l3d));
 
    arch->add_stmt(proc);
 }
