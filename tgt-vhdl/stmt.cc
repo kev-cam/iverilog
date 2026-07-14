@@ -290,8 +290,10 @@ static int draw_stask_display(vhdl_procedural *proc,
                               "to_std_logic_vector",
                               vhdl_type::std_logic_vector(hi, lo));
                            conv->add_expr(base);
-                           vhdl_fcall *f = new vhdl_fcall("sv_dstr",
-                                                          vhdl_type::string());
+                           vhdl_fcall *f = new vhdl_fcall(
+                              ivl_expr_signed(netp) ? "sv_dstr_signed"
+                                                    : "sv_dstr",
+                              vhdl_type::string());
                            f->add_expr(conv);
                            f->add_expr(new vhdl_const_int((int)field_w));
                            text->add_expr(f);
@@ -345,7 +347,8 @@ static int draw_stask_display(vhdl_procedural *proc,
             vhdl_fcall *conv = new vhdl_fcall("to_std_logic_vector",
                vhdl_type::std_logic_vector(hi, lo));
             conv->add_expr(base);
-            vhdl_fcall *f = new vhdl_fcall("sv_dstr", vhdl_type::string());
+            vhdl_fcall *f = new vhdl_fcall(
+               sgn ? "sv_dstr_signed" : "sv_dstr", vhdl_type::string());
             f->add_expr(conv);
             f->add_expr(new vhdl_const_int(fw));
             text->add_expr(f);

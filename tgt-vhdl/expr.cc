@@ -279,7 +279,11 @@ static vhdl_expr *translate_shift(vhdl_expr *lhs, vhdl_expr *rhs,
    // the shift_right function which does the same thing and
    // exists in earlier versions of numeric_std.
    if (op == VHDL_BINOP_SRA) {
-      vhdl_fcall *sra = new vhdl_fcall("shift_right", rtype);
+      // sv2vhdl: the logic3d_vector shift_right is LOGICAL; a Verilog >>> on a
+      // signed operand must sign-extend, so route to the arithmetic l3d_sra.
+      const bool is_l3d = lhs->get_type()
+         && lhs->get_type()->get_name() == VHDL_TYPE_LOGIC3D_VECTOR;
+      vhdl_fcall *sra = new vhdl_fcall(is_l3d ? "l3d_sra" : "shift_right", rtype);
       sra->add_expr(lhs);
       sra->add_expr(r_cast);
 
