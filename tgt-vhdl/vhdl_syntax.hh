@@ -787,15 +787,19 @@ class vhdl_port_decl : public vhdl_decl {
 public:
    vhdl_port_decl(const char *name, const vhdl_type *type,
                   vhdl_port_mode_t mode)
-      : vhdl_decl(name, type), mode_(mode) {}
+      : vhdl_decl(name, type), resolved_(false), mode_(mode) {}
 
    void emit(std::ostream &of, int level) const;
    vhdl_port_mode_t get_mode() const { return mode_; }
    void set_mode(vhdl_port_mode_t m) { mode_ = m; }
+   // Emit a resolved logic3d subtype (for an inout port that nvc's all-ports-
+   // are-inout treatment gives both an internal and external driver).
+   void set_resolved(bool r) { resolved_ = r; }
    assign_type_t assignment_type() const { return ASSIGN_NONBLOCK; }
    void ensure_readable();
    bool is_readable() const;
 private:
+   bool resolved_;
    vhdl_port_mode_t mode_;
 };
 

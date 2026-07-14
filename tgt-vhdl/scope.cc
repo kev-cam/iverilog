@@ -350,8 +350,11 @@ void draw_nexus(ivl_nexus_t nexus)
 
             vhdl_scope *vhdl_scope = ent->get_arch()->get_scope();
             if (!visible_nexus(priv, vhdl_scope)) {
-               // Create a temporary signal for this switch connection
-               const vhdl_type *type = vhdl_type::std_logic();
+               // Create a temporary signal for this switch connection. In
+               // sv2vhdl mode nets are logic3d, and this temp is bound to a
+               // logic3d inout port, so it must be logic3d too (not std_logic).
+               const vhdl_type *type = get_sv2vhdl_mode()
+                  ? vhdl_type::logic3d() : vhdl_type::std_logic();
 
                ostringstream ss;
                ss << "SW" << ivl_switch_basename(sw);
@@ -625,6 +628,50 @@ static string genvar_unique_suffix(ivl_scope_t scope)
 }
 
 // Declare a single signal in a scope
+// Does anything inside sig's OWN module drive its (inout-port) net? nvc's inout
+// ports read their own default rather than the externally-driven value, so a
+// read-only inout Verilog port must be declared `in` to see the connected
+// value. Only report "driven" for a driver in the port's own scope (external
+// and submodule connections live in other scopes); be conservative -- if a net
+// join or unknown driver could exist, keep it inout (safe: no regression).
+static bool inout_driven_internally(ivl_signal_t sig)
+{
+   ivl_scope_t sig_scope = ivl_signal_scope(sig);
+   ivl_nexus_t nex = ivl_signal_nex(sig, 0);
+   if (nex == NULL)
+      return true;                       // unknown -> keep inout
+   int nptrs = ivl_nexus_ptrs(nex);
+   for (int i = 0; i < nptrs; i++) {
+      ivl_nexus_ptr_t ptr = ivl_nexus_ptr(nex, i);
+      ivl_net_logic_t log = ivl_nexus_ptr_log(ptr);
+      if (log && ivl_logic_scope(log) == sig_scope
+          && ivl_logic_pin(log, 0) == nex)
+         return true;                    // driven by an in-scope gate output
+      ivl_lpm_t lpm = ivl_nexus_ptr_lpm(ptr);
+      if (lpm && ivl_lpm_scope(lpm) == sig_scope
+          && ivl_lpm_q(lpm) == nex)
+         return true;                    // driven by an in-scope LPM output
+      ivl_net_const_t con = ivl_nexus_ptr_con(ptr);
+      if (con)
+         return true;                    // a constant driver
+      // A switch (tran/tranif/relay) in the port's OWN scope makes it a genuine
+      // bidirectional endpoint, and its formal is inout -- keep the port inout
+      // so the port-map modes match. (A part-select tran for an instance
+      // connection lives in the PARENT scope, so a read-only port there still
+      // becomes `in`.)
+      ivl_switch_t sw = ivl_nexus_ptr_switch(ptr);
+      if (sw && ivl_switch_scope(sw) == sig_scope)
+         return true;
+      // Sharing the net with another module's inout port (pass-through short)
+      // is also bidirectional.
+      ivl_signal_t s2 = ivl_nexus_ptr_sig(ptr);
+      if (s2 && s2 != sig && ivl_signal_port(s2) == IVL_SIP_INOUT
+          && ivl_signal_scope(s2) != sig_scope)
+         return true;
+   }
+   return false;                         // read-only inside this module
+}
+
 static void declare_one_signal(vhdl_entity *ent, ivl_signal_t sig,
    ivl_scope_t scope)
 {
@@ -760,8 +807,19 @@ static void declare_one_signal(vhdl_entity *ent, ivl_signal_t sig,
          }
       break;
    case IVL_SIP_INOUT:
-      ent->get_scope()->add_decl
-         (new vhdl_port_decl(name.c_str(), sig_type, VHDL_PORT_INOUT));
+      {
+         // nvc reads an inout port's own (default) driver, not the external
+         // value, so a read-only inout Verilog port must be `in` to see the
+         // connected value. Keep `inout` (resolved) only when the module
+         // actually drives the port.
+         bool driven = inout_driven_internally(sig);
+         vhdl_port_mode_t mode = (get_sv2vhdl_mode() && !driven)
+            ? VHDL_PORT_IN : VHDL_PORT_INOUT;
+         vhdl_port_decl *pd = new vhdl_port_decl(name.c_str(), sig_type, mode);
+         if (get_sv2vhdl_mode() && mode == VHDL_PORT_INOUT)
+            pd->set_resolved(true);
+         ent->get_scope()->add_decl(pd);
+      }
       break;
    default:
       assert(false);

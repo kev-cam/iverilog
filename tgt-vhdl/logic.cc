@@ -685,10 +685,26 @@ static void draw_one_switch(vhdl_arch *arch, ivl_switch_t sw)
    case IVL_SW_RTRAN:    entity_name = "sv_rtran";    break;
    case IVL_SW_RTRANIF0: entity_name = "sv_rtranif0"; has_enable = true; break;
    case IVL_SW_RTRANIF1: entity_name = "sv_rtranif1"; has_enable = true; break;
-   case IVL_SW_TRAN_VP:
-      debug_msg("Skipping TRAN_VP switch %s (part-select tran not supported)",
-                ivl_switch_basename(sw));
+   case IVL_SW_TRAN_VP: {
+      // Part-select tran: side a is the wide vector, side b the narrow part at
+      // bit offset `off`, width `part`. iverilog inserts this for an inout port
+      // (or tran) connected to a bit/part-select, e.g. `.bit0(value[0])`.
+      // Previously skipped -> the part net was left floating (read as 0). Join
+      // them: drive the part net from the vector slice. nvc treats the port as
+      // inout, so the external vector's value reaches the port (the common
+      // direction; a symmetric back-drive would need full strength resolution).
+      unsigned off  = ivl_switch_offset(sw);
+      unsigned part = ivl_switch_part(sw);
+      vhdl_scope *sc = arch->get_scope();
+      vhdl_var_ref *a = nexus_to_var_ref(sc, ivl_switch_a(sw));
+      vhdl_var_ref *b = nexus_to_var_ref(sc, ivl_switch_b(sw));
+      if (part == 1)
+         a->set_slice(new vhdl_const_int(off));         // single bit a(off)
+      else
+         a->set_slice(new vhdl_const_int(off), part - 1); // a(off+part-1 downto off)
+      arch->add_stmt(new vhdl_cassign_stmt(b, a->cast(b->get_type())));
       return;
+   }
    default:
       error("Unknown switch type %d", ivl_switch_type(sw));
       return;

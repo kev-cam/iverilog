@@ -603,7 +603,20 @@ void vhdl_port_decl::emit(std::ostream &of, int level) const
       break;
    }
 
-   type_->emit(of, level);
+   // A resolved inout port: emit the resolved logic3d subtype so nvc's
+   // internal + external drivers resolve (an unresolved port would just read
+   // its own default). Keep the constraint for the vector case.
+   if (resolved_ && type_ != NULL
+       && type_->get_name() == VHDL_TYPE_LOGIC3D) {
+      of << "resolved_logic3d";
+   }
+   else if (resolved_ && type_ != NULL
+            && type_->get_name() == VHDL_TYPE_LOGIC3D_VECTOR) {
+      of << "resolved_logic3d_vector(" << type_->get_msb()
+         << " downto " << type_->get_lsb() << ")";
+   }
+   else
+      type_->emit(of, level);
 }
 
 // If this is an `out' port make it a `buffer' so we can read from it
