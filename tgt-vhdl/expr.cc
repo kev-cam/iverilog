@@ -605,8 +605,24 @@ static vhdl_expr *translate_select(ivl_expr_t e)
             return from_var_ref;
       }
    }
-   else
-      return correct_signedness(from, e)->resize(ivl_expr_width(e));
+   else {
+      vhdl_expr *padded = correct_signedness(from, e);
+      // sv2vhdl: a widening pad-select (oper2 == NULL) of a signed logic3d
+      // value must sign-extend, but resize() zero-fills the logic3d_vector.
+      // Route signed widenings through l3d_resize_s. (Unsigned widenings and
+      // truncations keep zero-fill / low-bit semantics, which resize() gives.)
+      if (get_sv2vhdl_mode() && ivl_expr_signed(e)
+          && padded->get_type()
+          && padded->get_type()->get_name() == VHDL_TYPE_LOGIC3D_VECTOR
+          && ivl_expr_width(e) > padded->get_type()->get_width()) {
+         vhdl_fcall *f = new vhdl_fcall("l3d_resize_s",
+            vhdl_type::logic3d_vector(ivl_expr_width(e) - 1, 0));
+         f->add_expr(padded);
+         f->add_expr(new vhdl_const_int(ivl_expr_width(e)));
+         return f;
+      }
+      return padded->resize(ivl_expr_width(e));
+   }
 }
 
 template <class T>
