@@ -117,8 +117,18 @@ static int draw_stask_display(vhdl_procedural *proc,
                text->add_expr(new vhdl_const_string(ss.str()));
                ss.str("");
 
-               // Skip over width for now
-               while (isdigit(*p)) ++p;
+               // Parse the Verilog field-width spec: %[0][N]. A leading '0'
+               // selects minimum width / no padding (%0d); explicit digits N
+               // give the field width; plain %d uses a size-derived default
+               // (applied below in the decimal branch).
+               bool ld_zero = false;
+               long fw_spec = -1;   // -1 => no explicit width digits
+               if (*p == '0') { ld_zero = true; ++p; }
+               {
+                  bool has_digits = false; long wv = 0;
+                  while (isdigit(*p)) { has_digits = true; wv = wv*10 + (*p - '0'); ++p; }
+                  if (has_digits) fw_spec = wv;
+               }
 
                switch (*p) {
                case 'm':
@@ -257,6 +267,25 @@ static int draw_stask_display(vhdl_procedural *proc,
                               hi = base->get_type()->get_msb();
                               lo = base->get_type()->get_lsb();
                            }
+                           // Verilog %d field width: %Nd -> N, %0d -> 0 (no
+                           // pad), plain %d -> operand max-magnitude width.
+                           long field_w;
+                           if (fw_spec >= 0) field_w = fw_spec;
+                           else if (ld_zero) field_w = 0;
+                           else {
+                              int w = ivl_expr_width(netp); if (w < 1) w = 1;
+                              const bool sgn = ivl_expr_signed(netp) != 0;
+                              int magbits = sgn ? w - 1 : w;
+                              if (magbits < 0) magbits = 0;
+                              if (magbits >= 64) field_w = 20;
+                              else {
+                                 unsigned long long mv =
+                                    magbits ? ((1ULL << magbits) - 1ULL) : 0ULL;
+                                 field_w = 1;
+                                 while (mv >= 10) { mv /= 10; field_w++; }
+                              }
+                              if (sgn) field_w += 1;
+                           }
                            vhdl_fcall *conv = new vhdl_fcall(
                               "to_std_logic_vector",
                               vhdl_type::std_logic_vector(hi, lo));
@@ -264,6 +293,7 @@ static int draw_stask_display(vhdl_procedural *proc,
                            vhdl_fcall *f = new vhdl_fcall("sv_dstr",
                                                           vhdl_type::string());
                            f->add_expr(conv);
+                           f->add_expr(new vhdl_const_int((int)field_w));
                            text->add_expr(f);
                            l3d_dec = true;
                         }
@@ -288,7 +318,40 @@ static int draw_stask_display(vhdl_procedural *proc,
 
          emit_wait_for_0(proc, container, stmt, base);
 
-         text->add_expr(base->cast(text->get_type()));
+         // sv2vhdl: a bare $display arg (no format code) uses Verilog's
+         // DEFAULT format = DECIMAL (%d), right-justified to the operand's
+         // max-magnitude width. A logic3d/logic3d_vector must go through
+         // sv_dstr(to_std_logic_vector(...)); base->cast(string) would emit
+         // logic3d_vector'image -> raw aggregate "(2,2,2,3)" or a scalar code.
+         const vhdl_type *bt = base->get_type();
+         if (bt && (bt->get_name() == VHDL_TYPE_LOGIC3D_VECTOR
+                    || bt->get_name() == VHDL_TYPE_LOGIC3D)) {
+            int hi = 0, lo = 0;
+            if (bt->get_name() == VHDL_TYPE_LOGIC3D_VECTOR) {
+               hi = bt->get_msb(); lo = bt->get_lsb();
+            }
+            int w = ivl_expr_width(net); if (w < 1) w = 1;
+            const bool sgn = ivl_expr_signed(net) != 0;
+            int magbits = sgn ? w - 1 : w; if (magbits < 0) magbits = 0;
+            int fw;
+            if (magbits >= 64) fw = 20;
+            else {
+               unsigned long long mv =
+                  magbits ? ((1ULL << magbits) - 1ULL) : 0ULL;
+               fw = 1;
+               while (mv >= 10) { mv /= 10; fw++; }
+            }
+            if (sgn) fw += 1;
+            vhdl_fcall *conv = new vhdl_fcall("to_std_logic_vector",
+               vhdl_type::std_logic_vector(hi, lo));
+            conv->add_expr(base);
+            vhdl_fcall *f = new vhdl_fcall("sv_dstr", vhdl_type::string());
+            f->add_expr(conv);
+            f->add_expr(new vhdl_const_int(fw));
+            text->add_expr(f);
+         }
+         else
+            text->add_expr(base->cast(text->get_type()));
       }
    }
 

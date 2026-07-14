@@ -505,17 +505,20 @@ static vhdl_expr *translate_select(ivl_expr_t e)
          // a variable reference in VHDL, but we can emulate the
          // effect with a shift and a resize
 
+         vhdl_expr *shifted;
          if (ivl_expr_signed(ivl_expr_oper1(e))) {
             vhdl_fcall *sra = new vhdl_fcall("shift_right", from->get_type());
             sra->add_expr(from);
             sra->add_expr(base->to_integer());
-
-            return sra;
+            shifted = sra;
          }
          else
-            return new vhdl_binop_expr(from, VHDL_BINOP_SR, base->to_integer(),
-                                       from->get_type());
+            shifted = new vhdl_binop_expr(from, VHDL_BINOP_SR, base->to_integer(),
+                                          from->get_type());
 
+         // Truncate the shifted value to the select width (LSB-aligned) so a
+         // 1-bit select yields a single bit, not the full source vector.
+         return shifted->resize(ivl_expr_width(e));
       }
       else if (ivl_expr_type(ivl_expr_oper1(e)) == IVL_EX_SIGNAL
                && ivl_signal_data_type(ivl_expr_signal(ivl_expr_oper1(e)))
