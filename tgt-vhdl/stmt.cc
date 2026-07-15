@@ -1007,10 +1007,17 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
       // not deposited immediately.  vhdl_assign_stmt has no `after`
       // form, so keep it as a non-blocking signal assignment.
       vhdl_decl::assign_type_t atype = decl->assignment_type();
-      if (proc->get_scope()->initializing()
-          && atype == vhdl_decl::ASSIGN_NONBLOCK
-          && after == NULL)
+      // Deposit (:=) a signal at time zero to avoid a driver that would
+      // conflict with an always block. But once a signal is deposited, keep
+      // depositing it for the rest of the process: nvc silently drops a later
+      // <= on a signal that was already assigned with := (a time-zero deposit
+      // followed by a post-wait <= would lose the later value entirely).
+      if (atype == vhdl_decl::ASSIGN_NONBLOCK && after == NULL
+          && (proc->get_scope()->initializing()
+              || proc->was_deposited(lhs->get_name()))) {
          atype = vhdl_decl::ASSIGN_BLOCK;
+         proc->mark_deposited(lhs->get_name());
+      }
 
       if (!check_valid_assignment(atype, proc, stmt))
          return;
@@ -2222,12 +2229,27 @@ int draw_forever(vhdl_procedural *proc, stmt_container *container,
 int draw_repeat(vhdl_procedural *proc, stmt_container *container,
                 ivl_statement_t stmt)
 {
-   vhdl_expr *times = translate_expr(ivl_stmt_cond_expr(stmt));
+   ivl_expr_t cond = ivl_stmt_cond_expr(stmt);
+   vhdl_expr *times = translate_expr(cond);
    if (NULL == times)
       return 1;
 
    vhdl_type integer(VHDL_TYPE_INTEGER);
-   times = times->cast(&integer);
+   // A signed repeat count that is negative means zero iterations in Verilog;
+   // an unsigned To_Integer would read -1 as ~2**31 and loop almost forever.
+   // Reinterpret a signed logic3d count as signed so a negative count yields a
+   // null `1 to N' range.
+   if (get_sv2vhdl_mode() && ivl_expr_signed(cond) && times->get_type()
+       && times->get_type()->get_name() == VHDL_TYPE_LOGIC3D_VECTOR) {
+      vhdl_fcall *s = new vhdl_fcall("l3d_to_signed",
+         vhdl_type::nsigned(times->get_type()->get_width()));
+      s->add_expr(times);
+      vhdl_fcall *ti = new vhdl_fcall("To_Integer", vhdl_type::integer());
+      ti->add_expr(s);
+      times = ti;
+   }
+   else
+      times = times->cast(&integer);
 
    const char *it_name = "Verilog_Repeat";
    vhdl_for_stmt *loop =

@@ -929,6 +929,14 @@ public:
    const std::set<std::string>& get_blocking_targets() const
       { return blocking_targets_; }
 
+   // Signals deposited (:=) in this process. Once a signal is deposited, all
+   // its later assignments must also deposit -- nvc drops a <= that follows a
+   // := on the same signal, so a time-zero deposit + a post-wait <= would make
+   // the later value silently vanish.
+   void mark_deposited(const std::string& name) { deposited_.insert(name); }
+   bool was_deposited(const std::string& name) const
+      { return deposited_.count(name) > 0; }
+
 protected:
    stmt_container stmts_;
    vhdl_scope scope_;
@@ -942,6 +950,9 @@ protected:
    // The set of variable we have performed a blocking
    // assignment to
    std::set<std::string> blocking_targets_;
+
+   // Signals deposited (:=) in this process (see mark_deposited).
+   std::set<std::string> deposited_;
 };
 
 

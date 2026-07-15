@@ -788,10 +788,12 @@ vhdl_expr *translate_sfunc_stime(ivl_expr_t)
 
 vhdl_expr *translate_sfunc_simtime(ivl_expr_t)
 {
-   cerr << "warning: no translation for $simtime (returning 0)" << endl;
-   vhdl_expr *result = new vhdl_const_int(0);
-   result->set_comment("$simtime not supported, returned 0 instead!");
-   return result;
+   // $simtime is the raw simulation time. `now' is scaled to the scope's time
+   // units (the same scale as the emitted #delays), so divide by that unit --
+   // using the precision here would disagree with the delay scale when the two
+   // differ (e.g. a module with no timescale).
+   string e = "(now / (" + time_unit_literal(active_time_units()) + "))";
+   return new vhdl_var_ref(e.c_str(), vhdl_type::integer());
 }
 
 vhdl_expr *translate_sfunc_random(ivl_expr_t e)
