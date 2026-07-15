@@ -232,12 +232,20 @@ private:
    char bit_;
 };
 
+// Keep the existing members' order/values; new units appended.
 enum time_unit_t {
    TIME_UNIT_PS,
    TIME_UNIT_NS,
    TIME_UNIT_US,
-   TIME_UNIT_MS
+   TIME_UNIT_MS,
+   TIME_UNIT_FS,
+   TIME_UNIT_SEC
 };
+
+// The VHDL unit representing one simulation tick for a design of this time
+// precision, and its name. Delays and $time/$simtime must share this base.
+time_unit_t vhdl_tick_unit(int precision);
+const char *time_unit_name(time_unit_t u);
 
 class vhdl_const_time : public vhdl_expr {
 public:
@@ -1062,8 +1070,12 @@ private:
    std::string verilog_params_;
 
    // Entities have an associated VHDL time unit
-   // This is used to implement the Verilog timescale directive
+   // This is used to implement the Verilog timescale directive.
+   // A delay value is emitted as (value * time_mult_) time_unit_, so a
+   // precision that is not exactly a VHDL decade unit (e.g. 10ns) still comes
+   // out at the right scale. See set_time_units.
    time_unit_t time_unit_;
+   uint64_t time_mult_ = 1;
 };
 
 typedef std::list<vhdl_entity*> entity_list_t;

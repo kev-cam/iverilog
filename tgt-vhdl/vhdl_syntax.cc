@@ -187,22 +187,55 @@ void vhdl_entity::emit(std::ostream &of, int level) const
 // for this entity
 vhdl_const_time* scale_time(const vhdl_entity* ent, uint64_t t)
 {
-   return new vhdl_const_time(t, ent->time_unit_);
+   return new vhdl_const_time(t * ent->time_mult_, ent->time_unit_);
 }
 
-// Work out the best VHDL units to use given the Verilog timescale
-void vhdl_entity::set_time_units(int units, int precision)
+// The VHDL unit that represents ONE simulation tick, given the design's time
+// precision. The VHDL time base is arbitrary -- only ratios between delays and
+// $time matter -- so a tick is represented as a single unit of the nearest
+// decade at or below the precision, which COMPRESSES the time base. That is
+// deliberate: using the true SI scale (a 1s tick as "1 sec") overflows VHDL's
+// 64-bit fs TIME, which tops out near 9223 seconds, for any long run with a
+// coarse timescale. $time/$simtime divide by this same base -- see
+// vhdl_scope_unit_literal() -- so the two stay consistent.
+time_unit_t vhdl_tick_unit(int precision)
 {
-   int vhdl_units = std::min(units, precision);
+   if (precision >= -3)  return TIME_UNIT_MS;
+   if (precision >= -6)  return TIME_UNIT_US;
+   if (precision >= -9)  return TIME_UNIT_NS;
+   if (precision >= -12) return TIME_UNIT_PS;
+   return TIME_UNIT_FS;
+}
 
-   if (vhdl_units >= -3)
-      time_unit_ = TIME_UNIT_MS;
-   else if (vhdl_units >= -6)
-      time_unit_ = TIME_UNIT_US;
-   else if (vhdl_units >= -9)
-      time_unit_ = TIME_UNIT_NS;
-   else
-      time_unit_ = TIME_UNIT_PS;
+const char *time_unit_name(time_unit_t u)
+{
+   switch (u) {
+   case TIME_UNIT_FS:  return "fs";
+   case TIME_UNIT_PS:  return "ps";
+   case TIME_UNIT_NS:  return "ns";
+   case TIME_UNIT_US:  return "us";
+   case TIME_UNIT_MS:  return "ms";
+   case TIME_UNIT_SEC: return "sec";
+   }
+   return "ns";
+}
+
+// Work out the VHDL units for this entity's delays. `precision' is the DESIGN's
+// time precision -- the size of a simulation tick -- because delay values reach
+// us counted in ticks. One tick is emitted as one vhdl_tick_unit(), so a delay
+// of N ticks is simply "N <unit>".
+//
+// Keying this on the DESIGN precision (rather than the old per-scope
+// min(units, precision)) is what makes a mixed-timescale design consistent: all
+// entities must measure the shared tick with the same ruler, or a module whose
+// own precision landed in a different bucket scales its delays wrongly.
+//
+// `units' (this scope's timescale unit) does not scale delays -- only
+// $time/$simtime divide by it, via vhdl_scope_unit_literal().
+void vhdl_entity::set_time_units(int, int precision)
+{
+   time_unit_ = vhdl_tick_unit(precision);
+   time_mult_ = 1;
 }
 
 vhdl_arch::~vhdl_arch()
@@ -1000,10 +1033,12 @@ void vhdl_const_time::emit(std::ostream &of, int) const
 {
    of << dec << value_;
    switch (units_) {
-   case TIME_UNIT_PS: of << " ps"; break;
-   case TIME_UNIT_NS: of << " ns"; break;
-   case TIME_UNIT_US: of << " us"; break;
-   case TIME_UNIT_MS: of << " ms"; break;
+   case TIME_UNIT_FS:  of << " fs"; break;
+   case TIME_UNIT_PS:  of << " ps"; break;
+   case TIME_UNIT_NS:  of << " ns"; break;
+   case TIME_UNIT_US:  of << " us"; break;
+   case TIME_UNIT_MS:  of << " ms"; break;
+   case TIME_UNIT_SEC: of << " sec"; break;
    }
 }
 

@@ -1241,9 +1241,12 @@ static void create_skeleton_entity_for(ivl_scope_t scope, int depth)
       ent->set_verilog_src(vsrc.str());
    }
 
-   // Calculate the VHDL units to use for time values
+   // Calculate the VHDL units to use for time values. Delay values are counted
+   // in simulation ticks, and a tick is the DESIGN's time precision (the finest
+   // over all modules) -- not this scope's -- so a design mixing timescales
+   // (e.g. a 10us module beside a 1us one) scales every delay by the same tick.
    ent->set_time_units(ivl_scope_time_units(scope),
-                       ivl_scope_time_precision(scope));
+                       ivl_design_time_precision(get_vhdl_design()));
 
    // Build a comment to add to the entity/architecture
    ostringstream ss;

@@ -752,47 +752,58 @@ static vhdl_expr *translate_concat(ivl_expr_t e)
    return concat;
 }
 
-// A VHDL physical-time literal for 10^`units` seconds (ivl_scope_time_units
-// is a signed power of 10: -9 = 1 ns, -8 = 10 ns, -6 = 1 us, ...).
-static std::string time_unit_literal(int units)
+// A VHDL time literal for ONE simulation tick. Delays are emitted as a count of
+// ticks in this unit (see set_time_units), so `now' divided by it is the tick
+// count. Note the base is deliberately compressed rather than true SI -- see
+// vhdl_tick_unit().
+static std::string tick_literal()
 {
-   static const struct { int exp; const char *name; } bases[] = {
-      {0, "sec"}, {-3, "ms"}, {-6, "us"}, {-9, "ns"}, {-12, "ps"}, {-15, "fs"} };
-   for (unsigned i = 0; i < sizeof(bases)/sizeof(bases[0]); i++) {
-      if (units >= bases[i].exp) {
-         long mult = 1;
-         for (int k = 0; k < units - bases[i].exp; k++) mult *= 10;
-         ostringstream ss;
-         ss << mult << " " << bases[i].name;
-         return ss.str();
-      }
-   }
-   return "1 fs";
+   const int prec = ivl_design_time_precision(get_vhdl_design());
+   return std::string("1 ") + time_unit_name(vhdl_tick_unit(prec));
+}
+
+// A VHDL time literal for one unit of the ACTIVE SCOPE's Verilog timescale,
+// expressed in the same tick base the delays use. A scope's unit spans
+// 10^(units - precision) ticks (ivl_scope_time_units is a signed power of 10:
+// -9 = 1 ns, -8 = 10 ns, ...), so `now' divided by this yields the Verilog time
+// count in that scope's units.
+//
+// This must be derived from the tick base, NOT from the true SI size of the
+// scope's unit: the emitted delays live in the compressed base, so an
+// independently-computed SI literal disagrees with them whenever the two scales
+// differ (which is exactly what made $time/$simtime read 0 in a module with no
+// timescale).
+static std::string scope_unit_literal(int units)
+{
+   const int prec = ivl_design_time_precision(get_vhdl_design());
+   uint64_t ticks = 1;
+   for (int k = 0; k < units - prec; k++)
+      ticks *= 10;
+   ostringstream ss;
+   ss << ticks << " " << time_unit_name(vhdl_tick_unit(prec));
+   return ss.str();
 }
 
 // $time / $stime: the current simulation time scaled to the calling scope's
-// time units. VHDL `now` is in the simulation's base precision, so dividing by
-// the scope's unit literal yields the Verilog time count. The scope's units
-// come from the scope-keyed store (set_active_scope in draw_process).
+// time units. The scope's units come from the scope-keyed store
+// (set_active_scope in draw_process).
 vhdl_expr *translate_sfunc_time(ivl_expr_t)
 {
-   string e = "(now / (" + time_unit_literal(active_time_units()) + "))";
+   string e = "(now / (" + scope_unit_literal(active_time_units()) + "))";
    return new vhdl_var_ref(e.c_str(), vhdl_type::integer());
 }
 
 vhdl_expr *translate_sfunc_stime(ivl_expr_t)
 {
-   string e = "(now / (" + time_unit_literal(active_time_units()) + "))";
+   string e = "(now / (" + scope_unit_literal(active_time_units()) + "))";
    return new vhdl_var_ref(e.c_str(), vhdl_type::integer());
 }
 
 vhdl_expr *translate_sfunc_simtime(ivl_expr_t)
 {
-   // $simtime is the raw simulation time. `now' is scaled to the scope's time
-   // units (the same scale as the emitted #delays), so divide by that unit --
-   // using the precision here would disagree with the delay scale when the two
-   // differ (e.g. a module with no timescale).
-   string e = "(now / (" + time_unit_literal(active_time_units()) + "))";
+   // $simtime is the raw simulation time: a count of ticks, unscaled by any
+   // scope's timescale units.
+   string e = "(now / (" + tick_literal() + "))";
    return new vhdl_var_ref(e.c_str(), vhdl_type::integer());
 }
 
