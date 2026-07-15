@@ -65,6 +65,22 @@ struct WriteInfo {
    unsigned slice_width = 0;
 };
 
+// Does this body suspend on its own, via an explicit wait at the top level of
+// the process? If not, the process is driven by a sensitivity list whose
+// implicit wait sits at the END of the body -- see the seed placement below.
+// Only a top-level wait counts: one buried in a branch might not be reached on
+// every iteration, so a loop around the body could still spin.
+static bool body_has_toplevel_wait(stmt_container *body)
+{
+   stmt_container::stmt_list_t &stmts = body->get_stmts();
+   for (stmt_container::stmt_list_t::iterator it = stmts.begin();
+        it != stmts.end(); ++it) {
+      if (dynamic_cast<vhdl_wait_stmt*>(*it))
+         return true;
+   }
+   return false;
+}
+
 static bool same_const_int(vhdl_expr *a, vhdl_expr *b)
 {
    vhdl_const_int *ca = dynamic_cast<vhdl_const_int*>(a);
@@ -179,6 +195,9 @@ static void shadow_blocking_targets(vhdl_process *vhdl_proc, vhdl_entity *ent)
    vhdl_scope *proc_scope = vhdl_proc->get_scope();
    vhdl_scope *arch_scope = ent->get_arch()->get_scope();
 
+   // `v_sig := sig;` seeds, hoisted out of the body loop below.
+   std::list<vhdl_seq_stmt*> seeds;
+
    for (std::set<std::string>::const_iterator tit = targets.begin();
         tit != targets.end(); ++tit) {
       const std::string &sig_name = *tit;
@@ -235,13 +254,14 @@ static void shadow_blocking_targets(vhdl_process *vhdl_proc, vhdl_entity *ent)
       // emit as `:=` rather than `<=`.
       mark_var_assigns(body, var_name);
 
-      // Prepend `v_sig := sig;` so reads of other slices see live values.
+      // Seed the shadow: `v_sig := sig;`. Collected here and emitted ONCE
+      // before the body loop (see below) rather than prepended into the body.
       {
          vhdl_var_ref *init_lhs =
             new vhdl_var_ref(var_name, new vhdl_type(*src_type));
          vhdl_var_ref *init_rhs =
             new vhdl_var_ref(sig_name, new vhdl_type(*src_type));
-         body->prepend_stmt(new vhdl_assign_stmt(init_lhs, init_rhs));
+         seeds.push_back(new vhdl_assign_stmt(init_lhs, init_rhs));
       }
 
       // Append `sig(slice) <= v_sig(slice);` just before the trailing
@@ -277,6 +297,45 @@ static void shadow_blocking_targets(vhdl_process *vhdl_proc, vhdl_entity *ent)
    // now expressed through variables, which see all in-process writes
    // without a delta cycle.
    remove_wait_for_0(body);
+
+   // Where the seed goes depends on how the process suspends.
+   //
+   // A process that suspends on its OWN explicit wait (`always #10 clk = ~clk`
+   // -> `wait for 10 ms;`) re-runs its body from the top immediately after the
+   // trailing `sig <= v_sig;` -- in the SAME delta, before that update has
+   // settled. A seed at the top then re-reads the pre-write value, clobbers the
+   // shadow, and the next write is a no-op: the clock toggled only every OTHER
+   // period. For these, seeding is INITIALISATION, so hoist it out and loop the
+   // body -- the standard idiom:
+   //
+   //   process is variable v_clk : logic3d; begin
+   //     v_clk := clk;
+   //     loop  wait for 10 ms;  v_clk := not v_clk;  clk <= v_clk;  end loop;
+   //   end process;
+   //
+   // The shadow then just carries the last written value across iterations,
+   // which is what a blocking-assignment target should do.
+   //
+   // A process with a SENSITIVITY LIST has no wait of its own: its implicit
+   // wait is at the END of the body. It therefore does genuinely suspend before
+   // re-running, so a seed at the top reads a settled value and is correct --
+   // and wrapping its body in a loop would trap it so the implicit wait were
+   // never reached, spinning forever. Keep the seed at the top for those.
+   if (!seeds.empty()) {
+      if (body_has_toplevel_wait(body)) {
+         vhdl_loop_stmt *lp = new vhdl_loop_stmt;
+         lp->get_container()->move_stmts_from(body);  // body (incl. commits) -> loop
+         for (std::list<vhdl_seq_stmt*>::iterator it = seeds.begin();
+              it != seeds.end(); ++it)
+            body->add_stmt(*it);
+         body->add_stmt(lp);
+      }
+      else {
+         for (std::list<vhdl_seq_stmt*>::iterator it = seeds.begin();
+              it != seeds.end(); ++it)
+            body->prepend_stmt(*it);
+      }
+   }
 }
 
 }  // namespace
