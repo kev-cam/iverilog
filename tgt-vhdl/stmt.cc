@@ -911,16 +911,21 @@ static vhdl_var_ref *make_assign_lhs(ivl_lval_t lval, vhdl_scope *scope)
       return NULL;
    }
 
-   vhdl_expr *base = NULL;
-   ivl_expr_t e_off = ivl_lval_part_off(lval);
-   if (NULL == e_off)
-      e_off = ivl_lval_idx(lval);
-   if (e_off) {
-      if ((base = translate_expr(e_off)) == NULL)
+   // An lvalue can carry BOTH an array word index and a bit/part offset
+   // (mem[i][hi:lo] = ...) -- they compose, in that order.
+   vhdl_expr *word = NULL, *base = NULL;
+   vhdl_type integer(VHDL_TYPE_INTEGER);
+   ivl_expr_t e_idx = ivl_lval_idx(lval);
+   ivl_expr_t e_part = ivl_lval_part_off(lval);
+   if (e_idx) {
+      if ((word = translate_expr(e_idx)) == NULL)
          return NULL;
-
-      vhdl_type integer(VHDL_TYPE_INTEGER);
-      base = base->cast(&integer);
+      word = index_to_integer(e_idx, word);
+   }
+   if (e_part) {
+      if ((base = translate_expr(e_part)) == NULL)
+         return NULL;
+      base = index_to_integer(e_part, base);
    }
 
    unsigned lval_width = ivl_lval_width(lval);
@@ -951,12 +956,17 @@ static vhdl_var_ref *make_assign_lhs(ivl_lval_t lval, vhdl_scope *scope)
 
    const vhdl_type *ltype = new vhdl_type(*decl->get_type());
    vhdl_var_ref *lval_ref = new vhdl_var_ref(decl->get_name(), ltype);
-   if (base) {
-      if (decl->get_type()->get_name() == VHDL_TYPE_ARRAY)
+   if (decl->get_type()->get_name() == VHDL_TYPE_ARRAY) {
+      if (word)
+         lval_ref->set_slice(word, 0);
+      else if (base)
          lval_ref->set_slice(base, 0);
-      else if (ivl_signal_width(sig) > 1)
-         lval_ref->set_slice(base, lval_width - 1);
+      // A part-select within the selected word composes after it
+      if (word && base)
+         lval_ref->add_extra_slice(base, lval_width - 1);
    }
+   else if ((base || word) && ivl_signal_width(sig) > 1)
+      lval_ref->set_slice(base ? base : word, lval_width - 1);
 
    return lval_ref;
 }
@@ -1136,7 +1146,185 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
 
    if (lvals.size() == 1) {
       vhdl_var_ref *lhs = lvals.front();
-      rhs = rhs->cast(lhs->get_type());
+      bool clamped = false;
+
+      // sv2vhdl: a statically out-of-range part-select WRITE drops the
+      // out-of-range bits (a VHDL slice raises a bounds error instead).
+      // Clamp the target range and take the matching sub-slice of the RHS
+      // through a temporary.
+      // NB: set_slice mutates the ref's type to the slice's own width, so the
+      // target bounds must come from the DECLARATION, not lhs->get_type().
+      vhdl_decl *lhs_decl = proc->get_scope()->get_decl(lhs->get_name());
+
+      // Array-word + part-select lvalue (mem(word)(range)): clamp a static
+      // OOB part against the ELEMENT type's bounds by rewriting the extra
+      // range slice (the plain-vector clamp below can't see it).
+      if (get_sv2vhdl_mode() && lhs_decl && lhs_decl->get_type()
+          && lhs_decl->get_type()->get_name() == VHDL_TYPE_ARRAY
+          && lhs->extra_range_width() > 0
+          && lhs_decl->get_type()->get_base()
+          && lhs_decl->get_type()->get_base()->get_name()
+                == VHDL_TYPE_LOGIC3D_VECTOR) {
+         vhdl_const_int *eb =
+            dynamic_cast<vhdl_const_int*>(lhs->last_extra_base());
+         if (eb) {
+            const vhdl_type *et = lhs_decl->get_type()->get_base();
+            const int lo_e = et->get_lsb();
+            const int hi_e = et->get_msb();
+            const int b = eb->get_value();
+            const int w = lhs->extra_range_width() + 1;
+            if (b < lo_e || b + w - 1 > hi_e) {
+               const int clo = b > lo_e ? b : lo_e;
+               const int chi = (b + w - 1) < hi_e ? (b + w - 1) : hi_e;
+               if (clo > chi)
+                  return;      // whole part out of range: write lost
+               static int oob_aw_count = 0;
+               ostringstream tn;
+               tn << "OOB_AWrite_Tmp_" << oob_aw_count++;
+               vhdl_type lvw(VHDL_TYPE_LOGIC3D_VECTOR, w - 1, 0);
+               vhdl_var_decl *td = new vhdl_var_decl(
+                  tn.str(), vhdl_type::logic3d_vector(w - 1, 0));
+               proc->get_scope()->add_decl(td);
+               container->add_stmt(
+                  new vhdl_assign_stmt(td->make_ref(), rhs->cast(&lvw)));
+               lhs->set_last_extra(new vhdl_const_int(clo), chi - clo);
+               vhdl_var_ref *tr = new vhdl_var_ref(
+                  tn.str(), vhdl_type::logic3d_vector(w - 1, 0));
+               tr->set_slice(new vhdl_const_int(clo - b), chi - clo);
+               rhs = tr;
+               clamped = true;
+            }
+         }
+      }
+      if (get_sv2vhdl_mode() && lhs->get_slice() && lhs_decl
+          && lhs_decl->get_type()
+          && lhs_decl->get_type()->get_name() == VHDL_TYPE_LOGIC3D_VECTOR) {
+         vhdl_const_int *cb = dynamic_cast<vhdl_const_int*>(lhs->get_slice());
+         const int lo_t = lhs_decl->get_type()->get_lsb();
+         const int hi_t = lhs_decl->get_type()->get_msb();
+         if (cb == NULL && lhs->get_slice_width() > 0) {
+            // Runtime-variable part-select write: any bit can be out of
+            // range, and Verilog silently drops those. Capture base and RHS,
+            // then write per-bit under a bounds guard.
+            const int w = lhs->get_slice_width() + 1;
+            static int oobv_count = 0;
+            ostringstream tn, ix;
+            tn << "OOB_WriteV_Tmp_" << oobv_count;
+            ix << "OOB_WriteV_Idx_" << oobv_count++;
+            vhdl_type lvw(VHDL_TYPE_LOGIC3D_VECTOR, w - 1, 0);
+            vhdl_var_decl *td = new vhdl_var_decl(
+               tn.str(), vhdl_type::logic3d_vector(w - 1, 0));
+            proc->get_scope()->add_decl(td);
+            vhdl_var_decl *xd = new vhdl_var_decl(ix.str(),
+                                                  vhdl_type::integer());
+            proc->get_scope()->add_decl(xd);
+            container->add_stmt(
+               new vhdl_assign_stmt(td->make_ref(), rhs->cast(&lvw)));
+            container->add_stmt(
+               new vhdl_assign_stmt(xd->make_ref(), lhs->get_slice()));
+
+            vhdl_decl::assign_type_t at = lhs_decl->assignment_type();
+            if (at == vhdl_decl::ASSIGN_NONBLOCK
+                && (proc->get_scope()->initializing()
+                    || proc->was_deposited(lhs->get_name()))) {
+               at = vhdl_decl::ASSIGN_BLOCK;
+               proc->mark_deposited(lhs->get_name());
+            }
+
+            // Outer gate keeps Idx + P from overflowing INTEGER when the
+            // captured index is extreme (e.g. int'high): constant-side
+            // comparisons only, computed at codegen.
+            vhdl_binop_expr *outer = new vhdl_binop_expr(
+               new vhdl_binop_expr(
+                  new vhdl_var_ref(ix.str().c_str(), vhdl_type::integer()),
+                  VHDL_BINOP_GEQ, new vhdl_const_int(lo_t - (w - 1)),
+                  vhdl_type::boolean()),
+               VHDL_BINOP_AND,
+               new vhdl_binop_expr(
+                  new vhdl_var_ref(ix.str().c_str(), vhdl_type::integer()),
+                  VHDL_BINOP_LEQ, new vhdl_const_int(hi_t),
+                  vhdl_type::boolean()),
+               vhdl_type::boolean());
+            vhdl_if_stmt *outer_if = new vhdl_if_stmt(outer);
+
+            vhdl_for_stmt *loop = new vhdl_for_stmt("OOB_P",
+               new vhdl_const_int(0), new vhdl_const_int(w - 1));
+            vhdl_expr *pos = new vhdl_binop_expr(
+               new vhdl_var_ref(ix.str().c_str(), vhdl_type::integer()),
+               VHDL_BINOP_ADD,
+               new vhdl_var_ref("OOB_P", vhdl_type::integer()),
+               vhdl_type::integer());
+            vhdl_binop_expr *guard = new vhdl_binop_expr(
+               new vhdl_binop_expr(pos, VHDL_BINOP_GEQ,
+                                   new vhdl_const_int(lo_t),
+                                   vhdl_type::boolean()),
+               VHDL_BINOP_AND,
+               new vhdl_binop_expr(
+                  new vhdl_binop_expr(
+                     new vhdl_var_ref(ix.str().c_str(), vhdl_type::integer()),
+                     VHDL_BINOP_ADD,
+                     new vhdl_var_ref("OOB_P", vhdl_type::integer()),
+                     vhdl_type::integer()),
+                  VHDL_BINOP_LEQ, new vhdl_const_int(hi_t),
+                  vhdl_type::boolean()),
+               vhdl_type::boolean());
+            vhdl_if_stmt *iff = new vhdl_if_stmt(guard);
+            vhdl_var_ref *bit_lhs = new vhdl_var_ref(
+               lhs->get_name(), new vhdl_type(*lhs_decl->get_type()));
+            bit_lhs->set_slice(new vhdl_binop_expr(
+               new vhdl_var_ref(ix.str().c_str(), vhdl_type::integer()),
+               VHDL_BINOP_ADD,
+               new vhdl_var_ref("OOB_P", vhdl_type::integer()),
+               vhdl_type::integer()));
+            vhdl_var_ref *bit_rhs = new vhdl_var_ref(
+               tn.str(), vhdl_type::logic3d_vector(w - 1, 0));
+            bit_rhs->set_slice(
+               new vhdl_var_ref("OOB_P", vhdl_type::integer()));
+            iff->get_then_container()->add_stmt(
+               assign_for(at, bit_lhs, bit_rhs));
+            loop->get_container()->add_stmt(iff);
+            outer_if->get_then_container()->add_stmt(loop);
+            container->add_stmt(outer_if);
+            return;
+         }
+         if (cb) {
+            const int b = cb->get_value();
+            const int w = lhs->get_slice_width() + 1;
+            if (b < lo_t || b + w - 1 > hi_t) {
+               const int clo = b > lo_t ? b : lo_t;
+               const int chi = (b + w - 1) < hi_t ? (b + w - 1) : hi_t;
+               if (clo > chi)
+                  return;      // entirely out of range: the write is lost
+               static int oob_tmp_count = 0;
+               ostringstream tn;
+               tn << "OOB_Write_Tmp_" << oob_tmp_count++;
+               vhdl_type lvw(VHDL_TYPE_LOGIC3D_VECTOR, w - 1, 0);
+               vhdl_var_decl *td = new vhdl_var_decl(
+                  tn.str(), vhdl_type::logic3d_vector(w - 1, 0));
+               proc->get_scope()->add_decl(td);
+               container->add_stmt(
+                  new vhdl_assign_stmt(td->make_ref(), rhs->cast(&lvw)));
+               lhs->set_slice(new vhdl_const_int(clo), chi - clo);
+               vhdl_var_ref *tr = new vhdl_var_ref(
+                  tn.str(), vhdl_type::logic3d_vector(w - 1, 0));
+               tr->set_slice(new vhdl_const_int(clo - b), chi - clo);
+               rhs = tr;
+               clamped = true;
+            }
+         }
+      }
+
+      if (!clamped) {
+         // A word+part lvalue (mem(word)(part-range)) has the ARRAY type on
+         // the ref; the assignment target is really the part's width.
+         const int xw = lhs->extra_range_width();
+         if (get_sv2vhdl_mode() && xw > 0) {
+            vhdl_type evw(VHDL_TYPE_LOGIC3D_VECTOR, xw, 0);
+            rhs = rhs->cast(&evw);
+         }
+         else
+            rhs = rhs->cast(lhs->get_type());
+      }
 
       ivl_expr_t i_delay;
       vhdl_expr *after = NULL;

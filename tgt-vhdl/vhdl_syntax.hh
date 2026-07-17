@@ -82,15 +82,24 @@ public:
    void set_slice(vhdl_expr *s, int w=0);
    vhdl_expr *get_slice() const { return slice_; }
    unsigned get_slice_width() const { return slice_width_; }
-   // Append an additional bit-select to the chain (emits as `(idx)(extra)…`).
-   // Used by `$set_val(arr, i, j, val)` to build `arr(i)(j) := val`.
-   void add_extra_slice(vhdl_expr *s) { extra_slices_.push_back(s); }
+   // Append an additional select to the chain (emits as `(idx)` for w==0 or
+   // `(idx + w downto idx)` for a range). Used by `$set_val(arr, i, j, val)`
+   // and by array-word part-selects: mem(word)(base+w-1 downto base).
+   void add_extra_slice(vhdl_expr *s, int w = 0)
+      { extra_slices_.push_back(std::make_pair(s, w)); }
+   // Width of the trailing range select, or -1 if none (0 = single index).
+   int extra_range_width() const
+      { return extra_slices_.empty() ? -1 : extra_slices_.back().second; }
+   vhdl_expr *last_extra_base() const
+      { return extra_slices_.empty() ? NULL : extra_slices_.back().first; }
+   void set_last_extra(vhdl_expr *s, int w)
+      { extra_slices_.back() = std::make_pair(s, w); }
    void find_vars(vhdl_var_set_t& read);
 private:
    std::string name_;
    vhdl_expr *slice_;
    unsigned slice_width_;
-   std::vector<vhdl_expr *> extra_slices_;
+   std::vector<std::pair<vhdl_expr *, int> > extra_slices_;
 };
 
 enum vhdl_binop_t {

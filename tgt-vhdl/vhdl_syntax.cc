@@ -821,8 +821,8 @@ void vhdl_var_ref::find_vars(vhdl_var_set_t& read)
    read.insert(this);
    if (slice_)
       slice_->find_vars(read);
-   for (auto *extra : extra_slices_)
-      extra->find_vars(read);
+   for (auto &extra : extra_slices_)
+      extra.first->find_vars(read);
 }
 
 void vhdl_var_ref::emit(std::ostream &of, int level) const
@@ -837,9 +837,13 @@ void vhdl_var_ref::emit(std::ostream &of, int level) const
       slice_->emit(of, level);
       of << ")";
    }
-   for (auto *extra : extra_slices_) {
+   for (auto &extra : extra_slices_) {
       of << "(";
-      extra->emit(of, level);
+      if (extra.second > 0) {
+         extra.first->emit(of, level);
+         of << " + " << extra.second << " downto ";
+      }
+      extra.first->emit(of, level);
       of << ")";
    }
 }

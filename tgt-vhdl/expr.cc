@@ -717,6 +717,30 @@ static vhdl_expr *translate_binary(ivl_expr_t e)
    return result;
 }
 
+vhdl_expr *index_to_integer(ivl_expr_t e, vhdl_expr *v)
+{
+   // A constant index converts at compile time -- bits_to_int knows the true
+   // signed value regardless of the emitted vector's width, and a constant
+   // integer also keeps the static OOB clamps in play.
+   if (v->constant()) {
+      vhdl_type integer(VHDL_TYPE_INTEGER);
+      return v->cast(&integer);
+   }
+   if (get_sv2vhdl_mode() && v->get_type()
+       && v->get_type()->get_name() == VHDL_TYPE_LOGIC3D_VECTOR) {
+      // l3d_index honours the index's signedness AND returns an
+      // out-of-every-range sentinel when any bit is X/Z (a Verilog x-index
+      // selects nothing).
+      vhdl_fcall *f = new vhdl_fcall("l3d_index", vhdl_type::integer());
+      f->add_expr(v);
+      f->add_expr(new vhdl_const_bool(
+         e != NULL && ivl_expr_signed(e) != 0));
+      return f;
+   }
+   vhdl_type integer(VHDL_TYPE_INTEGER);
+   return v->cast(&integer);
+}
+
 static vhdl_expr *translate_select(ivl_expr_t e)
 {
    vhdl_expr *from = translate_expr(ivl_expr_oper1(e));
@@ -792,8 +816,46 @@ static vhdl_expr *translate_select(ivl_expr_t e)
       else if (from_var_ref->get_type()->get_name() != VHDL_TYPE_STD_LOGIC) {
          // We can use the more idiomatic VHDL slice notation on a
          // single variable reference
-         vhdl_type integer(VHDL_TYPE_INTEGER);
-         from_var_ref->set_slice(base->cast(&integer), ivl_expr_width(e) - 1);
+         const int w = ivl_expr_width(e);
+         vhdl_expr *ibase = index_to_integer(ivl_expr_oper2(e), base);
+
+         // A word-indexed array ref already carries its word slice; the
+         // bit/part-select composes AFTER it: mem(word)(base+w-1 downto base).
+         // set_slice would OVERWRITE the word index (select6/7/8).
+         if (from_var_ref->get_slice() != NULL) {
+            from_var_ref->add_extra_slice(ibase, w - 1);
+            return from_var_ref;
+         }
+
+         // sv2vhdl: a select that can fall outside the vector reads x for the
+         // out-of-range bits, where a VHDL slice raises a bounds error. A
+         // statically in-range select keeps the direct slice; anything else
+         // (constant OOB, or a runtime-variable base) goes through the
+         // bounds-safe readers.
+         if (get_sv2vhdl_mode()
+             && from_var_ref->get_type()->get_name()
+                   == VHDL_TYPE_LOGIC3D_VECTOR) {
+            const int hi_t = from_var_ref->get_type()->get_msb();
+            const int lo_t = from_var_ref->get_type()->get_lsb();
+            vhdl_const_int *ci = dynamic_cast<vhdl_const_int*>(ibase);
+            const bool safe = ci != NULL && ci->get_value() >= lo_t
+               && ci->get_value() + w - 1 <= hi_t;
+            if (!safe) {
+               vhdl_fcall *f;
+               if (w == 1)
+                  f = new vhdl_fcall("l3d_bit_read", vhdl_type::logic3d());
+               else
+                  f = new vhdl_fcall("l3d_part_read",
+                                     vhdl_type::logic3d_vector(w - 1, 0));
+               f->add_expr(from_var_ref);
+               f->add_expr(ibase);
+               if (w != 1)
+                  f->add_expr(new vhdl_const_int(w));
+               return f;
+            }
+         }
+
+         from_var_ref->set_slice(ibase, w - 1);
          return from_var_ref;
       }
       else {
