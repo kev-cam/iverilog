@@ -2536,6 +2536,47 @@ string analog_stmt_to_str(ivl_statement_t stmt)
    return ss.str();
 }
 
+// Verilog force (and, approximately, procedural continuous assign): emit the
+// VHDL-2008 force assignment. nvc's runtime gives the Verilog semantics: the
+// forced value overrides all drivers and deposits; on release a net returns
+// to its resolved driving value while a driverless reg retains the forced
+// value. `assign r = v` is mapped to the same machinery -- the only divergence
+// is Verilog's force-over-assign layering when both are active at once.
+static int draw_force(vhdl_procedural *proc, stmt_container *container,
+                      ivl_statement_t stmt)
+{
+   list<vhdl_var_ref*> lvals;
+   if (!assignment_lvals(stmt, proc, lvals))
+      return 1;
+   if (lvals.size() != 1) {
+      error("force with %zu lvalues not supported at %s:%d", lvals.size(),
+            ivl_stmt_file(stmt), ivl_stmt_lineno(stmt));
+      return 1;
+   }
+   vhdl_expr *rhs = translate_expr(ivl_stmt_rval(stmt));
+   if (NULL == rhs)
+      return 1;
+   vhdl_var_ref *lhs = lvals.front();
+   rhs = rhs->cast(lhs->get_type());
+   container->add_stmt(new vhdl_force_stmt(lhs, rhs));
+   return 0;
+}
+
+static int draw_release(vhdl_procedural *proc, stmt_container *container,
+                        ivl_statement_t stmt)
+{
+   list<vhdl_var_ref*> lvals;
+   if (!assignment_lvals(stmt, proc, lvals))
+      return 1;
+   if (lvals.size() != 1) {
+      error("release with %zu lvalues not supported at %s:%d", lvals.size(),
+            ivl_stmt_file(stmt), ivl_stmt_lineno(stmt));
+      return 1;
+   }
+   container->add_stmt(new vhdl_release_stmt(lvals.front()));
+   return 0;
+}
+
 /*
  * Generate VHDL statements for the given Verilog statement and
  * add them to the given VHDL process. The container is the
@@ -2582,9 +2623,9 @@ int draw_stmt(vhdl_procedural *proc, stmt_container *container,
    case IVL_ST_UTASK:
       return draw_utask(proc, container, stmt);
    case IVL_ST_FORCE:
+      return draw_force(proc, container, stmt);
    case IVL_ST_RELEASE:
-      error("force/release statements cannot be translated to VHDL");
-      return 1;
+      return draw_release(proc, container, stmt);
    case IVL_ST_DISABLE:
       {
          // Verilog 'disable' exits a named scope block.
@@ -2603,9 +2644,10 @@ int draw_stmt(vhdl_procedural *proc, stmt_container *container,
       error("fork statement cannot be translated to VHDL");
       return 1;
    case IVL_ST_CASSIGN:
+      // Procedural continuous assign: approximate with force (see draw_force)
+      return draw_force(proc, container, stmt);
    case IVL_ST_DEASSIGN:
-      error("continuous procedural assignment cannot be translated to VHDL");
-      return 1;
+      return draw_release(proc, container, stmt);
    default:
       error("No VHDL translation for statement at %s:%d (type = %d)",
             ivl_stmt_file(stmt), ivl_stmt_lineno(stmt),

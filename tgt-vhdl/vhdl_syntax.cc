@@ -864,6 +864,22 @@ void vhdl_const_string::emit(std::ostream &of, int) const
    of << "\"";
 }
 
+void vhdl_force_stmt::emit(std::ostream &of, int level) const
+{
+   lhs_->emit(of, level);
+   of << " <= force ";
+   rhs_->emit(of, level);
+   of << ";";
+   emit_comment(of, level, true);
+}
+
+void vhdl_release_stmt::emit(std::ostream &of, int level) const
+{
+   lhs_->emit(of, level);
+   of << " <= release;";
+   emit_comment(of, level, true);
+}
+
 void vhdl_null_stmt::emit(std::ostream &of, int level) const
 {
    of << "null;";

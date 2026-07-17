@@ -456,6 +456,31 @@ protected:
  * Similar to Verilog non-blocking assignment, except the LHS
  * must be a signal not a variable.
  */
+// Verilog force/release -> VHDL-2008 force / release signal assignment
+// (nvc implements these via its forcing pseudo-source; our deposit extension
+// composes with them for Verilog reg semantics). find_vars deliberately
+// reports NOTHING: force acts on the underlying SIGNAL, so the blocking-
+// shadow pass must not rename the target to a process-local shadow variable.
+class vhdl_force_stmt : public vhdl_seq_stmt {
+public:
+   vhdl_force_stmt(vhdl_var_ref *lhs, vhdl_expr *rhs)
+      : lhs_(lhs), rhs_(rhs) {}
+   void emit(std::ostream &of, int level) const;
+   void find_vars(vhdl_var_set_t&, vhdl_var_set_t&) {}
+private:
+   vhdl_var_ref *lhs_;
+   vhdl_expr *rhs_;
+};
+
+class vhdl_release_stmt : public vhdl_seq_stmt {
+public:
+   explicit vhdl_release_stmt(vhdl_var_ref *lhs) : lhs_(lhs) {}
+   void emit(std::ostream &of, int level) const;
+   void find_vars(vhdl_var_set_t&, vhdl_var_set_t&) {}
+private:
+   vhdl_var_ref *lhs_;
+};
+
 class vhdl_nbassign_stmt : public vhdl_abstract_assign_stmt {
 public:
    vhdl_nbassign_stmt(vhdl_var_ref *lhs, vhdl_expr *rhs)
