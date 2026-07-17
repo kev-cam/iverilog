@@ -706,15 +706,23 @@ void vhdl_signal_decl::emit(std::ostream &of, int level) const
       // would use L3D_0X; revisit once iverilog uses VHDL variables for
       // procedural locals in always_comb.
       vhdl_type_name_t tn = type_->get_name();
+      // Doctrine (user, 2026-07-18): 3D-logic initialises with CERTAINTY = 0.
+      // L3D_X = value 0 + uncertain, so the value plane still computes as 0
+      // (no X-pessimism/propagation -- the LUTs are value-preserving) while
+      // certainty-aware observers ($display x-rendering, ===) see the
+      // uninitialised state exactly as Verilog's x.
       if (tn == VHDL_TYPE_LOGIC3D)
-         of << " := L3D_0";
+         of << " := L3D_X";
       else if (tn == VHDL_TYPE_LOGIC3D_VECTOR)
-         of << " := (others => L3D_0)";
+         of << " := (others => L3D_X)";
       else if (tn == VHDL_TYPE_REAL)
          of << " := 0.0";   // VHDL's default is real'left (-1.7e308)
       else if (tn == VHDL_TYPE_ARRAY && type_->get_base()
                && type_->get_base()->get_name() == VHDL_TYPE_REAL)
          of << " := (others => 0.0)";   // Verilog real array elements start 0
+      else if (tn == VHDL_TYPE_ARRAY && type_->get_base()
+               && type_->get_base()->get_name() == VHDL_TYPE_LOGIC3D_VECTOR)
+         of << " := (others => (others => L3D_X))";
    }
 
    of << ";";
