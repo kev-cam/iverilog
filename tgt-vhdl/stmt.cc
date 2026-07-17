@@ -917,6 +917,8 @@ static vhdl_var_ref *make_assign_lhs(ivl_lval_t lval, vhdl_scope *scope)
       return NULL;
    }
 
+   ensure_signal_declared(sig);   // package/$unit-scope orphans
+
    // An lvalue can carry BOTH an array word index and a bit/part offset
    // (mem[i][hi:lo] = ...) -- they compose, in that order.
    vhdl_expr *word = NULL, *base = NULL;

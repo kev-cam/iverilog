@@ -109,6 +109,8 @@ static vhdl_var_ref *translate_signal(ivl_expr_t e)
 {
    ivl_signal_t sig = ivl_expr_signal(e);
 
+   ensure_signal_declared(sig);   // package/$unit-scope orphans
+
    const vhdl_scope *scope = find_scope_for_signal(sig);
    assert(scope);
 

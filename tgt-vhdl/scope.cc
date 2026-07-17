@@ -628,6 +628,83 @@ static string genvar_unique_suffix(ivl_scope_t scope)
 }
 
 // Declare a single signal in a scope
+// A signal living in a PACKAGE or $unit/compilation-unit scope is never
+// visited by the entity walk, so a reference to it (import p1::x) died on
+// get_renamed_signal's assertion. Give it a home on first use: declare it in
+// the referencing entity's architecture, package-prefixed. Verilog package
+// variables are global shared state; a per-referencing-entity copy is an
+// approximation that holds for the (dominant) single-module tests --
+// cross-module package-variable sharing would need the C-side store.
+void ensure_signal_declared(ivl_signal_t sig)
+{
+   if (seen_signal_before(sig))
+      return;
+
+   ivl_scope_t sscope = ivl_signal_scope(sig);
+   const ivl_scope_type_t st = ivl_scope_type(sscope);
+   // Package/$unit scopes are never walked; named begin/fork and generate
+   // scopes can also carry locals the walk missed.
+   if (st != IVL_SCT_PACKAGE && st != IVL_SCT_MODULE
+       && st != IVL_SCT_BEGIN && st != IVL_SCT_FORK
+       && st != IVL_SCT_GENERATE)
+      return;
+
+   vhdl_entity *ent = get_active_entity();
+   if (NULL == ent)
+      return;
+
+   std::string name(ivl_scope_basename(sscope));
+   name += "_";
+   name += ivl_signal_basename(sig);
+   // $unit scope names contain characters VHDL identifiers cannot ($unit#...)
+   for (std::string::size_type i = 0; i < name.size(); i++) {
+      const char c = name[i];
+      if (!isalnum(c) && c != '_')
+         name[i] = '_';
+   }
+   while (!name.empty() && (name[0] == '_' || isdigit(name[0])))
+      name.erase(0, 1);
+   if (name.empty())
+      name = "unit_var";
+   // VHDL rejects consecutive underscores in identifiers
+   std::string::size_type p;
+   while ((p = name.find("__")) != std::string::npos)
+      name.erase(p, 1);
+
+   vhdl_scope *ascope = ent->get_arch()->get_scope();
+   if (!ascope->have_declared(name)) {
+      vhdl_signal_decl *decl =
+         new vhdl_signal_decl(name, vhdl_type_for_signal(sig));
+      decl->set_comment("Package/unit-scope variable given a local home");
+
+      // A package variable's initializer appears as a constant driver on its
+      // nexus (the package scope itself is never walked) -- carry it onto the
+      // local declaration or `int x = 5;` in a package silently becomes 0.
+      ivl_nexus_t nex = ivl_signal_nex(sig, 0);
+      if (nex != NULL) {
+         const int nptrs = ivl_nexus_ptrs(nex);
+         for (int i = 0; i < nptrs; i++) {
+            ivl_net_const_t con =
+               ivl_nexus_ptr_con(ivl_nexus_ptr(nex, i));
+            if (con == NULL)
+               continue;
+            if (ivl_const_type(con) == IVL_VT_REAL)
+               decl->set_initial(new vhdl_const_real(ivl_const_real(con)));
+            else if (ivl_const_width(con) == 1)
+               decl->set_initial(new vhdl_const_bit(ivl_const_bits(con)[0]));
+            else
+               decl->set_initial(new vhdl_const_bits(
+                  ivl_const_bits(con), ivl_const_width(con),
+                  ivl_const_signed(con) != 0));
+            break;
+         }
+      }
+      ascope->add_decl(decl);
+   }
+   remember_signal(sig, ascope);
+   rename_signal(sig, name);
+}
+
 vhdl_type *vhdl_type_for_signal(ivl_signal_t sig)
 {
    if (ivl_signal_data_type(sig) == IVL_VT_REAL)

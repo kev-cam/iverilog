@@ -33,6 +33,8 @@ ivl_design_t get_vhdl_design();
 // Every signal/parameter/local declaration site must use this (not raw
 // vhdl_type::type_for) or real-typed locals silently become logic3d.
 vhdl_type *vhdl_type_for_signal(ivl_signal_t sig);
+// Declare a package/$unit-scope signal in the active entity on first use.
+void ensure_signal_declared(ivl_signal_t sig);
 vhdl_var_ref *nexus_to_var_ref(vhdl_scope *arch_scope, ivl_nexus_t nexus);
 // Convert a bit/part/word index expression to a VHDL integer honouring the
 // VERILOG signedness of the index (a signed -1 index must become -1, not
