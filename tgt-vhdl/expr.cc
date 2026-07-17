@@ -24,6 +24,7 @@
 
 #include <iostream>
 #include <sstream>
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 
@@ -198,6 +199,20 @@ static vhdl_expr *translate_unary(ivl_expr_t e)
           && operand->get_type()->get_name() == VHDL_TYPE_REAL)
          return new vhdl_unaryop_expr
             (VHDL_UNARYOP_NEG, operand, vhdl_type::real());
+      // sv2vhdl: negate natively in the logic3d family (two's complement at
+      // the expression width) -- the SIGNED round-trip has no overloads in
+      // logic3d contexts and l3d_vector -> signed is not a VHDL conversion.
+      if (get_sv2vhdl_mode() && operand->get_type()
+          && (operand->get_type()->get_name() == VHDL_TYPE_LOGIC3D_VECTOR
+              || operand->get_type()->get_name() == VHDL_TYPE_LOGIC3D)) {
+         int w = ivl_expr_width(e);
+         if (w < 1) w = 1;
+         vhdl_type lv(VHDL_TYPE_LOGIC3D_VECTOR, w - 1, 0);
+         vhdl_fcall *f = new vhdl_fcall("l3d_neg",
+                                        vhdl_type::logic3d_vector(w - 1, 0));
+         f->add_expr(operand->cast(&lv));
+         return f;
+      }
       operand = change_signedness(operand, true);
       return new vhdl_unaryop_expr
          (VHDL_UNARYOP_NEG, operand, new vhdl_type(*operand->get_type()));
@@ -358,6 +373,32 @@ static vhdl_expr *translate_shift(vhdl_expr *lhs, vhdl_expr *rhs,
  */
 static vhdl_expr *translate_power(ivl_expr_t e, vhdl_expr *lhs, vhdl_expr *rhs)
 {
+   // sv2vhdl: modular exponentiation in the logic3d domain (l3d_pow wraps at
+   // the result width and never overflows; the integer-domain fallback below
+   // both overflows past 2**31 and returns a SIGNED/UNSIGNED that has no
+   // overloads in logic3d contexts).
+   if (get_sv2vhdl_mode()) {
+      int w = ivl_expr_width(e);
+      if (w < 1) w = 1;
+      vhdl_type lv(VHDL_TYPE_LOGIC3D_VECTOR, w - 1, 0);
+      vhdl_expr *base = lhs->cast(&lv);
+      vhdl_expr *expo = rhs;
+      if (!expo->get_type()
+          || expo->get_type()->get_name() != VHDL_TYPE_LOGIC3D_VECTOR) {
+         int ew = expo->get_type() ? expo->get_type()->get_width() : w;
+         if (ew < 1) ew = w;
+         vhdl_type ev(VHDL_TYPE_LOGIC3D_VECTOR, ew - 1, 0);
+         expo = expo->cast(&ev);
+      }
+      vhdl_fcall *f = new vhdl_fcall("l3d_pow",
+                                     vhdl_type::logic3d_vector(w - 1, 0));
+      f->add_expr(base);
+      f->add_expr(expo);
+      f->add_expr(new vhdl_const_bool(ivl_expr_signed(ivl_expr_oper1(e)) != 0));
+      f->add_expr(new vhdl_const_bool(ivl_expr_signed(ivl_expr_oper2(e)) != 0));
+      return f;
+   }
+
    vhdl_type integer(VHDL_TYPE_INTEGER);
    vhdl_expr *lhs_int = lhs->cast(&integer);
    vhdl_expr *rhs_int = rhs->cast(&integer);
@@ -498,6 +539,69 @@ static vhdl_expr *translate_binary(ivl_expr_t e)
       }
    }
 
+   // sv2vhdl operand normalization: Verilog mixes operand kinds freely where
+   // VHDL's typing rejects them. Bring both sides into the logic3d family
+   // before dispatch -- numeric_std escapees (a signed intermediate), bare
+   // integers (parameters, $time arithmetic), and scalar-vs-vector mixes.
+   // Shift opcodes are excluded: their right operand is a COUNT with its own
+   // handling (l3d_shcount).
+   {
+      const char opc = ivl_expr_opcode(e);
+      const bool is_shift = (opc == 'l' || opc == 'r' || opc == 'R');
+      if (get_sv2vhdl_mode() && !is_shift
+          && lhs->get_type() && rhs->get_type()) {
+         vhdl_type_name_t lt = lhs->get_type()->get_name();
+         vhdl_type_name_t rt = rhs->get_type()->get_name();
+         bool l_l3 = (lt == VHDL_TYPE_LOGIC3D
+                      || lt == VHDL_TYPE_LOGIC3D_VECTOR);
+         bool r_l3 = (rt == VHDL_TYPE_LOGIC3D
+                      || rt == VHDL_TYPE_LOGIC3D_VECTOR);
+         // A boolean (comparison result used as a value) or std_logic side
+         // meeting logic3d: convert to scalar logic3d; the scalar-vs-vector
+         // rule below then widens it if needed.
+         if (l_l3 && !r_l3 && (rt == VHDL_TYPE_BOOLEAN
+                               || rt == VHDL_TYPE_STD_LOGIC
+                               || rt == VHDL_TYPE_STD_ULOGIC)) {
+            rhs = rhs->to_std_logic();
+            rt = rhs->get_type() ? rhs->get_type()->get_name() : rt;
+            r_l3 = (rt == VHDL_TYPE_LOGIC3D || rt == VHDL_TYPE_LOGIC3D_VECTOR);
+         }
+         else if (r_l3 && !l_l3 && (lt == VHDL_TYPE_BOOLEAN
+                                    || lt == VHDL_TYPE_STD_LOGIC
+                                    || lt == VHDL_TYPE_STD_ULOGIC)) {
+            lhs = lhs->to_std_logic();
+            lt = lhs->get_type() ? lhs->get_type()->get_name() : lt;
+            l_l3 = (lt == VHDL_TYPE_LOGIC3D || lt == VHDL_TYPE_LOGIC3D_VECTOR);
+         }
+         // A numeric/integer side meeting a logic3d side converts to the
+         // logic3d family at its own (or the l3d side's) width.
+         if (l_l3 && !r_l3 && (rt == VHDL_TYPE_SIGNED || rt == VHDL_TYPE_UNSIGNED
+                               || rt == VHDL_TYPE_INTEGER)) {
+            int w = rt == VHDL_TYPE_INTEGER
+               ? std::max(lhs->get_type()->get_width(), 1)
+               : std::max(rhs->get_type()->get_width(), 1);
+            vhdl_type lv(VHDL_TYPE_LOGIC3D_VECTOR, w - 1, 0);
+            rhs = rhs->cast(&lv);
+            rt = rhs->get_type()->get_name();
+         }
+         else if (r_l3 && !l_l3 && (lt == VHDL_TYPE_SIGNED
+                                    || lt == VHDL_TYPE_UNSIGNED
+                                    || lt == VHDL_TYPE_INTEGER)) {
+            int w = lt == VHDL_TYPE_INTEGER
+               ? std::max(rhs->get_type()->get_width(), 1)
+               : std::max(lhs->get_type()->get_width(), 1);
+            vhdl_type lv(VHDL_TYPE_LOGIC3D_VECTOR, w - 1, 0);
+            lhs = lhs->cast(&lv);
+            lt = lhs->get_type()->get_name();
+         }
+         // Scalar logic3d meeting a logic3d_vector: widen the scalar.
+         if (lt == VHDL_TYPE_LOGIC3D && rt == VHDL_TYPE_LOGIC3D_VECTOR)
+            lhs = lhs->cast(rhs->get_type());
+         else if (rt == VHDL_TYPE_LOGIC3D && lt == VHDL_TYPE_LOGIC3D_VECTOR)
+            rhs = rhs->cast(lhs->get_type());
+      }
+   }
+
    vhdl_expr *result;
    switch (ivl_expr_opcode(e)) {
    case '+':
@@ -621,6 +725,13 @@ static vhdl_expr *translate_select(ivl_expr_t e)
 
    ivl_expr_t o2 = ivl_expr_oper2(e);
    if (o2) {
+      // A bit-select on a 1-bit value (x[0] where x is scalar): VHDL cannot
+      // index a scalar; the select is the value itself.
+      if (from->get_type()
+          && from->get_type()->get_name() == VHDL_TYPE_LOGIC3D
+          && ivl_expr_width(e) == 1)
+         return from;
+
       vhdl_expr *base = translate_expr(ivl_expr_oper2(e));
       if (NULL == base)
          return NULL;
@@ -799,9 +910,18 @@ static vhdl_expr *translate_ternary(ivl_expr_t e)
    vhdl_type boolean(VHDL_TYPE_BOOLEAN);
    test = test->cast(&boolean);
 
+   vhdl_type *rtype = vhdl_type::type_for(width, issigned);
+
+   // sv2vhdl: the support ternary takes logic3d-family branches; a boolean
+   // comparison result, bare integer, or width-mismatched branch must be
+   // brought to the result type first.
+   if (get_sv2vhdl_mode()) {
+      true_part = true_part->cast(rtype);
+      false_part = false_part->cast(rtype);
+   }
+
    vhdl_fcall *fcall =
-      new vhdl_fcall(support_function::function_name(sf),
-                     vhdl_type::type_for(width, issigned));
+      new vhdl_fcall(support_function::function_name(sf), rtype);
    fcall->add_expr(test);
    fcall->add_expr(true_part);
    fcall->add_expr(false_part);

@@ -185,6 +185,29 @@ vhdl_expr *vhdl_expr::cast(const vhdl_type *to)
       case VHDL_TYPE_LOGIC3D:
          return to_std_logic();  // logic3d is the sv2vhdl equivalent
       case VHDL_TYPE_LOGIC3D_VECTOR: {
+         int w = to->get_width();
+
+         // A boolean (comparison result in a value context): to a logic3d
+         // bit first, then widen through the scalar path below.
+         if (type_->get_name() == VHDL_TYPE_BOOLEAN)
+            return to_std_logic()->cast(to);
+
+         // A numeric_std escapee (SIGNED/UNSIGNED annotation) or a bare
+         // integer re-entering the logic3d family. The C++ annotation can LIE
+         // for l3d expressions that passed through numeric-typed paths (lpm,
+         // width-doubling multiply), so emit the overloaded to_l3d(x, w) and
+         // let VHDL overload resolution act on the expression's REAL type --
+         // the l3d overload is just a resize.
+         if (type_->get_name() == VHDL_TYPE_SIGNED
+             || type_->get_name() == VHDL_TYPE_UNSIGNED
+             || type_->get_name() == VHDL_TYPE_INTEGER) {
+            vhdl_fcall *conv = new vhdl_fcall("to_l3d",
+                                              vhdl_type::logic3d_vector(w - 1, 0));
+            conv->add_expr(this);
+            conv->add_expr(new vhdl_const_int(w));
+            return conv;
+         }
+
          // Zero-extend a single logic3d bit into a logic3d_vector of the
          // target width. Verilog widens a narrow value to the lvalue by
          // padding the MSBs with 0. Only valid when the source is a SCALAR
@@ -192,7 +215,6 @@ vhdl_expr *vhdl_expr::cast(const vhdl_type *to)
          // Round-trip via unsigned so the result is a self-ranged (w-1 downto
          // 0) value — a positional aggregate would clash with a shifted target
          // slice range: unsigned_to_l3d(Resize(l3d_to_unsigned(this), w)).
-         int w = to->get_width();
          if (w <= 1 || type_->get_width() != 1)
             return this;
          vhdl_fcall *as_u = new vhdl_fcall("l3d_to_unsigned",
@@ -380,6 +402,15 @@ vhdl_expr *vhdl_expr::to_std_logic()
    if (type_->get_name() == VHDL_TYPE_LOGIC3D) {
       // Already logic3d (the sv2vhdl equivalent of std_logic)
       return this;
+   }
+   if (get_sv2vhdl_mode()
+       && (type_->get_name() == VHDL_TYPE_STD_LOGIC
+           || type_->get_name() == VHDL_TYPE_STD_ULOGIC)) {
+      // A std_logic value (e.g. an 'x'/'z' literal from ===) meeting the
+      // logic3d family: convert losslessly.
+      vhdl_fcall *conv = new vhdl_fcall("to_logic3d", vhdl_type::logic3d());
+      conv->add_expr(this);
+      return conv;
    }
    if (type_->get_name() == VHDL_TYPE_BOOLEAN) {
       require_support_function(SF_BOOLEAN_TO_LOGIC);
