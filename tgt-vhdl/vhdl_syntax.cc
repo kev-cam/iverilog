@@ -1584,7 +1584,11 @@ void vhdl_function::emit(std::ostream &of, int level) const
 {
    newline(of, level);
    emit_comment(of, level);
-   of << "function " << name_;
+   // impure: a Verilog function may read any signal in scope, and VHDL's
+   // purity checker rejects that in a plain function ("cannot reference
+   // signal ... in pure function" -- the single-word fix flagged in the
+   // parity roadmap). Impure is always safe here.
+   of << "impure function " << name_;
    if (!scope_.get_decls().empty()) {
       // VHDL forbids an empty interface list: a zero-argument function is
       // declared without parentheses (and called without them).
@@ -1606,9 +1610,17 @@ void vhdl_function::emit(std::ostream &of, int level) const
 
 void vhdl_forward_fdecl::emit(std::ostream &of, int level) const
 {
-   of << "function " << f_->get_name() << " (";
-   emit_children<vhdl_decl>(of, f_->scope_.get_decls(), level, ";");
-   of << ") ";
+   // impure: generated function bodies read architecture signals freely.
+   // No parens for a zero-argument function (empty interface lists are
+   // illegal VHDL).
+   of << "impure function " << f_->get_name();
+   if (!f_->scope_.get_decls().empty()) {
+      of << " (";
+      emit_children<vhdl_decl>(of, f_->scope_.get_decls(), level, ";");
+      of << ") ";
+   }
+   else
+      of << " ";
    newline(of, level);
    of << "return " << f_->type_->get_string() << ";";
    newline(of, level);
