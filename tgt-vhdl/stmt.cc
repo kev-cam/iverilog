@@ -1144,8 +1144,22 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
       // Build: lhs <op> rhs
       vhdl_var_ref *lhs_read =
          make_assign_lhs(ivl_stmt_lval(stmt, 0), proc->get_scope());
-      rhs = new vhdl_binop_expr(lhs_read, binop, rhs,
-                                new vhdl_type(*lhs_read->get_type()));
+      // The implicit read joins Verilog width propagation like any operand:
+      // a scalar meeting a wider RHS (e.g. `bit |= 5'h01 & ...`) computes at
+      // the wide width and the assignment cast truncates back to the LHS.
+      // Mirrors translate_binary's operand normalization, which this
+      // hand-built binop otherwise bypasses.
+      vhdl_expr *lhs_x = lhs_read;
+      if (get_sv2vhdl_mode() && lhs_x->get_type() && rhs->get_type()) {
+         vhdl_type_name_t lt = lhs_x->get_type()->get_name();
+         vhdl_type_name_t rt = rhs->get_type()->get_name();
+         if (lt == VHDL_TYPE_LOGIC3D && rt == VHDL_TYPE_LOGIC3D_VECTOR)
+            lhs_x = lhs_x->cast(rhs->get_type());
+         else if (rt == VHDL_TYPE_LOGIC3D && lt == VHDL_TYPE_LOGIC3D_VECTOR)
+            rhs = rhs->cast(lhs_x->get_type());
+      }
+      rhs = new vhdl_binop_expr(lhs_x, binop, rhs,
+                                new vhdl_type(*lhs_x->get_type()));
    }
 
    emit_wait_for_0(proc, container, stmt, rhs);
