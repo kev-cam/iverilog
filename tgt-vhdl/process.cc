@@ -642,9 +642,22 @@ extern "C" int draw_process(ivl_process_t proc, void *)
             }
             if (!decl->has_initial()) {
                vhdl_expr *init = translate_expr(ia.value);
-               if (init) {
+               // Only hoist when the value's type/width actually matches the
+               // declaration -- a width-mismatched initial (e.g. a vector
+               // constant against a scalar decl from a forward-typedef'd
+               // signal) is a hard VHDL error at the declaration; leave those
+               // assignments in the process where normal casting applies.
+               if (init && init->get_type() && decl->get_type()
+                   && init->get_type()->get_name()
+                         == decl->get_type()->get_name()
+                   && init->get_type()->get_width()
+                         == decl->get_type()->get_width()) {
                   decl->set_initial(init);
                   g_hoisted_signals.insert(ia.sig);
+               }
+               else if (init) {
+                  all_ok = false;   // keep the initial process for this one
+                  break;
                }
             }
          }

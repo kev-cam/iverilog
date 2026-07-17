@@ -1164,6 +1164,30 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
       // target bounds must come from the DECLARATION, not lhs->get_type().
       vhdl_decl *lhs_decl = proc->get_scope()->get_decl(lhs->get_name());
 
+      // Static out-of-range ARRAY WORD write: a Verilog OOB word store is a
+      // no-op (VHDL raises a bounds error). Also give a 1-element array a
+      // word index when assigned a plain vector (x[0:0] = v).
+      if (get_sv2vhdl_mode() && lhs_decl && lhs_decl->get_type()
+          && lhs_decl->get_type()->get_name() == VHDL_TYPE_ARRAY) {
+         const int wlo = std::min(lhs_decl->get_type()->get_lsb(),
+                                  lhs_decl->get_type()->get_msb());
+         const int whi = std::max(lhs_decl->get_type()->get_lsb(),
+                                  lhs_decl->get_type()->get_msb());
+         if (lhs->get_slice() != NULL && lhs->extra_range_width() < 0) {
+            vhdl_const_int *wb =
+               dynamic_cast<vhdl_const_int*>(lhs->get_slice());
+            if (wb && (wb->get_value() < wlo || wb->get_value() > whi))
+               return;      // whole-word write out of range: lost
+         }
+         else if (lhs->get_slice() == NULL && wlo == whi
+                  && rhs->get_type()
+                  && rhs->get_type()->get_name()
+                        == VHDL_TYPE_LOGIC3D_VECTOR) {
+            // Single-element array assigned a vector: target the element
+            lhs->set_slice(new vhdl_const_int(wlo), 0);
+         }
+      }
+
       // Array-word + part-select lvalue (mem(word)(range)): clamp a static
       // OOB part against the ELEMENT type's bounds by rewriting the extra
       // range slice (the plain-vector clamp below can't see it).
@@ -2890,6 +2914,25 @@ string analog_stmt_to_str(ivl_statement_t stmt)
 // to its resolved driving value while a driverless reg retains the forced
 // value. `assign r = v` is mapped to the same machinery -- the only divergence
 // is Verilog's force-over-assign layering when both are active at once.
+// A statically out-of-range ARRAY WORD lvalue: the Verilog write is a no-op.
+static bool lval_word_statically_dead(vhdl_procedural *proc, vhdl_var_ref *lhs)
+{
+   if (!get_sv2vhdl_mode() || lhs == NULL || lhs->get_slice() == NULL)
+      return false;
+   vhdl_decl *decl = proc->get_scope()->get_decl(lhs->get_name());
+   if (!decl || !decl->get_type()
+       || decl->get_type()->get_name() != VHDL_TYPE_ARRAY)
+      return false;
+   vhdl_const_int *wb = dynamic_cast<vhdl_const_int*>(lhs->get_slice());
+   if (!wb)
+      return false;
+   const int wlo = std::min(decl->get_type()->get_lsb(),
+                            decl->get_type()->get_msb());
+   const int whi = std::max(decl->get_type()->get_lsb(),
+                            decl->get_type()->get_msb());
+   return wb->get_value() < wlo || wb->get_value() > whi;
+}
+
 static int draw_force(vhdl_procedural *proc, stmt_container *container,
                       ivl_statement_t stmt)
 {
@@ -2905,6 +2948,8 @@ static int draw_force(vhdl_procedural *proc, stmt_container *container,
    if (NULL == rhs)
       return 1;
    vhdl_var_ref *lhs = lvals.front();
+   if (lval_word_statically_dead(proc, lhs))
+      return 0;    // force to an out-of-range array word: lost
    rhs = rhs->cast(lhs->get_type());
    container->add_stmt(new vhdl_force_stmt(lhs, rhs));
    return 0;
@@ -2921,6 +2966,8 @@ static int draw_release(vhdl_procedural *proc, stmt_container *container,
             ivl_stmt_file(stmt), ivl_stmt_lineno(stmt));
       return 1;
    }
+   if (lval_word_statically_dead(proc, lvals.front()))
+      return 0;    // release of an out-of-range array word: no-op
    container->add_stmt(new vhdl_release_stmt(lvals.front()));
    return 0;
 }

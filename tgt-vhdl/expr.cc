@@ -140,8 +140,32 @@ static vhdl_var_ref *translate_signal(ivl_expr_t e)
          return NULL;
       }
 
-      vhdl_type integer(VHDL_TYPE_INTEGER);
-      ref->set_slice(vhd_off->cast(&integer));
+      vhdl_expr *ioff = index_to_integer(off, vhd_off);
+
+      // sv2vhdl: a statically out-of-range word READ is x in Verilog; a VHDL
+      // index would raise a bounds error.
+      if (get_sv2vhdl_mode()) {
+         vhdl_const_int *ci = dynamic_cast<vhdl_const_int*>(ioff);
+         if (ci) {
+            const int base = ivl_signal_array_base(sig);
+            const int cnt  = ivl_signal_array_count(sig);
+            const int lo = std::min(base, base + cnt - 1);
+            const int hi = std::max(base, base + cnt - 1);
+            if (ci->get_value() < lo || ci->get_value() > hi) {
+               delete ref;
+               int w = ivl_signal_width(sig);
+               if (w < 1) w = 1;
+               string agg = "(others => L3D_X)";
+               // Emit a qualified all-X aggregate of the element width
+               ostringstream ss;
+               ss << "logic3d_vector'(" << w - 1 << " downto 0 => L3D_X)";
+               return new vhdl_var_ref(ss.str().c_str(),
+                                       vhdl_type::logic3d_vector(w - 1, 0));
+            }
+         }
+      }
+
+      ref->set_slice(ioff);
    }
 
    return ref;
