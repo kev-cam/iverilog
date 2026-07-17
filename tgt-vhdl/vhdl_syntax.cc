@@ -710,6 +710,9 @@ void vhdl_signal_decl::emit(std::ostream &of, int level) const
          of << " := (others => L3D_0)";
       else if (tn == VHDL_TYPE_REAL)
          of << " := 0.0";   // VHDL's default is real'left (-1.7e308)
+      else if (tn == VHDL_TYPE_ARRAY && type_->get_base()
+               && type_->get_base()->get_name() == VHDL_TYPE_REAL)
+         of << " := (others => 0.0)";   // Verilog real array elements start 0
    }
 
    of << ";";
@@ -842,13 +845,21 @@ void vhdl_var_ref::emit(std::ostream &of, int level) const
 void vhdl_const_string::emit(std::ostream &of, int) const
 {
    // VHDL string literals escape an embedded double-quote by doubling it.
+   // A literal cannot contain control characters at all (a folded Verilog
+   // $display can carry a newline or a %c NUL) -- splice those in as
+   // character'val(N) concatenations so the byte survives to the output.
    of << "\"";
    for (std::string::const_iterator it = value_.begin();
         it != value_.end(); ++it) {
-      if (*it == '"')
+      const unsigned char c = *it;
+      if (c == '"')
          of << "\"\"";
+      else if (c == 0)
+         ;   // IEEE 1364: NULs in display strings are ignored
+      else if (c < 0x20 || c == 0x7f)
+         of << "\" & character'val(" << (int)c << ") & \"";
       else
-         of << *it;
+         of << c;
    }
    of << "\"";
 }

@@ -323,8 +323,8 @@ void draw_nexus(ivl_nexus_t nexus)
       }
       else if ((con = ivl_nexus_ptr_con(nexus_ptr))) {
          if (ivl_const_type(con) == IVL_VT_REAL) {
-            error("No VHDL translation for real constant (%g)",
-                  ivl_const_real(con));
+            priv->const_driver = new vhdl_const_real(ivl_const_real(con));
+            ndrivers++;
             continue;
          }
          if (ivl_const_width(con) == 1)
@@ -779,8 +779,12 @@ static void declare_one_signal(vhdl_entity *ent, ivl_signal_t sig,
       }
 
       string type_name = name + "_Type";
-      vhdl_type *base_type =
-         vhdl_type::type_for(ivl_signal_width(sig), ivl_signal_signed(sig) != 0);
+      vhdl_type *base_type;
+      if (ivl_signal_data_type(sig) == IVL_VT_REAL)
+         base_type = vhdl_type::real();   // real array: element is VHDL real
+      else
+         base_type = vhdl_type::type_for(ivl_signal_width(sig),
+                                         ivl_signal_signed(sig) != 0);
 
       int lsb = ivl_signal_array_base(sig);
       int msb = lsb + ivl_signal_array_count(sig) - 1;

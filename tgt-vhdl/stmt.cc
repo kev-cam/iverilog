@@ -109,7 +109,7 @@ static int draw_stask_display(vhdl_procedural *proc,
                   // Maybe generate another report statement
                }
                else
-                  ss << ch;
+                  ss << ch;   // NULs dropped later, by vhdl_const_string::emit
                p += 3;
             }
             else if (*p == '%' && *(++p) != '%') {
