@@ -1028,9 +1028,13 @@ public:
 
    void emit(std::ostream &of, int level) const;
    void add_sensitivity(const std::string &name);
+   // Postponed process: runs once per simulation cycle after the final delta,
+   // reading settled values -- exactly $monitor/$strobe timing.
+   void set_postponed() { postponed_ = true; }
 private:
    std::string name_;
    string_list_t sens_;
+   bool postponed_ = false;
 };
 
 

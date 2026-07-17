@@ -78,10 +78,13 @@ static char parse_octal(const char *p)
       + (*(p+2) - '0') * 1;
 }
 
-// Generate VHDL report statements for Verilog $display/$write
-static int draw_stask_display(vhdl_procedural *proc,
-                              stmt_container *container,
-                              ivl_statement_t stmt)
+// Build the concatenated display text for a $display-family statement's
+// parameters. `proc' may be NULL when building the body of a companion
+// (postponed) $monitor/$strobe process -- no wait-for-0 statements are needed
+// there, and none can be emitted. Returns NULL on translation failure.
+static vhdl_expr *build_display_text(vhdl_procedural *proc,
+                                     stmt_container *container,
+                                     ivl_statement_t stmt)
 {
    vhdl_binop_expr *text = new vhdl_binop_expr(VHDL_BINOP_CONCAT,
                                                vhdl_type::string());
@@ -152,7 +155,7 @@ static int draw_stask_display(vhdl_procedural *proc,
                      assert(netp);
                      vhdl_expr *base = translate_expr(netp);
                      if (NULL == base)
-                        return 1;
+                        return NULL;
                      emit_wait_for_0(proc, container, stmt, base);
                      vhdl_type itype(VHDL_TYPE_INTEGER);
                      vhdl_fcall *f = new vhdl_fcall("sv_tstr",
@@ -174,7 +177,7 @@ static int draw_stask_display(vhdl_procedural *proc,
                      assert(netp);
                      vhdl_expr *base = translate_expr(netp);
                      if (NULL == base)
-                        return 1;
+                        return NULL;
                      emit_wait_for_0(proc, container, stmt, base);
                      ostringstream fs;
                      fs << '%';
@@ -200,7 +203,7 @@ static int draw_stask_display(vhdl_procedural *proc,
 
                      vhdl_expr *base = translate_expr(netp);
                      if (NULL == base)
-                        return 1;
+                        return NULL;
 
                      emit_wait_for_0(proc, container, stmt, base);
 
@@ -311,7 +314,7 @@ static int draw_stask_display(vhdl_procedural *proc,
 
                      vhdl_expr *base = translate_expr(netp);
                      if (NULL == base)
-                        return 1;
+                        return NULL;
 
                      emit_wait_for_0(proc, container, stmt, base);
 
@@ -410,7 +413,7 @@ static int draw_stask_display(vhdl_procedural *proc,
       else {
          vhdl_expr *base = translate_expr(net);
          if (NULL == base)
-            return 1;
+            return NULL;
 
          emit_wait_for_0(proc, container, stmt, base);
 
@@ -465,7 +468,135 @@ static int draw_stask_display(vhdl_procedural *proc,
    if (count == 0)
       text->add_expr(new vhdl_const_string(""));
 
+   return text;
+}
+
+// Generate VHDL report statements for Verilog $display/$write
+static int draw_stask_display(vhdl_procedural *proc,
+                              stmt_container *container,
+                              ivl_statement_t stmt)
+{
+   vhdl_expr *text = build_display_text(proc, container, stmt);
+   if (NULL == text)
+      return 1;
    container->add_stmt(new vhdl_report_stmt(text));
+   return 0;
+}
+
+// $monitor / $strobe: both print at the END of a time step, reading settled
+// values -- exactly a POSTPONED process. Each statement gets a companion
+// postponed process holding its (re-evaluated) display text:
+//
+//  * $monitor arms its companion via an architecture-level integer signal
+//    (sv_monitor_arm <= K); the companion is sensitive to the arm and to
+//    every signal the text reads, and prints when armed -- once per settled
+//    step, starting immediately on arming. A later $monitor re-arms a
+//    different id, disarming this one (Verilog: one active monitor).
+//    $monitoroff arms id 0; $monitoron restores the last armed id.
+//  * $strobe bumps a per-statement request counter; the companion prints
+//    (request - serviced) times at the end of that step.
+static int g_monitor_count = 0;
+
+static int draw_stask_monitor(vhdl_procedural *proc,
+                              stmt_container *container,
+                              ivl_statement_t stmt, bool is_monitor)
+{
+   vhdl_entity *ent = get_active_entity();
+   if (NULL == ent) {
+      error("$monitor/$strobe outside an entity context at %s:%d",
+            ivl_stmt_file(stmt), ivl_stmt_lineno(stmt));
+      return 1;
+   }
+   vhdl_arch *arch = ent->get_arch();
+   vhdl_scope *ascope = arch->get_scope();
+   const int id = ++g_monitor_count;
+
+   ostringstream pname;
+   pname << (is_monitor ? "sv_monitor_" : "sv_strobe_") << id;
+   vhdl_process *mon = new vhdl_process(pname.str().c_str());
+   mon->set_postponed();
+
+   vhdl_expr *text = build_display_text(NULL, mon->get_container(), stmt);
+   if (NULL == text)
+      return 1;
+
+   if (is_monitor) {
+      if (!ascope->have_declared("sv_monitor_arm")) {
+         vhdl_signal_decl *d =
+            new vhdl_signal_decl("sv_monitor_arm", vhdl_type::integer());
+         d->set_initial(new vhdl_const_int(0));
+         ascope->add_decl(d);
+         vhdl_signal_decl *l =
+            new vhdl_signal_decl("sv_monitor_last", vhdl_type::integer());
+         l->set_initial(new vhdl_const_int(0));
+         ascope->add_decl(l);
+      }
+      container->add_stmt(new vhdl_nbassign_stmt(
+         new vhdl_var_ref("sv_monitor_arm", vhdl_type::integer()),
+         new vhdl_const_int(id)));
+      container->add_stmt(new vhdl_nbassign_stmt(
+         new vhdl_var_ref("sv_monitor_last", vhdl_type::integer()),
+         new vhdl_const_int(id)));
+
+      vhdl_binop_expr *armed = new vhdl_binop_expr(
+         new vhdl_var_ref("sv_monitor_arm", vhdl_type::integer()),
+         VHDL_BINOP_EQ, new vhdl_const_int(id), vhdl_type::boolean());
+      vhdl_if_stmt *iff = new vhdl_if_stmt(armed);
+      iff->get_then_container()->add_stmt(new vhdl_report_stmt(text));
+      mon->get_container()->add_stmt(iff);
+      mon->add_sensitivity("sv_monitor_arm");
+   }
+   else {
+      ostringstream req;
+      req << "sv_strobe_req_" << id;
+      vhdl_signal_decl *d =
+         new vhdl_signal_decl(req.str(), vhdl_type::integer());
+      d->set_initial(new vhdl_const_int(0));
+      ascope->add_decl(d);
+      container->add_stmt(new vhdl_nbassign_stmt(
+         new vhdl_var_ref(req.str().c_str(), vhdl_type::integer()),
+         new vhdl_binop_expr(
+            new vhdl_var_ref(req.str().c_str(), vhdl_type::integer()),
+            VHDL_BINOP_ADD, new vhdl_const_int(1), vhdl_type::integer())));
+
+      // variable serviced : integer := 0;  print (req - serviced) times
+      vhdl_var_decl *sv =
+         new vhdl_var_decl("serviced", vhdl_type::integer());
+      sv->set_initial(new vhdl_const_int(0));
+      mon->get_scope()->add_decl(sv);
+
+      vhdl_for_stmt *loop = new vhdl_for_stmt("P", new vhdl_const_int(1),
+         new vhdl_binop_expr(
+            new vhdl_var_ref(req.str().c_str(), vhdl_type::integer()),
+            VHDL_BINOP_SUB,
+            new vhdl_var_ref("serviced", vhdl_type::integer()),
+            vhdl_type::integer()));
+      loop->get_container()->add_stmt(new vhdl_report_stmt(text));
+      mon->get_container()->add_stmt(loop);
+      mon->get_container()->add_stmt(new vhdl_assign_stmt(
+         new vhdl_var_ref("serviced", vhdl_type::integer()),
+         new vhdl_var_ref(req.str().c_str(), vhdl_type::integer())));
+      mon->add_sensitivity(req.str());
+   }
+
+   // Sensitivity: every signal the printed text reads (monitor re-prints on
+   // any operand change). find_vars over the built body collects them.
+   if (is_monitor) {
+      vhdl_var_set_t rd, wr;
+      mon->get_container()->find_vars(rd, wr);
+      set<string> seen;
+      seen.insert("sv_monitor_arm");
+      for (vhdl_var_set_t::const_iterator it = rd.begin();
+           it != rd.end(); ++it) {
+         const string &nm = (*it)->get_name();
+         // Only architecture-visible signals can be in a sensitivity list.
+         vhdl_decl *d = ascope->get_decl(nm);
+         if (d && seen.insert(nm).second)
+            mon->add_sensitivity(nm);
+      }
+   }
+
+   arch->add_stmt(mon);
    return 0;
 }
 
@@ -665,6 +796,22 @@ static int draw_stask(vhdl_procedural *proc, stmt_container *container,
       return draw_stask_display(proc, container, stmt);
    else if (strcmp(name, "$write") == 0)
       return draw_stask_display(proc, container, stmt);
+   else if (strcmp(name, "$monitor") == 0)
+      return draw_stask_monitor(proc, container, stmt, true);
+   else if (strcmp(name, "$strobe") == 0)
+      return draw_stask_monitor(proc, container, stmt, false);
+   else if (strcmp(name, "$monitoroff") == 0) {
+      container->add_stmt(new vhdl_nbassign_stmt(
+         new vhdl_var_ref("sv_monitor_arm", vhdl_type::integer()),
+         new vhdl_const_int(0)));
+      return 0;
+   }
+   else if (strcmp(name, "$monitoron") == 0) {
+      container->add_stmt(new vhdl_nbassign_stmt(
+         new vhdl_var_ref("sv_monitor_arm", vhdl_type::integer()),
+         new vhdl_var_ref("sv_monitor_last", vhdl_type::integer())));
+      return 0;
+   }
    else if (strcmp(name, "$finish") == 0)
       return draw_stask_finish(proc, container, stmt);
    else if (strcmp(name, "$set_val") == 0)
@@ -892,6 +1039,11 @@ static void emit_wait_for_0(vhdl_procedural *proc,
                             ivl_statement_t stmt,
                             vhdl_expr *expr)
 {
+   // A NULL proc means we are building a companion (postponed) process for
+   // $monitor/$strobe, which reads settled values by construction.
+   if (proc == NULL)
+      return;
+
    vhdl_var_set_t read;
    expr->find_vars(read);
 

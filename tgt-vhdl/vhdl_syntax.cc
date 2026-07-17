@@ -337,6 +337,8 @@ void vhdl_process::emit(std::ostream &of, int level) const
    emit_comment(of, level);
    if (! name_.empty())
       of << name_ << ": ";
+   if (postponed_)
+      of << "postponed ";
    of << "process ";
 
    int num_sens = sens_.size();
