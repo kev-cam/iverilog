@@ -35,6 +35,9 @@ ivl_design_t get_vhdl_design();
 vhdl_type *vhdl_type_for_signal(ivl_signal_t sig);
 // Declare a package/$unit-scope signal in the active entity on first use.
 void ensure_signal_declared(ivl_signal_t sig);
+// Emit a function scope's VHDL function into a specific entity (used to draw
+// package functions on demand into whichever entity first calls them).
+int draw_function_in_entity(ivl_scope_t scope, vhdl_entity *ent);
 vhdl_var_ref *nexus_to_var_ref(vhdl_scope *arch_scope, ivl_nexus_t nexus);
 // Convert a bit/part/word index expression to a VHDL integer honouring the
 // VERILOG signedness of the index (a signed -1 index must become -1, not

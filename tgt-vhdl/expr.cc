@@ -934,12 +934,16 @@ static vhdl_expr *translate_ufunc(ivl_expr_t e)
 {
    ivl_scope_t defscope = ivl_expr_def(e);
    ivl_scope_t parentscope = ivl_scope_parent(defscope);
-   assert(ivl_scope_type(parentscope) == IVL_SCT_MODULE);
 
-   // A function is always declared in a module, which should have
-   // a corresponding entity by this point: so we can get type
-   // information, etc. from the declaration
+   // Normally the function's parent module already has an entity holding the
+   // emitted function. A PACKAGE (or $unit) function has no entity -- draw it
+   // on demand into the entity that is calling it.
    vhdl_entity *parent_ent = find_entity(parentscope);
+   if (parent_ent == NULL) {
+      parent_ent = get_active_entity();
+      if (parent_ent != NULL)
+         draw_function_in_entity(defscope, parent_ent);
+   }
    assert(parent_ent);
 
    const char *funcname = ivl_scope_tname(defscope);

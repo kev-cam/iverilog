@@ -1584,9 +1584,16 @@ void vhdl_function::emit(std::ostream &of, int level) const
 {
    newline(of, level);
    emit_comment(of, level);
-   of << "function " << name_ << " (";
-   emit_children<vhdl_decl>(of, scope_.get_decls(), level, ";");
-   of << ") ";
+   of << "function " << name_;
+   if (!scope_.get_decls().empty()) {
+      // VHDL forbids an empty interface list: a zero-argument function is
+      // declared without parentheses (and called without them).
+      of << " (";
+      emit_children<vhdl_decl>(of, scope_.get_decls(), level, ";");
+      of << ") ";
+   }
+   else
+      of << " ";
    newline(of, level);
    of << "return " << type_->get_string() << " is";
    emit_children<vhdl_decl>(of, variables_.get_decls(), level);

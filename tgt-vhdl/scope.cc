@@ -646,7 +646,8 @@ void ensure_signal_declared(ivl_signal_t sig)
    // scopes can also carry locals the walk missed.
    if (st != IVL_SCT_PACKAGE && st != IVL_SCT_MODULE
        && st != IVL_SCT_BEGIN && st != IVL_SCT_FORK
-       && st != IVL_SCT_GENERATE)
+       && st != IVL_SCT_GENERATE && st != IVL_SCT_TASK
+       && st != IVL_SCT_FUNCTION)
       return;
 
    vhdl_entity *ent = get_active_entity();
@@ -1165,20 +1166,19 @@ static void port_map(ivl_scope_t scope, const vhdl_entity *parent,
 /*
  * Create a VHDL function from a Verilog function definition.
  */
-static int draw_function(ivl_scope_t scope, ivl_scope_t parent)
+int draw_function_in_entity(ivl_scope_t scope, vhdl_entity *ent)
 {
    assert(ivl_scope_type(scope) == IVL_SCT_FUNCTION);
 
    debug_msg("Generating function %s (%s)", ivl_scope_tname(scope),
              ivl_scope_name(scope));
 
-   // Find the containing entity
-   vhdl_entity *ent = find_entity(parent);
-   assert(ent);
-
    const char *funcname = ivl_scope_tname(scope);
 
-   assert(!ent->get_arch()->get_scope()->have_declared(funcname));
+   // Already emitted here (e.g. a package function drawn on demand by an
+   // earlier call site in this entity)
+   if (ent->get_arch()->get_scope()->have_declared(funcname))
+      return 0;
 
    // The return type is worked out from the output port
    vhdl_function *func = new vhdl_function(funcname, NULL);
@@ -1217,8 +1217,10 @@ static int draw_function(ivl_scope_t scope, ivl_scope_t parent)
          assert(false);
       }
 
-      remember_signal(sig, func->get_scope());
-      rename_signal(sig, signame);
+      if (!seen_signal_before(sig)) {
+         remember_signal(sig, func->get_scope());
+         rename_signal(sig, signame);
+      }
    }
 
    int nsigs = ivl_scope_sigs(scope);
@@ -1232,8 +1234,10 @@ static int draw_function(ivl_scope_t scope, ivl_scope_t parent)
          func->get_scope()->add_decl(
             new vhdl_var_decl(signame, sigtype));
 
-         remember_signal(sig, func->get_scope());
-         rename_signal(sig, signame);
+         if (!seen_signal_before(sig)) {
+            remember_signal(sig, func->get_scope());
+            rename_signal(sig, signame);
+         }
       }
    }
 
@@ -1264,6 +1268,13 @@ static int draw_function(ivl_scope_t scope, ivl_scope_t parent)
 /*
  * Create the signals necessary to expand this task later.
  */
+static int draw_function(ivl_scope_t scope, ivl_scope_t parent)
+{
+   vhdl_entity *ent = find_entity(parent);
+   assert(ent);
+   return draw_function_in_entity(scope, ent);
+}
+
 static int draw_task(ivl_scope_t scope, ivl_scope_t parent)
 {
    assert(ivl_scope_type(scope) == IVL_SCT_TASK);
