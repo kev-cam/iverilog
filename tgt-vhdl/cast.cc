@@ -50,6 +50,91 @@ vhdl_expr *vhdl_expr::cast(const vhdl_type *to)
          return resize(to->get_width());
    }
 
+   // Conversions FROM real (Verilog real in a vector/integer/boolean context)
+   if (type_->get_name() == VHDL_TYPE_REAL) {
+      switch (to->get_name()) {
+      case VHDL_TYPE_INTEGER: {
+         // VHDL's integer(x) rounds to nearest, matching Verilog's implicit
+         // real->integer conversion ($rtoi, which truncates, is routed
+         // separately through sv_math_pkg.rtoi).
+         vhdl_fcall *f = new vhdl_fcall("integer", vhdl_type::integer());
+         f->add_expr(this);
+         return f;
+      }
+      case VHDL_TYPE_BOOLEAN:
+         return new vhdl_binop_expr(this, VHDL_BINOP_NEQ,
+                                    new vhdl_const_real(0.0),
+                                    vhdl_type::boolean());
+      case VHDL_TYPE_LOGIC3D_VECTOR: {
+         vhdl_fcall *f = new vhdl_fcall("real_to_l3d",
+            vhdl_type::logic3d_vector(to->get_width() - 1, 0));
+         f->add_expr(this);
+         f->add_expr(new vhdl_const_int(to->get_width()));
+         return f;
+      }
+      case VHDL_TYPE_LOGIC3D: {
+         vhdl_fcall *f = new vhdl_fcall("real_to_l3d1", vhdl_type::logic3d());
+         f->add_expr(this);
+         return f;
+      }
+      case VHDL_TYPE_SIGNED:
+      case VHDL_TYPE_UNSIGNED: {
+         vhdl_fcall *ti = new vhdl_fcall("integer", vhdl_type::integer());
+         ti->add_expr(this);
+         const char *fn = to->get_name() == VHDL_TYPE_SIGNED
+            ? "to_signed" : "to_unsigned";
+         vhdl_fcall *tv = new vhdl_fcall(fn,
+            new vhdl_type(to->get_name(), to->get_width() - 1, 0));
+         tv->add_expr(ti);
+         tv->add_expr(new vhdl_const_int(to->get_width()));
+         return tv;
+      }
+      default:
+         cerr << "Warning: no cast from real to "
+              << to->get_string() << endl;
+         return this;
+      }
+   }
+
+   // Conversions TO real
+   if (to->get_name() == VHDL_TYPE_REAL) {
+      switch (type_->get_name()) {
+      case VHDL_TYPE_INTEGER: {
+         vhdl_fcall *f = new vhdl_fcall("real", vhdl_type::real());
+         f->add_expr(this);
+         return f;
+      }
+      case VHDL_TYPE_LOGIC3D_VECTOR: {
+         // Unsigned interpretation; a Verilog-signed source goes through
+         // l3d_to_real_s at the 'r'-cast site where signedness is known.
+         vhdl_fcall *f = new vhdl_fcall("l3d_to_real", vhdl_type::real());
+         f->add_expr(this);
+         return f;
+      }
+      case VHDL_TYPE_LOGIC3D: {
+         vhdl_fcall *f = new vhdl_fcall("l3d_to_real", vhdl_type::real());
+         f->add_expr(this);
+         return f;
+      }
+      case VHDL_TYPE_SIGNED:
+      case VHDL_TYPE_UNSIGNED: {
+         vhdl_fcall *ti = new vhdl_fcall("to_integer", vhdl_type::integer());
+         ti->add_expr(this);
+         vhdl_fcall *f = new vhdl_fcall("real", vhdl_type::real());
+         f->add_expr(ti);
+         return f;
+      }
+      case VHDL_TYPE_BOOLEAN: {
+         cerr << "Warning: no cast from boolean to real" << endl;
+         return this;
+      }
+      default:
+         cerr << "Warning: no cast from " << type_->get_string()
+              << " to real" << endl;
+         return this;
+      }
+   }
+
    // Cross-type conversions between logic3d and std_logic families
    if (type_->get_name() == VHDL_TYPE_LOGIC3D_VECTOR
        && (to->get_name() == VHDL_TYPE_UNSIGNED

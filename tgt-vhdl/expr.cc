@@ -194,6 +194,10 @@ static vhdl_expr *translate_unary(ivl_expr_t e)
       return new vhdl_unaryop_expr
          (VHDL_UNARYOP_NOT, operand, new vhdl_type(*operand->get_type()));
    case '-':
+      if (operand->get_type()
+          && operand->get_type()->get_name() == VHDL_TYPE_REAL)
+         return new vhdl_unaryop_expr
+            (VHDL_UNARYOP_NEG, operand, vhdl_type::real());
       operand = change_signedness(operand, true);
       return new vhdl_unaryop_expr
          (VHDL_UNARYOP_NEG, operand, new vhdl_type(*operand->get_type()));
@@ -209,9 +213,44 @@ static vhdl_expr *translate_unary(ivl_expr_t e)
       return translate_reduction(SF_REDUCE_XOR, false, operand);
    case 'X':   // XNOR
       return translate_reduction(SF_REDUCE_XNOR, false, operand);
-   case '2':   // Cast to bool (4-state -> 2-state)
+   case 'r': {  // Cast to real
+      // A vector operand needs its Verilog signedness honoured (the VHDL type
+      // is logic3d_vector either way, so the generic cast can't know it).
+      vhdl_type_name_t tn = operand->get_type()
+         ? operand->get_type()->get_name() : VHDL_TYPE_INTEGER;
+      if (tn == VHDL_TYPE_LOGIC3D_VECTOR) {
+         const char *fn = ivl_expr_signed(ivl_expr_oper1(e))
+            ? "l3d_to_real_s" : "l3d_to_real";
+         vhdl_fcall *f = new vhdl_fcall(fn, vhdl_type::real());
+         f->add_expr(operand);
+         return f;
+      }
+      return operand->cast(vhdl_type::real());
+   }
+   case '2':   // Cast to bool = 2-STATE VECTOR (iverilog vec2), NOT truthiness
    case 'v':   // Cast to vec4
-      // In VHDL these are no-ops — just pass through the operand
+      if (operand->get_type()
+          && operand->get_type()->get_name() == VHDL_TYPE_REAL) {
+         // real -> vector: round to nearest (Verilog implicit conversion
+         // semantics), then two's-complement at the expression width.
+         vhdl_fcall *f = new vhdl_fcall("real_to_l3d",
+            vhdl_type::logic3d_vector(ivl_expr_width(e) - 1, 0));
+         f->add_expr(operand);
+         f->add_expr(new vhdl_const_int(ivl_expr_width(e)));
+         return f;
+      }
+      if (opcode == '2' && operand->get_type()) {
+         // 4-state -> 2-state: X/Z/W/U coerce to 0 (a 2-state bit/int target
+         // cannot hold them). 'v' (to vec4) stays a pass-through.
+         vhdl_type_name_t tn = operand->get_type()->get_name();
+         if (tn == VHDL_TYPE_LOGIC3D_VECTOR || tn == VHDL_TYPE_LOGIC3D) {
+            vhdl_fcall *f = new vhdl_fcall("l3d_to_2state",
+                                           new vhdl_type(*operand->get_type()));
+            f->add_expr(operand);
+            return f;
+         }
+      }
+      // Otherwise a no-op in VHDL — just pass through the operand
       return operand;
    default:
       error("No translation for unary opcode '%c'\n",
@@ -415,6 +454,47 @@ static vhdl_expr *translate_binary(ivl_expr_t e)
          vhdl_fcall *f = new vhdl_fcall(vf, new vhdl_type(*lhs->get_type()));
          f->add_expr(lhs); f->add_expr(rhs);
          return f;
+      }
+   }
+
+   // Real operands: VHDL's real has native arithmetic and ordering, so emit
+   // plain operators. iverilog promotes mixed int/real to real with explicit
+   // 'r' casts, but an untyped integer constant can still appear on one side;
+   // cast it so both operands are real.
+   {
+      bool lreal = lhs->get_type()
+         && lhs->get_type()->get_name() == VHDL_TYPE_REAL;
+      bool rreal = rhs->get_type()
+         && rhs->get_type()->get_name() == VHDL_TYPE_REAL;
+      if (lreal || rreal) {
+         vhdl_type rt(VHDL_TYPE_REAL);
+         if (!lreal) lhs = lhs->cast(&rt);
+         if (!rreal) rhs = rhs->cast(&rt);
+         vhdl_binop_t op;
+         bool is_cmp = false;
+         switch (ivl_expr_opcode(e)) {
+         case '+': op = VHDL_BINOP_ADD;  break;
+         case '-': op = VHDL_BINOP_SUB;  break;
+         case '*': op = VHDL_BINOP_MULT; break;
+         case '/': op = VHDL_BINOP_DIV;  break;
+         case 'e': case 'E': op = VHDL_BINOP_EQ;  is_cmp = true; break;
+         case 'n': case 'N': op = VHDL_BINOP_NEQ; is_cmp = true; break;
+         case '<': op = VHDL_BINOP_LT;   is_cmp = true; break;
+         case '>': op = VHDL_BINOP_GT;   is_cmp = true; break;
+         case 'L': op = VHDL_BINOP_LEQ;  is_cmp = true; break;
+         case 'G': op = VHDL_BINOP_GEQ;  is_cmp = true; break;
+         case 'p': {  // ** : C pow() semantics (sv_math_pkg VHPIDIRECT wrapper)
+            vhdl_fcall *f = new vhdl_fcall("pow", vhdl_type::real());
+            f->add_expr(lhs); f->add_expr(rhs);
+            return f;
+         }
+         default:
+            error("No VHDL translation for real binary opcode '%c' at %s:%d",
+                  ivl_expr_opcode(e), ivl_expr_file(e), ivl_expr_lineno(e));
+            return NULL;
+         }
+         return new vhdl_binop_expr(lhs, op, rhs,
+            is_cmp ? vhdl_type::boolean() : vhdl_type::real());
       }
    }
 
@@ -666,8 +746,14 @@ static vhdl_expr *translate_ufunc(ivl_expr_t e)
 
    const char *funcname = ivl_scope_tname(defscope);
 
-   const vhdl_type *rettype =
-      vhdl_type::type_for(ivl_expr_width(e), ivl_expr_signed(e) != 0);
+   // The result type must track the function's declared return type: a real
+   // function's width-based type would be logic3d, and every caller would then
+   // wrap the call in a bogus l3d_to_real.
+   const vhdl_type *rettype;
+   if (ivl_expr_value(e) == IVL_VT_REAL)
+      rettype = vhdl_type::real();
+   else
+      rettype = vhdl_type::type_for(ivl_expr_width(e), ivl_expr_signed(e) != 0);
    vhdl_fcall *fcall = new vhdl_fcall(funcname, rettype);
 
    int nparams = ivl_expr_parms(e);
@@ -681,9 +767,7 @@ static vhdl_expr *translate_ufunc(ivl_expr_t e)
       // Ensure the parameter has the correct VHDL type
       // Parameter number is i + 1 since 0th parameter is return value
       ivl_signal_t param_sig = ivl_scope_port(defscope, i + 1);
-      vhdl_type *param_type =
-         vhdl_type::type_for(ivl_signal_width(param_sig),
-                             ivl_signal_signed(param_sig) != 0);
+      vhdl_type *param_type = vhdl_type_for_signal(param_sig);
 
       fcall->add_expr(param->cast(param_type));
       delete param_type;
@@ -984,7 +1068,88 @@ vhdl_expr *translate_sfunc(ivl_expr_t e)
       l3->add_expr(tu);
       return l3;
    }
+   else if (strcmp(name, "$realtime") == 0) {
+      // $realtime: simulation time scaled to the scope's units, KEEPING the
+      // fractional part. Count ticks as an integer (exact), convert to real,
+      // then divide by ticks-per-unit (10^(units - precision)).
+      const int prec = ivl_design_time_precision(get_vhdl_design());
+      double tpu = 1.0;
+      for (int k = 0; k < active_time_units() - prec; k++)
+         tpu *= 10.0;
+      string ticks = "real((now / (" + tick_literal() + ")))";
+      vhdl_expr *tv = new vhdl_var_ref(ticks.c_str(), vhdl_type::real());
+      if (tpu == 1.0)
+         return tv;
+      return new vhdl_binop_expr(tv, VHDL_BINOP_DIV,
+                                 new vhdl_const_real(tpu), vhdl_type::real());
+   }
+   else if (strcmp(name, "$itor") == 0) {
+      vhdl_expr *arg = translate_expr(ivl_expr_parm(e, 0));
+      if (NULL == arg)
+         return NULL;
+      if (arg->get_type()
+          && arg->get_type()->get_name() == VHDL_TYPE_LOGIC3D_VECTOR) {
+         const char *fn = ivl_expr_signed(ivl_expr_parm(e, 0))
+            ? "l3d_to_real_s" : "l3d_to_real";
+         vhdl_fcall *f = new vhdl_fcall(fn, vhdl_type::real());
+         f->add_expr(arg);
+         return f;
+      }
+      return arg->cast(vhdl_type::real());
+   }
+   else if (strcmp(name, "$rtoi") == 0) {
+      // Truncating conversion (C semantics via the sv_math_pkg wrapper),
+      // wrapped back up at the expression width.
+      vhdl_expr *arg = translate_expr(ivl_expr_parm(e, 0));
+      if (NULL == arg)
+         return NULL;
+      vhdl_type rt(VHDL_TYPE_REAL);
+      vhdl_fcall *f = new vhdl_fcall("rtoi", vhdl_type::integer());
+      f->add_expr(arg->cast(&rt));
+      const int w = ivl_expr_width(e);
+      if (w <= 1)
+         return f;
+      vhdl_fcall *ts = new vhdl_fcall("to_signed", vhdl_type::nsigned(w));
+      ts->add_expr(f);
+      ts->add_expr(new vhdl_const_int(w));
+      vhdl_fcall *tu = new vhdl_fcall("unsigned", vhdl_type::nunsigned(w));
+      tu->add_expr(ts);
+      vhdl_fcall *l3 = new vhdl_fcall("unsigned_to_l3d",
+                                      vhdl_type::logic3d_vector(w - 1, 0));
+      l3->add_expr(tu);
+      return l3;
+   }
    else {
+      // Verilog-2005 real math functions -> the same-named sv_math_pkg
+      // VHPIDIRECT wrappers (C library semantics).
+      static const char *const math1[] = {
+         "sqrt", "ln", "log10", "exp", "ceil", "floor", "sin", "cos", "tan",
+         "asin", "acos", "atan", "sinh", "cosh", "tanh", "asinh", "acosh",
+         "atanh", 0 };
+      static const char *const math2[] = { "pow", "atan2", "hypot", 0 };
+      vhdl_type rt(VHDL_TYPE_REAL);
+      if (name[0] == '$') {
+         for (int i = 0; math1[i]; i++) {
+            if (strcmp(name + 1, math1[i]) == 0 && ivl_expr_parms(e) >= 1) {
+               vhdl_expr *a = translate_expr(ivl_expr_parm(e, 0));
+               if (NULL == a) return NULL;
+               vhdl_fcall *f = new vhdl_fcall(math1[i], vhdl_type::real());
+               f->add_expr(a->cast(&rt));
+               return f;
+            }
+         }
+         for (int i = 0; math2[i]; i++) {
+            if (strcmp(name + 1, math2[i]) == 0 && ivl_expr_parms(e) >= 2) {
+               vhdl_expr *a = translate_expr(ivl_expr_parm(e, 0));
+               vhdl_expr *b = translate_expr(ivl_expr_parm(e, 1));
+               if (NULL == a || NULL == b) return NULL;
+               vhdl_fcall *f = new vhdl_fcall(math2[i], vhdl_type::real());
+               f->add_expr(a->cast(&rt));
+               f->add_expr(b->cast(&rt));
+               return f;
+            }
+         }
+      }
       error("No translation for system function %s", name);
       return NULL;
    }
@@ -1024,9 +1189,7 @@ vhdl_expr *translate_expr(ivl_expr_t e)
    case IVL_EX_DELAY:
       return translate_delay(e);
    case IVL_EX_REALNUM:
-      error("No VHDL translation for real expression at %s:%d",
-            ivl_expr_file(e), ivl_expr_lineno(e));
-      return NULL;
+      return new vhdl_const_real(ivl_expr_dvalue(e));
    default:
       error("No VHDL translation for expression at %s:%d (type = %d)",
             ivl_expr_file(e), ivl_expr_lineno(e), type);

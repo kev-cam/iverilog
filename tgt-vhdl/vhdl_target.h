@@ -29,6 +29,10 @@ std::string analog_expr_to_str(ivl_expr_t expr);
 std::string analog_stmt_to_str(ivl_statement_t stmt);
 
 ivl_design_t get_vhdl_design();
+// The VHDL type for a signal: real for IVL_VT_REAL, else width/sign-based.
+// Every signal/parameter/local declaration site must use this (not raw
+// vhdl_type::type_for) or real-typed locals silently become logic3d.
+vhdl_type *vhdl_type_for_signal(ivl_signal_t sig);
 vhdl_var_ref *nexus_to_var_ref(vhdl_scope *arch_scope, ivl_nexus_t nexus);
 vhdl_var_ref* readable_ref(vhdl_scope* scope, ivl_nexus_t nex);
 std::string make_safe_name(ivl_signal_t sig);

@@ -628,6 +628,14 @@ static string genvar_unique_suffix(ivl_scope_t scope)
 }
 
 // Declare a single signal in a scope
+vhdl_type *vhdl_type_for_signal(ivl_signal_t sig)
+{
+   if (ivl_signal_data_type(sig) == IVL_VT_REAL)
+      return vhdl_type::real();
+   return vhdl_type::type_for(ivl_signal_width(sig),
+                              ivl_signal_signed(sig) != 0);
+}
+
 // Does anything inside sig's OWN module drive its (inout-port) net? nvc's inout
 // ports read their own default rather than the externally-driven value, so a
 // read-only inout Verilog port must be declared `in` to see the connected
@@ -783,6 +791,11 @@ static void declare_one_signal(vhdl_entity *ent, ivl_signal_t sig,
       ent->get_arch()->get_scope()->add_decl(array_decl);
 
       sig_type = new vhdl_type(*array_type);
+   }
+   else if (ivl_signal_data_type(sig) == IVL_VT_REAL) {
+      // Verilog real/realtime -> VHDL real. Width-based type_for would see
+      // width 1 and pick logic3d.
+      sig_type = vhdl_type::real();
    }
    else {
       sig_type = vhdl_type::type_for(ivl_signal_width(sig),
@@ -1102,9 +1115,7 @@ static int draw_function(ivl_scope_t scope, ivl_scope_t parent)
    for (int i = 0; i < nports; i++) {
       ivl_signal_t sig = ivl_scope_port(scope, i);
 
-      const vhdl_type *sigtype =
-         vhdl_type::type_for(ivl_signal_width(sig),
-                             ivl_signal_signed(sig) != 0);
+      const vhdl_type *sigtype = vhdl_type_for_signal(sig);
 
       string signame(make_safe_name(sig));
 
@@ -1134,10 +1145,7 @@ static int draw_function(ivl_scope_t scope, ivl_scope_t parent)
       ivl_signal_t sig = ivl_scope_sig(scope, i);
 
       if (ivl_signal_port(sig) == IVL_SIP_NONE) {
-         const vhdl_type *sigtype =
-            vhdl_type::type_for(
-               ivl_signal_width(sig),
-               ivl_signal_signed(sig) != 0);
+         const vhdl_type *sigtype = vhdl_type_for_signal(sig);
 
          string signame(make_safe_name(sig));
          func->get_scope()->add_decl(
@@ -1188,9 +1196,7 @@ static int draw_task(ivl_scope_t scope, ivl_scope_t parent)
    int nsigs = ivl_scope_sigs(scope);
    for (int i = 0; i < nsigs; i++) {
       ivl_signal_t sig = ivl_scope_sig(scope, i);
-      const vhdl_type *sigtype =
-         vhdl_type::type_for(ivl_signal_width(sig),
-                             ivl_signal_signed(sig) != 0);
+      const vhdl_type *sigtype = vhdl_type_for_signal(sig);
 
       string signame(make_safe_name(sig));
 
@@ -1444,12 +1450,8 @@ extern "C" int draw_constant_drivers(ivl_scope_t scope, void *)
                for (list<ivl_signal_t>::const_iterator it = sn->connect.begin();
                     it != sn->connect.end();
                     ++it) {
-                  const vhdl_type* rtype =
-                     vhdl_type::type_for(ivl_signal_width(sn->sig),
-                                         ivl_signal_signed(sn->sig));
-                  const vhdl_type* ltype =
-                     vhdl_type::type_for(ivl_signal_width(*it),
-                                         ivl_signal_signed(*it));
+                  const vhdl_type* rtype = vhdl_type_for_signal(sn->sig);
+                  const vhdl_type* ltype = vhdl_type_for_signal(*it);
 
                   if (priv->has_inout) {
                      // Bidirectional short: the two signals are the same net,

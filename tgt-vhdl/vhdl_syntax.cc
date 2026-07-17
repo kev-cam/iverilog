@@ -24,6 +24,7 @@
 
 #include <cassert>
 #include <cstring>
+#include <cmath>
 #include <iostream>
 #include <typeinfo>
 #include <algorithm>
@@ -707,6 +708,8 @@ void vhdl_signal_decl::emit(std::ostream &of, int level) const
          of << " := L3D_0";
       else if (tn == VHDL_TYPE_LOGIC3D_VECTOR)
          of << " := (others => L3D_0)";
+      else if (tn == VHDL_TYPE_REAL)
+         of << " := 0.0";   // VHDL's default is real'left (-1.7e308)
    }
 
    of << ";";
@@ -1022,6 +1025,35 @@ void vhdl_const_int::emit(std::ostream &of, int) const
 {
    of << dec << value_;
    // We need to find a way to display a comment, since $time, etc. add one.
+}
+
+void vhdl_const_real::emit(std::ostream &of, int) const
+{
+   // VHDL's real has no inf/nan values (iverilog constant-folds 1.0/0.0 to
+   // inf). Approximate with the type bounds so the design still compiles;
+   // formatting will show 1.79769e+308 rather than "inf".
+   if (std::isinf(value_)) {
+      of << (value_ < 0 ? "real'low" : "real'high");
+      return;
+   }
+   if (std::isnan(value_)) {
+      of << "0.0";   // no NaN in VHDL real
+      return;
+   }
+   // A VHDL abstract real literal must contain a point before any exponent
+   // ("1e3" is not legal VHDL, "1.0e3" is). %.17g round-trips a double
+   // exactly; patch the point in when %g omits it.
+   char buf[64];
+   snprintf(buf, sizeof(buf), "%.17g", value_);
+   std::string s(buf);
+   if (s.find('.') == std::string::npos) {
+      std::string::size_type ep = s.find_first_of("eE");
+      if (ep == std::string::npos)
+         s += ".0";
+      else
+         s.insert(ep, ".0");
+   }
+   of << s;
 }
 
 void vhdl_const_bool::emit(std::ostream &of, int) const

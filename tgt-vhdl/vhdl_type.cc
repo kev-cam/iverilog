@@ -109,6 +109,8 @@ std::string vhdl_type::get_string() const
       return std::string("logic3d");
    case VHDL_TYPE_LOGIC3D_VECTOR:
       return std::string("logic3d_vector");
+   case VHDL_TYPE_REAL:
+      return std::string("real");
    default:
       return std::string("BadType");
    }
@@ -182,6 +184,11 @@ vhdl_type *vhdl_type::std_logic_vector(int msb, int lsb)
 vhdl_type *vhdl_type::logic3d()
 {
    return new vhdl_type(VHDL_TYPE_LOGIC3D);
+}
+
+vhdl_type *vhdl_type::real()
+{
+   return new vhdl_type(VHDL_TYPE_REAL);
 }
 
 vhdl_type *vhdl_type::logic3d_vector(int msb, int lsb)

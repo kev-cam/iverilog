@@ -129,6 +129,14 @@ static int draw_stask_display(vhdl_procedural *proc,
                   while (isdigit(*p)) { has_digits = true; wv = wv*10 + (*p - '0'); ++p; }
                   if (has_digits) fw_spec = wv;
                }
+               // Optional .precision (real formats: %5.2f etc.)
+               long prec_spec = -1;
+               if (*p == '.') {
+                  ++p;
+                  bool has_digits = false; long pv = 0;
+                  while (isdigit(*p)) { has_digits = true; pv = pv*10 + (*p - '0'); ++p; }
+                  if (has_digits) prec_spec = pv;
+               }
 
                switch (*p) {
                case 'm':
@@ -152,6 +160,33 @@ static int draw_stask_display(vhdl_procedural *proc,
                      f->add_expr(base->cast(&itype));
                      f->add_expr(new vhdl_const_int(active_time_units()));
                      f->add_expr(new vhdl_const_int(active_time_precision()));
+                     text->add_expr(f);
+                  }
+                  break;
+               case 'f': case 'F': case 'g': case 'G': case 'e':
+                  {
+                     // Real formats. Verilog %f/%g/%e are C printf semantics,
+                     // and VHDL-2008 to_string(real, fmt) is implemented with
+                     // C snprintf in nvc -- so reconstruct the C format string
+                     // and pass it through verbatim.
+                     assert(i < count);
+                     ivl_expr_t netp = ivl_stmt_parm(stmt, i++);
+                     assert(netp);
+                     vhdl_expr *base = translate_expr(netp);
+                     if (NULL == base)
+                        return 1;
+                     emit_wait_for_0(proc, container, stmt, base);
+                     ostringstream fs;
+                     fs << '%';
+                     if (ld_zero) fs << '0';
+                     if (fw_spec >= 0) fs << fw_spec;
+                     if (prec_spec >= 0) fs << '.' << prec_spec;
+                     fs << (char)tolower(*p);
+                     vhdl_type rt(VHDL_TYPE_REAL);
+                     vhdl_fcall *f = new vhdl_fcall("to_string",
+                                                    vhdl_type::string());
+                     f->add_expr(base->cast(&rt));
+                     f->add_expr(new vhdl_const_string(fs.str()));
                      text->add_expr(f);
                   }
                   break;
@@ -280,6 +315,14 @@ static int draw_stask_display(vhdl_procedural *proc,
 
                      emit_wait_for_0(proc, container, stmt, base);
 
+                     // Verilog %d with a real argument rounds to the nearest
+                     // integer first.
+                     if ((*p == 'd' || *p == 'D') && base->get_type()
+                         && base->get_type()->get_name() == VHDL_TYPE_REAL) {
+                        vhdl_type itype(VHDL_TYPE_INTEGER);
+                        base = base->cast(&itype);
+                     }
+
                      // sv2vhdl mode: %d of a logic3d value must print "x" if any
                      // bit is unknown (Verilog %d convention), not the raw
                      // logic3d aggregate "(2,3,..)". Route through sv_dstr on the
@@ -370,6 +413,16 @@ static int draw_stask_display(vhdl_procedural *proc,
             return 1;
 
          emit_wait_for_0(proc, container, stmt, base);
+
+         // A bare REAL $display arg formats as %g (Verilog default for reals).
+         const vhdl_type *bt0 = base->get_type();
+         if (bt0 && bt0->get_name() == VHDL_TYPE_REAL) {
+            vhdl_fcall *f = new vhdl_fcall("to_string", vhdl_type::string());
+            f->add_expr(base);
+            f->add_expr(new vhdl_const_string("%g"));
+            text->add_expr(f);
+            continue;
+         }
 
          // sv2vhdl: a bare $display arg (no format code) uses Verilog's
          // DEFAULT format = DECIMAL (%d), right-justified to the operand's
@@ -678,10 +731,8 @@ static int draw_block(vhdl_procedural *proc, stmt_container *container,
 
          std::string safe_name = make_safe_name(sig);
          if (!proc->get_scope()->have_declared(safe_name)) {
-            const vhdl_type* type = vhdl_type::type_for(ivl_signal_width(sig),
-                                                        ivl_signal_signed(sig));
             proc->get_scope()->add_decl
-               (new vhdl_var_decl(safe_name, type));
+               (new vhdl_var_decl(safe_name, vhdl_type_for_signal(sig)));
          }
       }
    }
