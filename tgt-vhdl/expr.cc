@@ -73,8 +73,31 @@ static vhdl_expr *correct_signedness(vhdl_expr *vhd_e, ivl_expr_t vl_e)
  */
 static vhdl_expr *translate_string(ivl_expr_t e)
 {
-   // TODO: May need to inspect or escape parts of this
    const char *str = ivl_expr_string(e);
+
+   // sv2vhdl: a Verilog string literal in a VALUE context is a packed vector
+   // of 8-bit ASCII codes ("AB" == 16'h4142). Emitting a VHDL string here
+   // broke every non-$display use (assignment, comparison, ternary, task
+   // arg). $display format strings never reach this function -- the display
+   // builder reads ivl_expr_string directly.
+   if (get_sv2vhdl_mode()) {
+      size_t len = strlen(str);
+      string bits;
+      if (len == 0)
+         bits = "00000000";               // "" is 8'b0
+      else {
+         // ivl bit order: LSB first -- last character's low bit leads.
+         for (size_t i = len; i-- > 0; ) {
+            unsigned char c = str[i];
+            for (int b = 0; b < 8; b++)
+               bits += ((c >> b) & 1) ? '1' : '0';
+         }
+      }
+      // vhdl_const_bits takes the LSB-first bit string
+      return new vhdl_const_bits(bits.c_str(), bits.size(), false);
+   }
+
+   // TODO: May need to inspect or escape parts of this
    return new vhdl_const_string(str);
 }
 

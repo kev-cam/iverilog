@@ -831,7 +831,13 @@ static int draw_stask(vhdl_procedural *proc, stmt_container *container,
             pc->add_expr(a == 2 ? (vhdl_expr*)new vhdl_const_string("")
                                 : (vhdl_expr*)new vhdl_const_int(0));
          } else if (a == 2) {
-            pc->add_expr(ve);                 // suffix string
+            // The suffix must be a VHDL string: translate_expr now packs
+            // string literals into logic3d vectors (their Verilog VALUE
+            // form), so take the text directly.
+            if (ivl_expr_type(pe) == IVL_EX_STRING)
+               pc->add_expr(new vhdl_const_string(ivl_expr_string(pe)));
+            else
+               pc->add_expr(ve);
          } else {
             pc->add_expr(ve->cast(&itype));   // units/precision/min_width
          }
