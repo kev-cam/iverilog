@@ -351,6 +351,23 @@ static vhdl_expr *translate_numeric(vhdl_expr *lhs, vhdl_expr *rhs,
 static vhdl_expr *translate_relation(vhdl_expr *lhs, vhdl_expr *rhs,
                                      vhdl_binop_t op)
 {
+   // Scalar logic3d equality must compare the VALUE plane, not raw codes:
+   // U(7) and 1(3) are value-equal but a natural "=" reads them unequal,
+   // so every 1-bit compare (EH2's bus_tid == tid thread qualifiers)
+   // failed once boot-time uncertainty touched an operand. Certainty
+   // cannot ride through a boolean context; the value plane decides.
+   if (get_sv2vhdl_mode() && (op == VHDL_BINOP_EQ || op == VHDL_BINOP_NEQ)
+       && lhs->get_type()
+       && lhs->get_type()->get_name() == VHDL_TYPE_LOGIC3D
+       && rhs->get_type()
+       && rhs->get_type()->get_name() == VHDL_TYPE_LOGIC3D) {
+      vhdl_fcall *la = new vhdl_fcall("is_one", vhdl_type::boolean());
+      la->add_expr(lhs);
+      vhdl_fcall *lb = new vhdl_fcall("is_one", vhdl_type::boolean());
+      lb->add_expr(rhs);
+      return new vhdl_binop_expr(la, op, lb, vhdl_type::boolean());
+   }
+
    // Generate any necessary casts
    // Arbitrarily, the RHS is casted to the type of the LHS
    vhdl_expr *r_cast = rhs->cast(lhs->get_type());
