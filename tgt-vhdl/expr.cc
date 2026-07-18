@@ -1303,6 +1303,18 @@ vhdl_expr *translate_sfunc(ivl_expr_t e)
       l3->add_expr(tu);
       return l3;
    }
+   else if (strcmp(name, "$isunknown") == 0) {
+      // The explicit certainty observer: L3D_1 when any bit of the operand
+      // has certainty 0. Value-plane reads never consult certainty; test
+      // variants probe it through this. Overloaded vector/scalar so the
+      // operand's REAL type resolves (annotations can lie).
+      vhdl_expr *arg = translate_expr(ivl_expr_parm(e, 0));
+      if (NULL == arg)
+         return NULL;
+      vhdl_fcall *f = new vhdl_fcall("l3d_isunknown", vhdl_type::logic3d());
+      f->add_expr(arg);
+      return f;
+   }
    else if (strcmp(name, "$realtime") == 0) {
       // $realtime: simulation time scaled to the scope's units, KEEPING the
       // fractional part. Count ticks as an integer (exact), convert to real,
