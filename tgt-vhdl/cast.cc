@@ -336,6 +336,13 @@ vhdl_expr *vhdl_expr::to_boolean()
 {
    if (type_->get_name() == VHDL_TYPE_STD_LOGIC
        || type_->get_name() == VHDL_TYPE_STD_ULOGIC) {
+      if (get_sv2vhdl_mode()) {
+         // Value-plane truth: a code equality against L3D_1 would reject
+         // U/H/W (uncertain/weak codes whose value plane is 1).
+         vhdl_fcall *conv = new vhdl_fcall("is_one", vhdl_type::boolean());
+         conv->add_expr(this);
+         return conv;
+      }
       // '1' is true all else are false
       vhdl_const_bit *one = new vhdl_const_bit('1');
       return new vhdl_binop_expr

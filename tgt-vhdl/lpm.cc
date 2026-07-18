@@ -370,9 +370,19 @@ static int draw_mux_lpm(vhdl_arch *arch, ivl_lpm_t lpm)
    vhdl_expr *s1 = readable_ref(scope, ivl_lpm_data(lpm, 1));
 
    vhdl_expr *sel = readable_ref(scope, ivl_lpm_select(lpm));
-   vhdl_expr *b1 = new vhdl_const_bit('1');
-   vhdl_expr *t1 =
-      new vhdl_binop_expr(sel, VHDL_BINOP_EQ, b1, vhdl_type::boolean());
+   vhdl_expr *t1;
+   if (get_sv2vhdl_mode()) {
+      // Value-plane select. A code equality (sel = L3D_1) rejects the
+      // uncertain/weak codes whose value plane is 1 (U/H/W), freezing
+      // every enable-mux whose enable is not yet certain.
+      vhdl_fcall *f = new vhdl_fcall("is_one", vhdl_type::boolean());
+      f->add_expr(sel);
+      t1 = f;
+   }
+   else {
+      vhdl_expr *b1 = new vhdl_const_bit('1');
+      t1 = new vhdl_binop_expr(sel, VHDL_BINOP_EQ, b1, vhdl_type::boolean());
+   }
 
    vhdl_var_ref *out = nexus_to_var_ref(scope, ivl_lpm_q(lpm));
 
