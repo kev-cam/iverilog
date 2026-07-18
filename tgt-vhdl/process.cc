@@ -258,18 +258,26 @@ static void nba_defer_commits(vhdl_process *vhdl_proc, vhdl_entity *ent)
 
       WriteInfo info;
       find_write_info(body, sig_name, info);
-      if (!info.found || info.ambiguous)
-         continue;   // no nbassign, or mixed slices -- leave as-is
+      if (!info.found)
+         continue;   // no nbassign to this signal
 
+      // A single static slice commits just that slice (keeps this process's
+      // driver footprint unchanged). Mixed or dynamic slices fall back to a
+      // WHOLE-signal shadow: seed the full value, write through the original
+      // (possibly dynamic) index into the variable, commit the whole signal.
+      // The dynamic index expression itself still reads SIGNALS (pre-edge,
+      // Verilog statement-time evaluation). Whole commits assume this
+      // process is the signal's only driver -- true for the memory/buffer
+      // always blocks this matters for (the gated-clock fill buffers).
       vhdl_expr *commit_lhs_slice = NULL;
       vhdl_expr *commit_rhs_slice = NULL;
-      if (info.slice) {
+      if (!info.ambiguous && info.slice) {
          commit_lhs_slice = clone_slice(info.slice);
          commit_rhs_slice = clone_slice(info.slice);
          if (commit_lhs_slice == NULL || commit_rhs_slice == NULL) {
             delete commit_lhs_slice;
             delete commit_rhs_slice;
-            continue;   // non-static slice
+            commit_lhs_slice = commit_rhs_slice = NULL;  // whole-signal
          }
       }
 
