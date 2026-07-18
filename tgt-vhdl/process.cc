@@ -157,6 +157,35 @@ static void mark_var_assigns(stmt_container *c, const std::string &var_name)
       mark_var_assigns_recurse(s, var_name);
 }
 
+// Rename ONLY the LHS base of nbassigns targeting `name`. The writes set
+// from find_vars also contains refs inside LHS slice indices (a[adr] puts
+// both `a` and `adr` there), and an index must keep reading the SIGNAL --
+// renaming it to a shadow that updated earlier in the block would apply the
+// post-assign index (Verilog evaluates NBA indices at statement time).
+static void rename_nbassign_lhs(stmt_container *c, const std::string &name,
+                                const std::string &var_name);
+
+static void rename_nbassign_lhs_recurse(vhdl_seq_stmt *s,
+                                        const std::string &name,
+                                        const std::string &var_name)
+{
+   if (vhdl_nbassign_stmt *nb = dynamic_cast<vhdl_nbassign_stmt*>(s)) {
+      if (nb->get_lhs()->get_name() == name)
+         nb->get_lhs()->set_name(var_name);
+   }
+   std::vector<stmt_container*> subs;
+   s->get_sub_containers(subs);
+   for (stmt_container *sc : subs)
+      rename_nbassign_lhs(sc, name, var_name);
+}
+
+static void rename_nbassign_lhs(stmt_container *c, const std::string &name,
+                                const std::string &var_name)
+{
+   for (vhdl_seq_stmt *s : c->get_stmts())
+      rename_nbassign_lhs_recurse(s, name, var_name);
+}
+
 static void remove_wait_for_0(stmt_container *body)
 {
    stmt_container::stmt_list_t &stmts = body->get_stmts();
@@ -183,6 +212,130 @@ static vhdl_expr *clone_slice(vhdl_expr *e)
    if (vhdl_const_int *ci = dynamic_cast<vhdl_const_int*>(e))
       return new vhdl_const_int(ci->get_value());
    return NULL;
+}
+
+// Verilog NBA-region commit semantics for edge-triggered processes (STD_MX).
+// A clock-gate (ICG latch + AND) fires its edge one-or-more DELTAS after the
+// raw clock edge; by then flops that committed at delta 0-1 have already
+// propagated through combinational logic, so the gated flop captures
+// POST-edge values (a race Verilog forbids: all nonblocking commits land in
+// the NBA region at end of timestep). Restore that ordering in translation:
+// evaluate every nonblocking RHS at statement time into a shadow variable,
+// then commit all of them after `wait for 0 ns` -- which STD_MX routes to
+// the INACTIVE region, i.e. after every same-timestep edge process (gated or
+// not) has evaluated with the pre-edge snapshot.
+static void nba_defer_commits(vhdl_process *vhdl_proc, vhdl_entity *ent)
+{
+   if (!get_sv2vhdl_mode())
+      return;
+   if (!vhdl_proc->is_edge_triggered() || vhdl_proc->contains_wait_stmt())
+      return;
+
+   stmt_container *body = vhdl_proc->get_container();
+   vhdl_scope *proc_scope = vhdl_proc->get_scope();
+   vhdl_scope *arch_scope = ent->get_arch()->get_scope();
+
+   vhdl_var_set_t reads, writes;
+   body->find_vars(reads, writes);
+
+   // Collect candidate target signal names (deduped).
+   std::set<std::string> targets;
+   for (vhdl_var_set_t::iterator it = writes.begin(); it != writes.end(); ++it)
+      targets.insert((*it)->get_name());
+
+   std::list<vhdl_seq_stmt*> seeds;
+   std::list<vhdl_seq_stmt*> commits;
+
+   for (std::set<std::string>::const_iterator tit = targets.begin();
+        tit != targets.end(); ++tit) {
+      const std::string &sig_name = *tit;
+
+      vhdl_decl *sig_decl = arch_scope->get_decl(sig_name);
+      if (sig_decl == NULL)
+         continue;
+      if (sig_decl->assignment_type() != vhdl_decl::ASSIGN_NONBLOCK)
+         continue;   // variables and blocking shadows commit immediately
+
+      WriteInfo info;
+      find_write_info(body, sig_name, info);
+      if (!info.found || info.ambiguous)
+         continue;   // no nbassign, or mixed slices -- leave as-is
+
+      vhdl_expr *commit_lhs_slice = NULL;
+      vhdl_expr *commit_rhs_slice = NULL;
+      if (info.slice) {
+         commit_lhs_slice = clone_slice(info.slice);
+         commit_rhs_slice = clone_slice(info.slice);
+         if (commit_lhs_slice == NULL || commit_rhs_slice == NULL) {
+            delete commit_lhs_slice;
+            delete commit_rhs_slice;
+            continue;   // non-static slice
+         }
+      }
+
+      std::string var_name = "v_nba_" + sig_name;
+      while (proc_scope->have_declared(var_name))
+         var_name += "_";
+
+      const vhdl_type *src_type = sig_decl->get_type();
+      vhdl_var_decl *var_decl =
+         new vhdl_var_decl(var_name, new vhdl_type(*src_type));
+      proc_scope->add_decl(var_decl);
+
+      // Rename ONLY the nbassign LHS bases to the shadow; reads AND slice
+      // indices keep the signal (Verilog NBA evaluates both at statement
+      // time against pre-edge values).
+      rename_nbassign_lhs(body, sig_name, var_name);
+      mark_var_assigns(body, var_name);
+
+      // Seed each iteration so a conditionally-skipped write commits the
+      // unchanged pre-edge value (a value-level no-op).
+      {
+         vhdl_var_ref *seed_lhs =
+            new vhdl_var_ref(var_name, new vhdl_type(*src_type));
+         vhdl_var_ref *seed_rhs =
+            new vhdl_var_ref(sig_name, new vhdl_type(*src_type));
+         seeds.push_back(new vhdl_assign_stmt(seed_lhs, seed_rhs));
+      }
+
+      // Commit (only the statically-written slice, to keep this process's
+      // driver footprint unchanged).
+      {
+         vhdl_var_ref *lhs =
+            new vhdl_var_ref(sig_name, new vhdl_type(*src_type));
+         if (commit_lhs_slice)
+            lhs->set_slice(commit_lhs_slice, info.slice_width);
+         vhdl_var_ref *rhs =
+            new vhdl_var_ref(var_name, new vhdl_type(*src_type));
+         if (commit_rhs_slice)
+            rhs->set_slice(commit_rhs_slice, info.slice_width);
+         commits.push_back(new vhdl_nbassign_stmt(lhs, rhs));
+      }
+   }
+
+   if (commits.empty())
+      return;
+
+   stmt_container::stmt_list_t &stmts = body->get_stmts();
+   for (std::list<vhdl_seq_stmt*>::reverse_iterator it = seeds.rbegin();
+        it != seeds.rend(); ++it)
+      stmts.push_front(*it);
+
+   // One hop to the Verilog NBA region, then all commits.
+   stmts.push_back(new vhdl_wait_stmt(VHDL_WAIT_FOR0));
+   for (std::list<vhdl_seq_stmt*>::iterator it = commits.begin();
+        it != commits.end(); ++it)
+      stmts.push_back(*it);
+
+   // A process with a wait may not also have a sensitivity list: move the
+   // clock/reset sensitivity into a trailing `wait on`.
+   vhdl_wait_stmt *trailing = new vhdl_wait_stmt(VHDL_WAIT_ON);
+   string_list_t &sens = vhdl_proc->get_sensitivity();
+   for (string_list_t::const_iterator it = sens.begin();
+        it != sens.end(); ++it)
+      trailing->add_sensitivity(*it);
+   sens.clear();
+   stmts.push_back(trailing);
 }
 
 static void shadow_blocking_targets(vhdl_process *vhdl_proc, vhdl_entity *ent)
@@ -471,8 +624,10 @@ static int generate_vhdl_process(vhdl_entity *ent, ivl_process_t proc)
    // on self-sensitive always-comb blocks.  Only applied to non-initial
    // processes (initial blocks have different semantics and are emitted
    // as deposit-style assignments anyway).
-   if (ivl_process_type(proc) != IVL_PR_INITIAL)
+   if (ivl_process_type(proc) != IVL_PR_INITIAL) {
       shadow_blocking_targets(vhdl_proc, ent);
+      nba_defer_commits(vhdl_proc, ent);
+   }
 
    // Initial processes are translated to VHDL processes with
    // no sensitivity list and and indefinite wait statement at

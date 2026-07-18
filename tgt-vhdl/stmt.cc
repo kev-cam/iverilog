@@ -1816,6 +1816,8 @@ static bool draw_synthesisable_wait(vhdl_process *proc, stmt_container *containe
       delete ref;
    }
 
+   proc->set_edge_triggered();
+
    // Don't bother with the default draw_wait
    return true;
 }
@@ -1925,6 +1927,8 @@ static int draw_wait(vhdl_procedural *_proc, stmt_container *container,
       // wrap it in an `if' statement with this test and add the
       // edge triggered signals to the sensitivity, otherwise
       // build a `wait until' statement at the top of the process
+      if (is_top_level)
+         proc->set_edge_triggered();
       vhdl_binop_expr *test =
          new vhdl_binop_expr(VHDL_BINOP_OR, vhdl_type::boolean());
 

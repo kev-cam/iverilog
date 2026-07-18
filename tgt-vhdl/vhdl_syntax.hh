@@ -1040,10 +1040,16 @@ public:
    // Postponed process: runs once per simulation cycle after the final delta,
    // reading settled values -- exactly $monitor/$strobe timing.
    void set_postponed() { postponed_ = true; }
+   // Marked when the process body is an edge-detect wrapper (always @posedge
+   // family) -- the NBA-deferral pass keys on this.
+   void set_edge_triggered() { edge_triggered_ = true; }
+   bool is_edge_triggered() const { return edge_triggered_; }
+   string_list_t &get_sensitivity() { return sens_; }
 private:
    std::string name_;
    string_list_t sens_;
    bool postponed_ = false;
+   bool edge_triggered_ = false;
 };
 
 
