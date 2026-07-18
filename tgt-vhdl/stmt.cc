@@ -1107,7 +1107,18 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
 
    vhdl_expr *rhs, *rhs2 = NULL;
    ivl_expr_t rval = ivl_stmt_rval(stmt);
-   if (ivl_expr_type(rval) == IVL_EX_TERNARY) {
+   // The ternary if/else expansion below is an idiom optimization and only
+   // correct for a plain unsliced lvalue: the clamp and dynamic-index
+   // guarded-write paths emit a single RHS expression and return early, so
+   // a pre-split ternary reached them as its bare TRUE-ARM -- condition and
+   // else-arm silently dropped (VeeR-EH2: every icache fill wrote the
+   // never-driven debug-write bus instead of debug?debug:bank, zeroing the
+   // banks). A slice-targeted ternary translates as an ordinary Ternary
+   // expression instead.
+   const bool plain_lval = lvals.size() == 1
+      && lvals.front()->get_slice() == NULL
+      && lvals.front()->extra_range_width() <= 0;
+   if (ivl_expr_type(rval) == IVL_EX_TERNARY && plain_lval) {
       rhs = translate_expr(ivl_expr_oper2(rval));
       rhs2 = translate_expr(ivl_expr_oper3(rval));
       if (rhs2 == NULL)
@@ -1394,7 +1405,7 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
       // A small optimisation is to expand ternary RHSs into an
       // if statement (eliminates a function call and produces
       // more idiomatic code)
-      if (ivl_expr_type(rval) == IVL_EX_TERNARY) {
+      if (ivl_expr_type(rval) == IVL_EX_TERNARY && rhs2 != NULL) {
          rhs2 = rhs2->cast(lhs->get_type());
          vhdl_var_ref *lhs2 =
             make_assign_lhs(ivl_stmt_lval(stmt, 0), proc->get_scope());
