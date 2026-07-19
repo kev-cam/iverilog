@@ -356,16 +356,30 @@ static vhdl_expr *translate_relation(vhdl_expr *lhs, vhdl_expr *rhs,
    // so every 1-bit compare (EH2's bus_tid == tid thread qualifiers)
    // failed once boot-time uncertainty touched an operand. Certainty
    // cannot ride through a boolean context; the value plane decides.
+   // Annotations LIE for indexed elements: a 1-bit slice keeps the VECTOR
+   // type (which hid EH2's icache bank-select ic_rw_addr_ff[2] == j from
+   // the type-keyed first version), while a memory word-select IS a vector
+   // under the same annotation shape. Emit the overloaded l3d_eq1() and
+   // let VHDL resolution act on the operand's REAL type.
+   const auto is_l3d_family = [](vhdl_expr *e) -> bool {
+      if (e->get_type() == NULL)
+         return false;
+      const vhdl_type_name_t t = e->get_type()->get_name();
+      return t == VHDL_TYPE_LOGIC3D || t == VHDL_TYPE_LOGIC3D_VECTOR;
+   };
    if (get_sv2vhdl_mode() && (op == VHDL_BINOP_EQ || op == VHDL_BINOP_NEQ)
-       && lhs->get_type()
-       && lhs->get_type()->get_name() == VHDL_TYPE_LOGIC3D
-       && rhs->get_type()
-       && rhs->get_type()->get_name() == VHDL_TYPE_LOGIC3D) {
-      vhdl_fcall *la = new vhdl_fcall("is_one", vhdl_type::boolean());
-      la->add_expr(lhs);
-      vhdl_fcall *lb = new vhdl_fcall("is_one", vhdl_type::boolean());
-      lb->add_expr(rhs);
-      return new vhdl_binop_expr(la, op, lb, vhdl_type::boolean());
+       && is_l3d_family(lhs) && is_l3d_family(rhs)
+       && (lhs->get_type()->get_name() == VHDL_TYPE_LOGIC3D
+           || rhs->get_type()->get_name() == VHDL_TYPE_LOGIC3D
+           || lhs->get_type()->get_width() <= 1
+           || rhs->get_type()->get_width() <= 1)) {
+      vhdl_fcall *eq = new vhdl_fcall("l3d_eq1", vhdl_type::boolean());
+      eq->add_expr(lhs);
+      eq->add_expr(rhs);
+      if (op == VHDL_BINOP_NEQ)
+         return new vhdl_unaryop_expr(VHDL_UNARYOP_NOT, eq,
+                                      vhdl_type::boolean());
+      return eq;
    }
 
    // Generate any necessary casts
