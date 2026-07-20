@@ -371,20 +371,46 @@ static void shadow_blocking_targets(vhdl_process *vhdl_proc, vhdl_entity *ent)
 
       WriteInfo info;
       find_write_info(body, sig_name, info);
-      if (!info.found || info.ambiguous)
-         continue;  // skip mixed-slice cases for now
+      if (!info.found)
+         continue;
 
-      // If the write has a slice we don't know how to clone, skip.
+      // Mixed-slice or unclonable-slice writes can't get a slice-accurate
+      // commit. Leaving them as plain `<=` is correct ONLY for write-only
+      // patterns; when the process also READS the target, the emulated
+      // blocking read-modify-write accumulates across activations (each
+      // `<=` lands after the run, so reads see the previous activation —
+      // the EH2 icache rd_mux `x = '0; for.. x |= ..` served stale rows
+      // forever). Fall back to a WHOLE-SIGNAL shadow: seed v := sig,
+      // rename every ref, commit sig <= v — sole-driver assumption, the
+      // same contract as the NBA whole-signal fallback.
+      bool whole_signal = false;
       vhdl_expr *commit_lhs_slice = NULL;
       vhdl_expr *commit_rhs_slice = NULL;
-      if (info.slice) {
+      if (info.ambiguous)
+         whole_signal = true;
+      else if (info.slice) {
          commit_lhs_slice = clone_slice(info.slice);
          commit_rhs_slice = clone_slice(info.slice);
          if (commit_lhs_slice == NULL || commit_rhs_slice == NULL) {
             delete commit_lhs_slice;
             delete commit_rhs_slice;
-            continue;
+            commit_lhs_slice = commit_rhs_slice = NULL;
+            whole_signal = true;
          }
+      }
+      if (whole_signal) {
+         vhdl_var_set_t rmw_reads, rmw_writes;
+         body->find_vars(rmw_reads, rmw_writes);
+         bool reads_target = false;
+         for (vhdl_var_set_t::iterator rit = rmw_reads.begin();
+              rit != rmw_reads.end(); ++rit) {
+            if ((*rit)->get_name() == sig_name) {
+               reads_target = true;
+               break;
+            }
+         }
+         if (!reads_target)
+            continue;   // write-only: plain `<=` slice writes are correct
       }
 
       std::string var_name = "v_" + sig_name;
