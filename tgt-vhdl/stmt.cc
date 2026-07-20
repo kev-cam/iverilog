@@ -711,8 +711,23 @@ static int draw_stask_set_val(vhdl_procedural *proc,
        && val->get_type()->get_width() != lhs_slice_width)
       val = val->cast(vhdl_type::logic3d_vector(lhs_slice_width - 1, 0));
 
-   vhdl_assign_stmt *assign = new vhdl_assign_stmt(lhs, val);
-   container->add_stmt(assign);
+   // Mirror make_assignment's discipline. $set_val is a rewritten BLOCKING
+   // assign, so a SIGNAL target inside a process must emit `<=` and be
+   // registered as a blocking target (the shadow pass then supplies
+   // read-after-write semantics where it can clone the slice). A bare `:=`
+   // on a signal is an in-place update that fires no event, so downstream
+   // `wait on` processes never wake. `:=` stays for variables and for
+   // initial-process deposits.
+   vhdl_decl::assign_type_t atype = decl->assignment_type();
+   if (atype == vhdl_decl::ASSIGN_NONBLOCK
+       && !proc->get_scope()->initializing()) {
+      if (proc->get_scope()->allow_signal_assignment())
+         proc->add_blocking_target(lhs);
+      container->add_stmt(new vhdl_nbassign_stmt(lhs, val));
+   }
+   else {
+      container->add_stmt(new vhdl_assign_stmt(lhs, val));
+   }
    return 0;
 }
 
