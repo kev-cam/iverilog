@@ -29,6 +29,8 @@
 #include <algorithm>
 #include <vector>
 #include <set>
+#include <map>
+#include <climits>
 #include <utility>
 
 // ---------------------------------------------------------------------------
@@ -909,4 +911,197 @@ extern "C" int draw_process(ivl_process_t proc, void *)
    }
 
    return generate_vhdl_process(ent, proc);
+}
+
+/*
+ * Comb-cone fusion. The per-gate/per-LPM draws emit ONE PROCESS PER
+ * INTERMEDIATE (`process (all) is begin tmp <= expr; end`), so logic
+ * depth becomes delta-cycle count and every level re-wakes the whole
+ * downstream cloud (measured on VeeR-EH2: ~130 proc-deltas and ~95K
+ * activations per clock cycle, 81.8% of eval time in 1024+-wide deltas).
+ *
+ * Fuse all such single-assign waitless processes in an architecture
+ * into ONE process, statements in topological order. Each member
+ * becomes the pair
+ *     v_T := <rhs with member-def reads renamed to their v_>;
+ *     T    <= v_T;
+ * The variable carries the fresh value within the single activation
+ * (zero internal deltas); the signal assign still publishes exactly
+ * one event per change for outside readers, and the driver census is
+ * unchanged. The fused process gets an explicit sensitivity list of
+ * EXTERNAL reads only, so it never wakes on its own outputs.
+ * Multi-defined names and cycle members are left as-is (Kahn survivors
+ * only). Kill-switch: SV2VHDL_NO_FUSE=1.
+ */
+void fuse_comb_processes(vhdl_entity *ent)
+{
+   vhdl_arch *arch = ent->get_arch();
+   if (arch == NULL)
+      return;
+
+   // Candidates: sv2vhdl-mode concurrent assigns (each emits as its own
+   // process(all)) — iverilog's per-operator netlist shrapnel.
+   struct member_t {
+      vhdl_cassign_stmt *ca;
+      std::string def;
+      member_t *dsu;         // union-find parent
+      vhdl_var_ref *lhs() const { return ca->get_lhs(); }
+      vhdl_expr *rhs() const { return ca->get_rhs(); }
+   };
+   std::list<member_t> cand;
+   std::map<std::string, int> def_count;
+
+   conc_stmt_list_t &items = arch->get_stmts();
+   for (conc_stmt_list_t::iterator it = items.begin();
+        it != items.end(); ++it) {
+      vhdl_cassign_stmt *ca = dynamic_cast<vhdl_cassign_stmt*>(*it);
+      if (ca == NULL || !ca->is_simple())
+         continue;
+      if (ca->get_lhs() == NULL || ca->get_rhs() == NULL)
+         continue;
+      if (ca->get_lhs()->get_slice() != NULL)   // part-writes stay put
+         continue;
+      if (ca->get_lhs()->get_type() == NULL)
+         continue;
+      member_t m = { ca, ca->get_lhs()->get_name(), NULL };
+      cand.push_back(m);
+      def_count[m.def]++;
+   }
+   for (std::list<member_t>::iterator it = cand.begin(); it != cand.end(); )
+      it = (def_count[it->def] > 1) ? cand.erase(it) : ++it;
+
+   // Drop self-loop members (T reads T) before graph building.
+   std::map<std::string, member_t*> defs;
+   for (std::list<member_t>::iterator it = cand.begin(); it != cand.end(); ++it)
+      defs[it->def] = &*it;
+   for (std::list<member_t>::iterator it = cand.begin(); it != cand.end(); ) {
+      vhdl_var_set_t reads;
+      it->rhs()->find_vars(reads);
+      bool self = false;
+      for (vhdl_var_set_t::iterator r = reads.begin(); r != reads.end(); ++r)
+         if ((*r)->get_name() == it->def) { self = true; break; }
+      if (self) {
+         defs.erase(it->def);
+         it = cand.erase(it);
+      }
+      else
+         ++it;
+   }
+   if (cand.size() < 2)
+      return;
+
+   // Def/use edges among members; union-find groups CONNECTED dataflow
+   // (a cone). Unrelated members stay in separate blocks so each block's
+   // wake-set is only its own inputs — the whole-arch experiment showed
+   // that merging unrelated members multiplies wasted re-execution.
+   struct dsu {
+      static member_t *find(member_t *m) {
+         while (m->dsu != NULL) {
+            if (m->dsu->dsu != NULL)
+               m->dsu = m->dsu->dsu;
+            m = m->dsu;
+         }
+         return m;
+      }
+      static void unite(member_t *a, member_t *b) {
+         a = find(a); b = find(b);
+         if (a != b)
+            b->dsu = a;
+      }
+   };
+
+   std::map<member_t*, unsigned> indeg;
+   std::map<member_t*, std::list<member_t*> > out;
+   for (std::list<member_t>::iterator it = cand.begin(); it != cand.end(); ++it) {
+      vhdl_var_set_t reads;
+      it->rhs()->find_vars(reads);
+      unsigned d = 0;
+      for (vhdl_var_set_t::iterator r = reads.begin(); r != reads.end(); ++r) {
+         std::map<std::string, member_t*>::iterator dd =
+            defs.find((*r)->get_name());
+         if (dd != defs.end()) {
+            out[dd->second].push_back(&*it);
+            dsu::unite(dd->second, &*it);
+            d++;
+         }
+      }
+      indeg[&*it] = d;
+   }
+
+   // Global Kahn order; members left unordered are in cycles and keep
+   // their original processes (their reads of fused defs still see
+   // evented deposits, so mixing is safe).
+   std::list<member_t*> order, queue;
+   for (std::list<member_t>::iterator it = cand.begin(); it != cand.end(); ++it)
+      if (indeg[&*it] == 0)
+         queue.push_back(&*it);
+   while (!queue.empty()) {
+      member_t *m = queue.front();
+      queue.pop_front();
+      order.push_back(m);
+      std::list<member_t*> &o = out[m];
+      for (std::list<member_t*>::iterator sit = o.begin(); sit != o.end(); ++sit)
+         if (--indeg[*sit] == 0)
+            queue.push_back(*sit);
+   }
+
+   // Group the ordered members by DSU component, preserving topo order.
+   std::map<member_t*, std::list<member_t*> > comps;
+   for (std::list<member_t*>::iterator it = order.begin(); it != order.end(); ++it)
+      comps[dsu::find(*it)].push_back(*it);
+
+   vhdl_scope *ascope = arch->get_scope();
+   std::set<vhdl_cassign_stmt*> fused;
+   unsigned blkno = 0;
+
+   for (std::map<member_t*, std::list<member_t*> >::iterator ci = comps.begin();
+        ci != comps.end(); ++ci) {
+      std::list<member_t*> &mem = ci->second;
+      if (mem.size() < 2)
+         continue;
+
+      // External sensitivity: reads outside this component's defs that
+      // are signals in the arch scope.
+      std::set<std::string> cdefs, externals;
+      for (std::list<member_t*>::iterator it = mem.begin(); it != mem.end(); ++it)
+         cdefs.insert((*it)->def);
+      for (std::list<member_t*>::iterator it = mem.begin(); it != mem.end(); ++it) {
+         vhdl_var_set_t reads;
+         (*it)->rhs()->find_vars(reads);
+         for (vhdl_var_set_t::iterator r = reads.begin(); r != reads.end(); ++r) {
+            const std::string rn = (*r)->get_name();
+            if (cdefs.count(rn))
+               continue;
+            vhdl_decl *d = ascope->get_decl(rn);
+            if (d != NULL && d->assignment_type() == vhdl_decl::ASSIGN_NONBLOCK)
+               externals.insert(rn);
+         }
+      }
+      if (externals.empty())
+         continue;
+
+      // One process per cone: members verbatim, `<=` becomes a 2040
+      // blocking deposit `:=` — immediate same-run readback for the
+      // downstream members, one event per real value change for outside
+      // readers, and IEEE 1364 force semantics from the runtime deposit.
+      char nbuf[32];
+      snprintf(nbuf, sizeof(nbuf), "comb_fused_%u", blkno++);
+      vhdl_process *fp = new vhdl_process(nbuf);
+      for (std::set<std::string>::iterator it = externals.begin();
+           it != externals.end(); ++it)
+         fp->add_sensitivity(*it);
+      for (std::list<member_t*>::iterator it = mem.begin(); it != mem.end(); ++it) {
+         fp->get_container()->add_stmt(
+            new vhdl_assign_stmt((*it)->lhs(), (*it)->rhs()));
+         fused.insert((*it)->ca);
+      }
+      arch->add_stmt(fp);
+   }
+
+   if (fused.empty())
+      return;
+   for (conc_stmt_list_t::iterator it = items.begin(); it != items.end(); ) {
+      vhdl_cassign_stmt *ca = dynamic_cast<vhdl_cassign_stmt*>(*it);
+      it = (ca != NULL && fused.count(ca)) ? items.erase(it) : ++it;
+   }
 }

@@ -42,6 +42,8 @@ void remember_entity(vhdl_entity *ent, ivl_scope_t scope);
 vhdl_entity* find_entity(ivl_scope_t scope);
 vhdl_entity* find_entity(const std::string& name);
 void emit_all_entities(std::ostream& os, int max_depth);
+void fuse_comb_in_all_entities();
+void fuse_comb_processes(vhdl_entity *ent);   // defined in process.cc
 void free_all_vhdl_objects();
 
 // Get and set the active entity

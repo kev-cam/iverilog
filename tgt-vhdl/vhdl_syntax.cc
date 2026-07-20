@@ -323,6 +323,15 @@ void vhdl_process::add_sensitivity(const std::string &name)
    sens_.push_back(name);
 }
 
+const std::set<const vhdl_var_ref*> *vhdl_fused_process::active_renames = NULL;
+
+void vhdl_fused_process::emit(std::ostream &of, int level) const
+{
+   active_renames = &renames_;
+   vhdl_process::emit(of, level);
+   active_renames = NULL;
+}
+
 void vhdl_process::emit(std::ostream &of, int level) const
 {
    // If there are no statements in the body, this process
@@ -835,7 +844,14 @@ void vhdl_var_ref::find_vars(vhdl_var_set_t& read)
 
 void vhdl_var_ref::emit(std::ostream &of, int level) const
 {
-   of << name_;
+   // Inside a fused comb block, reads of fused defs emit as the block's
+   // process variables (pointer-keyed: shared ref objects are unaffected
+   // when other arch items emit).
+   if (vhdl_fused_process::active_renames != NULL
+       && vhdl_fused_process::active_renames->count(this))
+      of << "v_" << name_;
+   else
+      of << name_;
    if (slice_) {
       of << "(";
       if (slice_width_ > 0) {
@@ -1440,6 +1456,15 @@ void vhdl_binop_expr::emit(std::ostream &of, int level) const
 vhdl_bit_spec_expr::~vhdl_bit_spec_expr()
 {
 
+}
+
+void vhdl_bit_spec_expr::find_vars(vhdl_var_set_t& read)
+{
+   if (others_)
+      others_->find_vars(read);
+   for (std::list<bit_map>::iterator it = bits_.begin();
+        it != bits_.end(); ++it)
+      it->e->find_vars(read);
 }
 
 void vhdl_bit_spec_expr::add_bit(int bit, vhdl_expr *e)

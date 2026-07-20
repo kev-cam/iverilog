@@ -216,6 +216,14 @@ void remember_entity(vhdl_entity* ent, ivl_scope_t scope)
    g_scope_names[scope] = ent->get_name();
 }
 
+// Fuse per-cone comb processes in every remembered entity (see process.cc).
+void fuse_comb_in_all_entities()
+{
+   for (entity_list_t::iterator it = g_entities.begin();
+        it != g_entities.end(); ++it)
+      fuse_comb_processes(*it);
+}
+
 // Print all VHDL entities to the specified output stream.
 // Emit in reverse discovery order: the skeleton walker uses DFS which
 // visits parents before children, so reversing gives children first.

@@ -118,6 +118,11 @@ extern "C" int target_design(ivl_design_t des)
    if (0 == g_errors)
       ivl_design_process(des, draw_process, NULL);
 
+   // Fuse per-intermediate comb processes into one topologically-ordered
+   // block per architecture (kill-switch: SV2VHDL_NO_FUSE=1).
+   if (0 == g_errors && getenv("SV2VHDL_NO_FUSE") == NULL)
+      fuse_comb_in_all_entities();
+
    // Write the generated elements to the output file
    // only if there were no errors generating entities or processes
    if (0 == g_errors) {

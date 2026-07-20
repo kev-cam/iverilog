@@ -184,6 +184,7 @@ public:
 
    void add_bit(int bit, vhdl_expr *e);
    void emit(std::ostream &of, int level) const;
+   void find_vars(vhdl_var_set_t& read);
 private:
    vhdl_expr *others_;
    struct bit_map {
@@ -376,6 +377,9 @@ public:
    void emit(std::ostream &of, int level) const;
    void add_condition(vhdl_expr *value, vhdl_expr *cond);
    void set_after(vhdl_expr *a) { after_ = a; }
+   vhdl_var_ref *get_lhs() const { return lhs_; }
+   vhdl_expr *get_rhs() const { return rhs_; }
+   bool is_simple() const { return whens_.empty() && after_ == NULL; }
 private:
    vhdl_var_ref *lhs_;
    vhdl_expr *rhs_;
@@ -1042,6 +1046,7 @@ public:
    // Postponed process: runs once per simulation cycle after the final delta,
    // reading settled values -- exactly $monitor/$strobe timing.
    void set_postponed() { postponed_ = true; }
+   bool is_postponed() const { return postponed_; }
    // Marked when the process body is an edge-detect wrapper (always @posedge
    // family) -- the NBA-deferral pass keys on this.
    void set_edge_triggered() { edge_triggered_ = true; }
@@ -1065,6 +1070,22 @@ struct vhdl_attr_spec_t {
    std::string attr_name, entity_name, entity_class, value;
 };
 
+/*
+ * A fused comb block (see fuse_comb_processes). Member statements keep
+ * their ORIGINAL expression objects — which may be SHARED with other
+ * arch items — so reads of fused defs are renamed to their process
+ * variables only WHILE THIS PROCESS EMITS, keyed by ref pointer.
+ */
+class vhdl_fused_process : public vhdl_process {
+public:
+   explicit vhdl_fused_process(const char *name) : vhdl_process(name) {}
+   void add_rename(const vhdl_var_ref *r) { renames_.insert(r); }
+   void emit(std::ostream &of, int level) const;
+   static const std::set<const vhdl_var_ref*> *active_renames;
+private:
+   std::set<const vhdl_var_ref*> renames_;
+};
+
 class vhdl_arch : public vhdl_element {
 public:
    vhdl_arch(const std::string& entity, const std::string& name)
@@ -1074,6 +1095,7 @@ public:
    void emit(std::ostream &of, int level=0) const;
    void add_stmt(vhdl_process *proc);
    void add_stmt(vhdl_conc_stmt *stmt);
+   conc_stmt_list_t &get_stmts() { return stmts_; }
    vhdl_scope *get_scope() { return &scope_; }
    void add_attribute_spec(const std::string& attr, const std::string& entity,
                            const std::string& cls, const std::string& val);
