@@ -143,6 +143,8 @@ public:
 
    void add_expr(vhdl_expr *e);
    void add_expr_front(vhdl_expr *e);
+   vhdl_binop_t get_op() const { return op_; }
+   const std::list<vhdl_expr*>& get_operands() const { return operands_; }
    void emit(std::ostream &of, int level) const;
    void find_vars(vhdl_var_set_t& read);
 private:

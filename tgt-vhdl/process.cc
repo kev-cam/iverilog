@@ -81,8 +81,52 @@ static bool body_has_toplevel_wait(stmt_container *body)
    return false;
 }
 
+// Evaluate a compile-time-constant slice expression (int literals composed
+// with +,-,*). Generate-scope flattening emits offsets like (0*2)+0 that
+// must compare equal to a plain 0, or find_write_info calls two writes to
+// the same bit "mixed slices" and the shadow pass takes the whole-signal
+// path — fatal when several processes share slices of one signal (EH2
+// icache bypass any_addr_match: 8 scope processes each republished stale
+// snapshots of the other scopes' bits).
+static bool const_value_of(vhdl_expr *e, int64_t &out)
+{
+   if (vhdl_const_int *ci = dynamic_cast<vhdl_const_int*>(e)) {
+      out = ci->get_value();
+      return true;
+   }
+   vhdl_binop_expr *b = dynamic_cast<vhdl_binop_expr*>(e);
+   if (b == NULL)
+      return false;
+   int64_t acc = 0;
+   bool first = true;
+   for (std::list<vhdl_expr*>::const_iterator it = b->get_operands().begin();
+        it != b->get_operands().end(); ++it) {
+      int64_t v;
+      if (!const_value_of(*it, v))
+         return false;
+      if (first) {
+         acc = v;
+         first = false;
+         continue;
+      }
+      switch (b->get_op()) {
+      case VHDL_BINOP_ADD:  acc += v; break;
+      case VHDL_BINOP_SUB:  acc -= v; break;
+      case VHDL_BINOP_MULT: acc *= v; break;
+      default: return false;
+      }
+   }
+   if (first)
+      return false;
+   out = acc;
+   return true;
+}
+
 static bool same_const_int(vhdl_expr *a, vhdl_expr *b)
 {
+   int64_t va, vb;
+   if (const_value_of(a, va) && const_value_of(b, vb))
+      return va == vb;
    vhdl_const_int *ca = dynamic_cast<vhdl_const_int*>(a);
    vhdl_const_int *cb = dynamic_cast<vhdl_const_int*>(b);
    return ca && cb && ca->get_value() == cb->get_value();
@@ -209,6 +253,9 @@ static vhdl_expr *clone_slice(vhdl_expr *e)
 {
    if (e == NULL)
       return NULL;
+   int64_t folded;
+   if (const_value_of(e, folded))
+      return new vhdl_const_int(folded);
    if (vhdl_const_int *ci = dynamic_cast<vhdl_const_int*>(e))
       return new vhdl_const_int(ci->get_value());
    return NULL;
