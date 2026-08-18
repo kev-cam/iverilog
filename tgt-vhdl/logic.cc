@@ -724,9 +724,21 @@ static void draw_one_switch(vhdl_arch *arch, ivl_switch_t sw)
    // Port B
    inst->map_port("b", nexus_to_var_ref(scope, ivl_switch_b(sw)));
 
-   // Enable (ctrl) for conditional tran
+   // Enable (ctrl) for conditional tran.  The formal is std_logic; a
+   // logic3d actual must go through the lossless package conversion --
+   // a bare association byte-reinterprets in STD_MX mode, which maps
+   // the weak codes L/H to 'U'/'X' and latches the switch into X the
+   // moment the net rests on its keeper value.
    if (has_enable) {
-      inst->map_port("ctrl", readable_ref(scope, ivl_switch_enable(sw)));
+      vhdl_expr *en = readable_ref(scope, ivl_switch_enable(sw));
+      if (en->get_type() != NULL
+          && en->get_type()->get_name() == VHDL_TYPE_LOGIC3D) {
+         vhdl_fcall *conv =
+            new vhdl_fcall("to_std_logic", vhdl_type::std_logic());
+         conv->add_expr(en);
+         en = conv;
+      }
+      inst->map_port("ctrl", en);
    }
 
    // Source location comment
