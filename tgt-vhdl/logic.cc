@@ -566,6 +566,50 @@ static void sv_buf_not_logic(vhdl_arch *arch, ivl_net_logic_t log)
 }
 
 /*
+ * A continuous assign with a drive-strength specification: emit the
+ * sv2vhdl strength buffer, which drives the net through y'driver with
+ * the exact l3ds strength ladder (resolved by the kernel net solver).
+ * A bare `w <= x` would enter resolution at full strength and turn
+ * weak-vs-strong contention into X.
+ */
+static void sv_strength_logic(vhdl_arch *arch, ivl_net_logic_t log)
+{
+   // ivl_drive_t -> l3ds strength codes (ST_HIGHZ/WEAK/PULL/STRONG/
+   // SUPPLY).  Drive specs only produce HiZ/weak/pull/strong/supply;
+   // the charge strengths map defensively onto the nearest drive level.
+   static const int l3ds_code[8] = { 0, 2, 2, 2, 4, 4, 8, 16 };
+
+   string inst_name = make_inst_name(
+      scoped_basename(ivl_logic_basename(log), ivl_logic_scope(log)).c_str(),
+      "sv_strength_buf");
+
+   vhdl_entity_inst *inst = new vhdl_entity_inst(
+      inst_name.c_str(), "sv2vhdl", "sv_strength_buf", "strength");
+
+   vhdl_scope *scope = arch->get_scope();
+
+   inst->map_generic("str1",
+      new vhdl_const_int(l3ds_code[ivl_logic_drive1(log) & 7]));
+   inst->map_generic("str0",
+      new vhdl_const_int(l3ds_code[ivl_logic_drive0(log) & 7]));
+
+   inst->map_port("y", nexus_to_var_ref(scope, ivl_logic_pin(log, 0)));
+
+   vhdl_expr *data = readable_ref(scope, ivl_logic_pin(log, 1));
+   if (data->get_type() != NULL
+       && (data->get_type()->get_name() == VHDL_TYPE_STD_LOGIC
+           || data->get_type()->get_name() == VHDL_TYPE_STD_ULOGIC)) {
+      vhdl_fcall *conv = new vhdl_fcall("to_logic3d", vhdl_type::logic3d());
+      conv->add_expr(data);
+      data = conv;
+   }
+   inst->map_port("data", data);
+
+   add_strength_comment(inst, log);
+   arch->add_stmt(inst);
+}
+
+/*
  * Emit a concurrent signal assignment with optional strength comment.
  */
 static void default_logic(vhdl_arch *arch, ivl_net_logic_t log)
@@ -653,10 +697,17 @@ void draw_logic(vhdl_arch *arch, ivl_net_logic_t log)
          default_logic(arch, log);
       break;
 
-   // Transparent buffers / continuous assigns: always keep as signal assignment
+   // Transparent buffers / continuous assigns: signal assignment, except
+   // scalar drives with a non-strong strength spec which need the
+   // strength buffer to enter resolution at the specified level
    case IVL_LO_BUFT:
    case IVL_LO_BUFZ:
-      default_logic(arch, log);
+      if (sv2vhdl && ivl_logic_width(log) == 1
+          && (ivl_logic_drive0(log) != IVL_DR_STRONG
+              || ivl_logic_drive1(log) != IVL_DR_STRONG))
+         sv_strength_logic(arch, log);
+      else
+         default_logic(arch, log);
       break;
 
    case IVL_LO_UDP:
