@@ -193,6 +193,53 @@ static vhdl_expr *build_display_text(vhdl_procedural *proc,
                      text->add_expr(f);
                   }
                   break;
+               case 'v': case 'V':
+                  {
+                     // %v: value with drive strength for a SCALAR
+                     // signal argument — exact strengths come from the
+                     // kernel net solver via sv_vstr, with a value-
+                     // alphabet fallback for non-kernel nets.  Every
+                     // other %v shape (vectors, expressions) keeps the
+                     // historical default handling.
+                     assert(i < count);
+                     ivl_expr_t netp = ivl_stmt_parm(stmt, i);
+                     if (netp == NULL
+                         || ivl_expr_type(netp) != IVL_EX_SIGNAL
+                         || ivl_expr_width(netp) != 1)
+                        goto default_fmt;
+
+                     i++;
+                     vhdl_expr *base = translate_expr(netp);
+                     if (NULL == base)
+                        return NULL;
+                     emit_wait_for_0(proc, container, stmt, base);
+                     const vhdl_type *bt = base->get_type();
+                     if (bt == NULL || bt->get_name() != VHDL_TYPE_LOGIC3D) {
+                        // Consumed but not a logic3d scalar: plain
+                        // 4-state character
+                        vhdl_fcall *f = new vhdl_fcall("sv_bstr",
+                                                       vhdl_type::string());
+                        vhdl_fcall *conv = new vhdl_fcall("to_std_logic_vector",
+                           vhdl_type::std_logic_vector(0, 0));
+                        conv->add_expr(base);
+                        f->add_expr(conv);
+                        text->add_expr(f);
+                        break;
+                     }
+
+                     ivl_signal_t vsig = ivl_expr_signal(netp);
+                     string vpath =
+                        string(ivl_scope_name(ivl_signal_scope(vsig)))
+                        + "." + ivl_signal_basename(vsig);
+                     for (size_t k = 0; k < vpath.size(); k++)
+                        vpath[k] = tolower(vpath[k]);
+                     vhdl_fcall *f = new vhdl_fcall("sv_vstr",
+                                                    vhdl_type::string());
+                     f->add_expr(base);
+                     f->add_expr(new vhdl_const_string(vpath.c_str()));
+                     text->add_expr(f);
+                  }
+                  break;
                case 'h': case 'H': case 'x': case 'X':
                case 'b': case 'B':
                case 'o': case 'O':
@@ -307,6 +354,7 @@ static vhdl_expr *build_display_text(vhdl_procedural *proc,
                   }
                   break;
                default:
+               default_fmt:
                   {
                      assert(i < count);
                      ivl_expr_t netp = ivl_stmt_parm(stmt, i++);
