@@ -55,6 +55,10 @@ struct scope_nexus_t {
 struct const_drv_t {
    vhdl_expr  *expr;
    ivl_drive_t drive0, drive1;
+   // Raw constant bit chars (LSB first, from ivl_const_bits): the
+   // per-bit strength-buffer emission for vector constants needs the
+   // individual bit values, not the packed vhdl expression
+   string      bits;
 };
 
 struct nexus_private_t {
@@ -65,6 +69,7 @@ struct nexus_private_t {
    // so the strengths live only here
    ivl_drive_t const_drive0 = IVL_DR_STRONG;
    ivl_drive_t const_drive1 = IVL_DR_STRONG;
+   string const_bits;          // raw bit chars of const_driver (LSB first)
    // Second and later constant drivers on the same nexus (opposing
    // strength-spec assigns): the single const_driver slot kept only
    // the last one and silently dropped the rest
@@ -350,15 +355,17 @@ void draw_nexus(ivl_nexus_t nexus)
             cexpr =
                new vhdl_const_bits(ivl_const_bits(con), ivl_const_width(con),
                                    ivl_const_signed(con) != 0);
+         const string cbits(ivl_const_bits(con), ivl_const_width(con));
 
          if (priv->const_driver == NULL) {
             priv->const_driver = cexpr;
             priv->const_drive0 = ivl_nexus_ptr_drive0(nexus_ptr);
             priv->const_drive1 = ivl_nexus_ptr_drive1(nexus_ptr);
+            priv->const_bits = cbits;
          }
          else {
             const_drv_t extra = { cexpr, ivl_nexus_ptr_drive0(nexus_ptr),
-                                  ivl_nexus_ptr_drive1(nexus_ptr) };
+                                  ivl_nexus_ptr_drive1(nexus_ptr), cbits };
             priv->const_extra.push_back(extra);
          }
 
@@ -1564,7 +1571,8 @@ extern "C" int draw_constant_drivers(ivl_scope_t scope, void *)
                list<const_drv_t> all;
                const_drv_t first = { priv->const_driver,
                                      priv->const_drive0,
-                                     priv->const_drive1 };
+                                     priv->const_drive1,
+                                     priv->const_bits };
                all.push_back(first);
                all.splice(all.end(), priv->const_extra);
                // If ANY constant driver has a strength spec, route ALL
@@ -1579,18 +1587,44 @@ extern "C" int draw_constant_drivers(ivl_scope_t scope, void *)
                   if (it->drive0 != IVL_DR_STRONG
                       || it->drive1 != IVL_DR_STRONG)
                      any_nonstrong = true;
+               const unsigned sig_w = ivl_signal_width(sig);
                int cd_n = 0;
                for (list<const_drv_t>::iterator it = all.begin();
                     it != all.end(); ++it, ++cd_n) {
                   vhdl_var_ref *dref =
                      cd_n == 0 ? ref : nexus_to_var_ref(arch_scope, nex);
-                  if (get_sv2vhdl_mode() && ivl_signal_width(sig) == 1
+                  if (get_sv2vhdl_mode() && sig_w == 1
                       && any_nonstrong) {
                      ostringstream bs;
                      bs << "cd" << cd_n << "_" << ivl_signal_basename(sig);
                      emit_strength_buf(ent->get_arch(), dref, it->expr,
                                        it->drive1, it->drive0,
                                        bs.str().c_str());
+                  }
+                  else if (get_sv2vhdl_mode() && sig_w > 1
+                           && any_nonstrong
+                           && it->bits.length() == sig_w
+                           && dref->get_type() != NULL
+                           && dref->get_type()->get_name()
+                              == VHDL_TYPE_LOGIC3D_VECTOR) {
+                     // Vector constant with a strength spec: one
+                     // strength buffer per bit so each bit's kernel
+                     // net resolves at the specified level and the
+                     // str1/str0 selection happens per bit value
+                     // (multi_bit_strength).  bits[b] is canonical
+                     // LSB-first, matching the (b) slice.
+                     for (unsigned b = 0; b < sig_w; b++) {
+                        vhdl_var_ref *bref =
+                           nexus_to_var_ref(arch_scope, nex);
+                        bref->set_slice(new vhdl_const_int(b));
+                        ostringstream bs;
+                        bs << "cd" << cd_n << "b" << b << "_"
+                           << ivl_signal_basename(sig);
+                        emit_strength_buf(ent->get_arch(), bref,
+                                          new vhdl_const_bit(it->bits[b]),
+                                          it->drive1, it->drive0,
+                                          bs.str().c_str());
+                     }
                   }
                   else
                      ent->get_arch()->add_stmt

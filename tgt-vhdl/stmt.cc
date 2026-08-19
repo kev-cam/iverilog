@@ -35,6 +35,8 @@ using namespace std;
 
 static void emit_wait_for_0(vhdl_procedural *proc, stmt_container *container,
                             ivl_statement_t stmt, vhdl_expr *expr);
+static bool number_is_long(ivl_expr_t expr);
+static long get_number_as_long(ivl_expr_t expr);
 
 /*
  * VHDL has no real equivalent of Verilog's $finish task. The
@@ -51,6 +53,10 @@ static void emit_wait_for_0(vhdl_procedural *proc, stmt_container *container,
 static int draw_stask_finish(vhdl_procedural *, stmt_container *container,
                              ivl_statement_t)
 {
+   // Emit any $write text still waiting for a newline before ending
+   if (get_sv2vhdl_mode())
+      container->add_stmt(new vhdl_pcall_stmt("sv_write_flush"));
+
    const char *use_vhpi = ivl_design_flag(get_vhdl_design(), "use-vhpi-finish");
    if (strcmp(use_vhpi, "1") == 0) {
       //get_active_entity()->requires_package("work.Verilog_Support");
@@ -84,13 +90,14 @@ static char parse_octal(const char *p)
 // there, and none can be emitted. Returns NULL on translation failure.
 static vhdl_expr *build_display_text(vhdl_procedural *proc,
                                      stmt_container *container,
-                                     ivl_statement_t stmt)
+                                     ivl_statement_t stmt,
+                                     int first_parm = 0)
 {
    vhdl_binop_expr *text = new vhdl_binop_expr(VHDL_BINOP_CONCAT,
                                                vhdl_type::string());
 
    const int count = ivl_stmt_parm_count(stmt);
-   int i = 0;
+   int i = first_parm;
    while (i < count) {
       // $display may have an empty parameter, in which case
       // the expression will be null
@@ -108,8 +115,13 @@ static vhdl_expr *build_display_text(vhdl_procedural *proc,
                // Octal escape
                char ch = parse_octal(p+1);
                if (ch == '\n') {
-                  // Is there a better way of handling newlines?
-                  // Maybe generate another report statement
+                  // Embedded newline: VHDL string literals cannot hold
+                  // LF, so flush and concatenate the LF character
+                  // (multi_bit_strength gold needs the line break)
+                  text->add_expr(new vhdl_const_string(ss.str()));
+                  ss.str("");
+                  text->add_expr(new vhdl_var_ref("LF",
+                                                  vhdl_type::string()));
                }
                else
                   ss << ch;   // NULs dropped later, by vhdl_const_string::emit
@@ -195,17 +207,37 @@ static vhdl_expr *build_display_text(vhdl_procedural *proc,
                   break;
                case 'v': case 'V':
                   {
-                     // %v: value with drive strength for a SCALAR
-                     // signal argument — exact strengths come from the
-                     // kernel net solver via sv_vstr, with a value-
-                     // alphabet fallback for non-kernel nets.  Every
-                     // other %v shape (vectors, expressions) keeps the
-                     // historical default handling.
+                     // %v: value with drive strength.  Scalar logic3d
+                     // signals, vector logic3d signals (per-bit,
+                     // MSB-first, '_'-joined) and constant bit-selects
+                     // query the kernel net solver via sv_vstr, with a
+                     // value-alphabet fallback for non-kernel nets.
+                     // Every other %v shape keeps the historical
+                     // default handling.
                      assert(i < count);
                      ivl_expr_t netp = ivl_stmt_parm(stmt, i);
-                     if (netp == NULL
-                         || ivl_expr_type(netp) != IVL_EX_SIGNAL
-                         || ivl_expr_width(netp) != 1)
+                     ivl_signal_t vsig = NULL;
+                     long sel_idx = -1;
+                     if (netp != NULL
+                         && ivl_expr_type(netp) == IVL_EX_SIGNAL)
+                        vsig = ivl_expr_signal(netp);
+                     else if (netp != NULL
+                              && ivl_expr_type(netp) == IVL_EX_SELECT
+                              && ivl_expr_width(netp) == 1) {
+                        // Constant bit-select of a signal: the kernel
+                        // net key is the indexed actual, e.g. w(2)
+                        ivl_expr_t bse = ivl_expr_oper1(netp);
+                        ivl_expr_t off = ivl_expr_oper2(netp);
+                        if (bse != NULL && off != NULL
+                            && ivl_expr_type(bse) == IVL_EX_SIGNAL
+                            && (ivl_expr_type(off) == IVL_EX_NUMBER
+                                || ivl_expr_type(off) == IVL_EX_ULONG)
+                            && number_is_long(off)) {
+                           vsig = ivl_expr_signal(bse);
+                           sel_idx = get_number_as_long(off);
+                        }
+                     }
+                     if (vsig == NULL)
                         goto default_fmt;
 
                      i++;
@@ -214,9 +246,12 @@ static vhdl_expr *build_display_text(vhdl_procedural *proc,
                         return NULL;
                      emit_wait_for_0(proc, container, stmt, base);
                      const vhdl_type *bt = base->get_type();
-                     if (bt == NULL || bt->get_name() != VHDL_TYPE_LOGIC3D) {
-                        // Consumed but not a logic3d scalar: plain
-                        // 4-state character
+                     const vhdl_type_name_t btn =
+                        bt == NULL ? VHDL_TYPE_STD_LOGIC : bt->get_name();
+                     if (btn != VHDL_TYPE_LOGIC3D
+                         && btn != VHDL_TYPE_LOGIC3D_VECTOR) {
+                        // Consumed but not a logic3d shape: plain
+                        // 4-state characters
                         vhdl_fcall *f = new vhdl_fcall("sv_bstr",
                                                        vhdl_type::string());
                         vhdl_fcall *conv = new vhdl_fcall("to_std_logic_vector",
@@ -227,16 +262,76 @@ static vhdl_expr *build_display_text(vhdl_procedural *proc,
                         break;
                      }
 
-                     ivl_signal_t vsig = ivl_expr_signal(netp);
                      string vpath =
                         string(ivl_scope_name(ivl_signal_scope(vsig)))
                         + "." + ivl_signal_basename(vsig);
+                     if (sel_idx >= 0) {
+                        ostringstream sfx;
+                        sfx << "(" << sel_idx << ")";
+                        vpath += sfx.str();
+                     }
                      for (size_t k = 0; k < vpath.size(); k++)
                         vpath[k] = tolower(vpath[k]);
                      vhdl_fcall *f = new vhdl_fcall("sv_vstr",
                                                     vhdl_type::string());
                      f->add_expr(base);
                      f->add_expr(new vhdl_const_string(vpath.c_str()));
+                     text->add_expr(f);
+                  }
+                  break;
+               case 'c': case 'C':
+                  {
+                     // %c: the argument's low 8 bits as one ASCII
+                     // character (historically fell into the default
+                     // 'image path, printing logic3d tuples)
+                     assert(i < count);
+                     ivl_expr_t netp = ivl_stmt_parm(stmt, i++);
+                     assert(netp);
+                     vhdl_expr *base = translate_expr(netp);
+                     if (NULL == base)
+                        return NULL;
+                     emit_wait_for_0(proc, container, stmt, base);
+                     const vhdl_type *bt = base->get_type();
+                     const vhdl_type_name_t btn = bt == NULL
+                        ? VHDL_TYPE_INTEGER : bt->get_name();
+                     vhdl_expr *slv = NULL;
+                     if (btn == VHDL_TYPE_LOGIC3D_VECTOR) {
+                        vhdl_fcall *conv = new vhdl_fcall("to_std_logic_vector",
+                           vhdl_type::std_logic_vector(bt->get_msb(),
+                                                       bt->get_lsb()));
+                        conv->add_expr(base);
+                        slv = conv;
+                     } else if (btn == VHDL_TYPE_LOGIC3D) {
+                        vhdl_fcall *conv = new vhdl_fcall("to_std_logic_vector",
+                           vhdl_type::std_logic_vector(0, 0));
+                        conv->add_expr(base);
+                        slv = conv;
+                     } else if ((btn == VHDL_TYPE_UNSIGNED
+                                 || btn == VHDL_TYPE_SIGNED)
+                                && !base->constant()) {
+                        vhdl_fcall *conv = new vhdl_fcall("std_logic_vector",
+                           vhdl_type::std_logic_vector(bt->get_msb(),
+                                                       bt->get_lsb()));
+                        conv->add_expr(base);
+                        slv = conv;
+                     } else if (btn == VHDL_TYPE_STD_LOGIC_VECTOR) {
+                        slv = base;
+                     } else {
+                        // Integer-typed (character literal or sized
+                        // constant): build the 8-bit vector directly
+                        vhdl_type itype(VHDL_TYPE_INTEGER);
+                        vhdl_fcall *num = new vhdl_fcall("to_unsigned",
+                           vhdl_type::nunsigned(8));
+                        num->add_expr(base->cast(&itype));
+                        num->add_expr(new vhdl_const_int(8));
+                        vhdl_fcall *conv = new vhdl_fcall("std_logic_vector",
+                           vhdl_type::std_logic_vector(7, 0));
+                        conv->add_expr(num);
+                        slv = conv;
+                     }
+                     vhdl_fcall *f = new vhdl_fcall("sv_cstr",
+                                                    vhdl_type::string());
+                     f->add_expr(slv);
                      text->add_expr(f);
                   }
                   break;
@@ -522,12 +617,60 @@ static vhdl_expr *build_display_text(vhdl_procedural *proc,
 // Generate VHDL report statements for Verilog $display/$write
 static int draw_stask_display(vhdl_procedural *proc,
                               stmt_container *container,
-                              ivl_statement_t stmt)
+                              ivl_statement_t stmt,
+                              bool newline)
 {
    vhdl_expr *text = build_display_text(proc, container, stmt);
    if (NULL == text)
       return 1;
-   container->add_stmt(new vhdl_report_stmt(text));
+   // vvp line semantics: $write text accumulates in the shared line
+   // buffer until a newline arrives; $display completes the pending
+   // line.  Both print through report inside sv_display_pkg.
+   vhdl_pcall_stmt *pc =
+      new vhdl_pcall_stmt(newline ? "sv_display_line" : "sv_write_buf");
+   pc->add_expr(text);
+   container->add_stmt(pc);
+   return 0;
+}
+
+// $swrite(dest, fmt, args...): format into a string and store it in
+// dest as packed 8-bit ASCII, right-justified and zero-filled (the
+// Verilog string-in-reg convention, what %s/%0s of the reg expects).
+// The formatter is the $display machinery starting at parameter 1.
+static int draw_stask_swrite(vhdl_procedural *proc,
+                             stmt_container *container,
+                             ivl_statement_t stmt)
+{
+   ivl_expr_t dst = ivl_stmt_parm(stmt, 0);
+   if (dst == NULL || ivl_expr_type(dst) != IVL_EX_SIGNAL) {
+      error("$swrite destination must be a simple register");
+      return 1;
+   }
+
+   vhdl_expr *text = build_display_text(proc, container, stmt, 1);
+   if (NULL == text)
+      return 1;
+
+   ivl_signal_t sig = ivl_expr_signal(dst);
+   vhdl_var_ref *lhs =
+      nexus_to_var_ref(proc->get_scope(), ivl_signal_nex(sig, 0));
+
+   vhdl_fcall *conv = new vhdl_fcall("sv_str2vec", lhs->get_type());
+   conv->add_expr(text);
+   conv->add_expr(new vhdl_const_int(ivl_signal_width(sig)));
+
+   // Same blocking-emulation shape as make_assignment: signal targets
+   // register as blocking so later same-step reads insert wait-for-0
+   vhdl_decl *decl = proc->get_scope()->get_decl(lhs->get_name());
+   if (decl != NULL
+       && decl->assignment_type() == vhdl_decl::ASSIGN_NONBLOCK
+       && !proc->get_scope()->initializing()) {
+      if (proc->get_scope()->allow_signal_assignment())
+         proc->add_blocking_target(lhs);
+      container->add_stmt(new vhdl_nbassign_stmt(lhs, conv));
+   }
+   else
+      container->add_stmt(new vhdl_assign_stmt(lhs, conv));
    return 0;
 }
 
@@ -856,9 +999,11 @@ static int draw_stask(vhdl_procedural *proc, stmt_container *container,
    const char *name = ivl_stmt_name(stmt);
 
    if (strcmp(name, "$display") == 0)
-      return draw_stask_display(proc, container, stmt);
+      return draw_stask_display(proc, container, stmt, true);
    else if (strcmp(name, "$write") == 0)
-      return draw_stask_display(proc, container, stmt);
+      return draw_stask_display(proc, container, stmt, false);
+   else if (strcmp(name, "$swrite") == 0)
+      return draw_stask_swrite(proc, container, stmt);
    else if (strcmp(name, "$monitor") == 0)
       return draw_stask_monitor(proc, container, stmt, true);
    else if (strcmp(name, "$strobe") == 0)

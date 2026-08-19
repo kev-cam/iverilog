@@ -613,6 +613,42 @@ static void sv_strength_logic(vhdl_arch *arch, ivl_net_logic_t log)
 }
 
 /*
+ * A width-N strength-spec assign: one strength buffer per bit.  Each
+ * bit of the target becomes its own kernel net — registration keys
+ * nets by the indexed port-map actual (e.g. w(2)), so per-bit
+ * instances group and resolve independently, and the per-value
+ * str1/str0 selection happens per bit (vvp_scalar_value).  Falls back
+ * to a plain assign when either side is not an indexable
+ * logic3d_vector signal.
+ */
+static bool sv_strength_logic_vec(vhdl_arch *arch, ivl_net_logic_t log)
+{
+   vhdl_scope *scope = arch->get_scope();
+   const unsigned width = ivl_logic_width(log);
+
+   vhdl_var_ref *ytest = nexus_to_var_ref(scope, ivl_logic_pin(log, 0));
+   vhdl_var_ref *dtest = readable_ref(scope, ivl_logic_pin(log, 1));
+   if (ytest->get_type() == NULL || dtest->get_type() == NULL
+       || ytest->get_type()->get_name() != VHDL_TYPE_LOGIC3D_VECTOR
+       || dtest->get_type()->get_name() != VHDL_TYPE_LOGIC3D_VECTOR)
+      return false;
+
+   const string base =
+      scoped_basename(ivl_logic_basename(log), ivl_logic_scope(log));
+   for (unsigned i = 0; i < width; i++) {
+      vhdl_var_ref *y = nexus_to_var_ref(scope, ivl_logic_pin(log, 0));
+      y->set_slice(new vhdl_const_int(i));
+      vhdl_var_ref *d = readable_ref(scope, ivl_logic_pin(log, 1));
+      d->set_slice(new vhdl_const_int(i));
+      ostringstream bs;
+      bs << base << "_b" << i;
+      emit_strength_buf(arch, y, d, ivl_logic_drive1(log),
+                        ivl_logic_drive0(log), bs.str().c_str());
+   }
+   return true;
+}
+
+/*
  * True when the nexus carries strength-bearing drivers: switches, pull
  * gates, or any pointer with a non-strong drive spec.  A plain assign
  * copying from such a net must re-strengthen the value — its weak
@@ -746,10 +782,13 @@ void draw_logic(vhdl_arch *arch, ivl_net_logic_t log)
    // strength buffer to enter resolution at the specified level
    case IVL_LO_BUFT:
    case IVL_LO_BUFZ:
-      if (sv2vhdl && ivl_logic_width(log) == 1
-          && (ivl_logic_drive0(log) != IVL_DR_STRONG
-              || ivl_logic_drive1(log) != IVL_DR_STRONG))
-         sv_strength_logic(arch, log);
+      if (sv2vhdl && (ivl_logic_drive0(log) != IVL_DR_STRONG
+                      || ivl_logic_drive1(log) != IVL_DR_STRONG)) {
+         if (ivl_logic_width(log) == 1)
+            sv_strength_logic(arch, log);
+         else if (!sv_strength_logic_vec(arch, log))
+            default_logic(arch, log);
+      }
       else
          default_logic(arch, log);
       break;
