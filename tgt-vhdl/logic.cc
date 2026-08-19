@@ -572,30 +572,24 @@ static void sv_buf_not_logic(vhdl_arch *arch, ivl_net_logic_t log)
  * A bare `w <= x` would enter resolution at full strength and turn
  * weak-vs-strong contention into X.
  */
-static void sv_strength_logic(vhdl_arch *arch, ivl_net_logic_t log)
+void emit_strength_buf(vhdl_arch *arch, vhdl_expr *y, vhdl_expr *data,
+                       ivl_drive_t d1, ivl_drive_t d0, const char *basename)
 {
    // ivl_drive_t -> l3ds strength codes (ST_HIGHZ/WEAK/PULL/STRONG/
    // SUPPLY).  Drive specs only produce HiZ/weak/pull/strong/supply;
    // the charge strengths map defensively onto the nearest drive level.
    static const int l3ds_code[8] = { 0, 2, 2, 2, 4, 4, 8, 16 };
 
-   string inst_name = make_inst_name(
-      scoped_basename(ivl_logic_basename(log), ivl_logic_scope(log)).c_str(),
-      "sv_strength_buf");
+   string inst_name = make_inst_name(basename, "sv_strength_buf");
 
    vhdl_entity_inst *inst = new vhdl_entity_inst(
       inst_name.c_str(), "sv2vhdl", "sv_strength_buf", "strength");
 
-   vhdl_scope *scope = arch->get_scope();
+   inst->map_generic("str1", new vhdl_const_int(l3ds_code[d1 & 7]));
+   inst->map_generic("str0", new vhdl_const_int(l3ds_code[d0 & 7]));
 
-   inst->map_generic("str1",
-      new vhdl_const_int(l3ds_code[ivl_logic_drive1(log) & 7]));
-   inst->map_generic("str0",
-      new vhdl_const_int(l3ds_code[ivl_logic_drive0(log) & 7]));
+   inst->map_port("y", y);
 
-   inst->map_port("y", nexus_to_var_ref(scope, ivl_logic_pin(log, 0)));
-
-   vhdl_expr *data = readable_ref(scope, ivl_logic_pin(log, 1));
    if (data->get_type() != NULL
        && (data->get_type()->get_name() == VHDL_TYPE_STD_LOGIC
            || data->get_type()->get_name() == VHDL_TYPE_STD_ULOGIC)) {
@@ -605,8 +599,46 @@ static void sv_strength_logic(vhdl_arch *arch, ivl_net_logic_t log)
    }
    inst->map_port("data", data);
 
-   add_strength_comment(inst, log);
    arch->add_stmt(inst);
+}
+
+static void sv_strength_logic(vhdl_arch *arch, ivl_net_logic_t log)
+{
+   vhdl_scope *scope = arch->get_scope();
+   emit_strength_buf(arch,
+      nexus_to_var_ref(scope, ivl_logic_pin(log, 0)),
+      readable_ref(scope, ivl_logic_pin(log, 1)),
+      ivl_logic_drive1(log), ivl_logic_drive0(log),
+      scoped_basename(ivl_logic_basename(log), ivl_logic_scope(log)).c_str());
+}
+
+/*
+ * True when the nexus carries strength-bearing drivers: switches, pull
+ * gates, or any pointer with a non-strong drive spec.  A plain assign
+ * copying from such a net must re-strengthen the value — its weak
+ * alphabet codes (H/L) would otherwise enter the destination's
+ * resolution at weak strength instead of the assign's own strong.
+ */
+static bool nexus_has_strength(ivl_nexus_t nex)
+{
+   int nptrs = ivl_nexus_ptrs(nex);
+   for (int i = 0; i < nptrs; i++) {
+      ivl_nexus_ptr_t p = ivl_nexus_ptr(nex, i);
+      if (ivl_nexus_ptr_switch(p))
+         return true;
+      ivl_net_logic_t plog = ivl_nexus_ptr_log(p);
+      if (plog && (ivl_logic_type(plog) == IVL_LO_PULLUP
+                   || ivl_logic_type(plog) == IVL_LO_PULLDOWN))
+         return true;
+      ivl_drive_t d0 = ivl_nexus_ptr_drive0(p);
+      ivl_drive_t d1 = ivl_nexus_ptr_drive1(p);
+      // Input-only pins report HiZ/HiZ — not a strength spec
+      if (d0 == IVL_DR_HiZ && d1 == IVL_DR_HiZ)
+         continue;
+      if (d0 != IVL_DR_STRONG || d1 != IVL_DR_STRONG)
+         return true;
+   }
+   return false;
 }
 
 /*
@@ -618,6 +650,18 @@ static void default_logic(vhdl_arch *arch, ivl_net_logic_t log)
    vhdl_var_ref *lhs = nexus_to_var_ref(arch->get_scope(), output);
 
    vhdl_expr *rhs = translate_logic_inputs(arch->get_scope(), log);
+
+   // BUFZ copy from a strength-bearing scalar net: normalize the weak
+   // alphabet codes to driven ones (the assign's strength is its own)
+   const ivl_logic_t ltype = ivl_logic_type(log);
+   if (is_sv2vhdl_mode() && (ltype == IVL_LO_BUFZ || ltype == IVL_LO_BUFT)
+       && ivl_logic_width(log) == 1
+       && nexus_has_strength(ivl_logic_pin(log, 1))) {
+      vhdl_fcall *st =
+         new vhdl_fcall("l3d_strengthen", vhdl_type::logic3d());
+      st->add_expr(rhs);
+      rhs = st;
+   }
    vhdl_cassign_stmt *ass = new vhdl_cassign_stmt(lhs, rhs);
 
    ivl_expr_t delay = ivl_logic_delay(log, 1);

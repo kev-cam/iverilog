@@ -52,9 +52,23 @@ struct scope_nexus_t {
  * contained_within to allow several nested scopes to reference
  * the same signal.
  */
+struct const_drv_t {
+   vhdl_expr  *expr;
+   ivl_drive_t drive0, drive1;
+};
+
 struct nexus_private_t {
    list<scope_nexus_t> signals;
    vhdl_expr *const_driver;
+   // Drive strengths of the constant driver's nexus pointer: a
+   // strength-spec assign with a constant r-value has no BUFZ device,
+   // so the strengths live only here
+   ivl_drive_t const_drive0 = IVL_DR_STRONG;
+   ivl_drive_t const_drive1 = IVL_DR_STRONG;
+   // Second and later constant drivers on the same nexus (opposing
+   // strength-spec assigns): the single const_driver slot kept only
+   // the last one and silently dropped the rest
+   list<const_drv_t> const_extra;
    bool has_inout = false;     // nexus touches an inout port => bidirectional
    string inout_module;        // module type of that inout (for origin markup)
 };
@@ -324,15 +338,29 @@ void draw_nexus(ivl_nexus_t nexus)
       else if ((con = ivl_nexus_ptr_con(nexus_ptr))) {
          if (ivl_const_type(con) == IVL_VT_REAL) {
             priv->const_driver = new vhdl_const_real(ivl_const_real(con));
+            priv->const_drive0 = ivl_nexus_ptr_drive0(nexus_ptr);
+            priv->const_drive1 = ivl_nexus_ptr_drive1(nexus_ptr);
             ndrivers++;
             continue;
          }
+         vhdl_expr *cexpr;
          if (ivl_const_width(con) == 1)
-            priv->const_driver = new vhdl_const_bit(ivl_const_bits(con)[0]);
+            cexpr = new vhdl_const_bit(ivl_const_bits(con)[0]);
          else
-            priv->const_driver =
+            cexpr =
                new vhdl_const_bits(ivl_const_bits(con), ivl_const_width(con),
                                    ivl_const_signed(con) != 0);
+
+         if (priv->const_driver == NULL) {
+            priv->const_driver = cexpr;
+            priv->const_drive0 = ivl_nexus_ptr_drive0(nexus_ptr);
+            priv->const_drive1 = ivl_nexus_ptr_drive1(nexus_ptr);
+         }
+         else {
+            const_drv_t extra = { cexpr, ivl_nexus_ptr_drive0(nexus_ptr),
+                                  ivl_nexus_ptr_drive1(nexus_ptr) };
+            priv->const_extra.push_back(extra);
+         }
 
          // A constant is a sort of driver
          ndrivers++;
@@ -1528,8 +1556,46 @@ extern "C" int draw_constant_drivers(ivl_scope_t scope, void *)
 
                vhdl_var_ref *ref = nexus_to_var_ref(arch_scope, nex);
 
-               ent->get_arch()->add_stmt
-                  (new vhdl_cassign_stmt(ref, priv->const_driver));
+               // Scalar constant with a strength spec (assign
+               // (pull1, pull0) w = 1'b1): drive through the strength
+               // buffer so resolution sees the specified level instead
+               // of a full-strength assignment.  Opposing constant
+               // drivers on the same net each get their own driver.
+               list<const_drv_t> all;
+               const_drv_t first = { priv->const_driver,
+                                     priv->const_drive0,
+                                     priv->const_drive1 };
+               all.push_back(first);
+               all.splice(all.end(), priv->const_extra);
+               // If ANY constant driver has a strength spec, route ALL
+               // of them through strength buffers: the kernel solver
+               // then owns the whole resolution.  A remaining plain
+               // driver would re-resolve against the exported view in
+               // the two-level l3d alphabet, where supply-vs-strong
+               // collapses to X (drive_strength su1st0)
+               bool any_nonstrong = false;
+               for (list<const_drv_t>::iterator it = all.begin();
+                    it != all.end(); ++it)
+                  if (it->drive0 != IVL_DR_STRONG
+                      || it->drive1 != IVL_DR_STRONG)
+                     any_nonstrong = true;
+               int cd_n = 0;
+               for (list<const_drv_t>::iterator it = all.begin();
+                    it != all.end(); ++it, ++cd_n) {
+                  vhdl_var_ref *dref =
+                     cd_n == 0 ? ref : nexus_to_var_ref(arch_scope, nex);
+                  if (get_sv2vhdl_mode() && ivl_signal_width(sig) == 1
+                      && any_nonstrong) {
+                     ostringstream bs;
+                     bs << "cd" << cd_n << "_" << ivl_signal_basename(sig);
+                     emit_strength_buf(ent->get_arch(), dref, it->expr,
+                                       it->drive1, it->drive0,
+                                       bs.str().c_str());
+                  }
+                  else
+                     ent->get_arch()->add_stmt
+                        (new vhdl_cassign_stmt(dref, it->expr));
+               }
                priv->const_driver = NULL;
             }
 

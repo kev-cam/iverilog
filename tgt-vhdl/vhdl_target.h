@@ -19,6 +19,8 @@ int draw_stmt(vhdl_procedural *proc, stmt_container *container,
               ivl_statement_t stmt, bool is_last = false);
 int draw_lpm(vhdl_arch *arch, ivl_lpm_t lpm);
 void draw_logic(vhdl_arch *arch, ivl_net_logic_t log);
+void emit_strength_buf(vhdl_arch *arch, vhdl_expr *y, vhdl_expr *data,
+                       ivl_drive_t d1, ivl_drive_t d0, const char *basename);
 void draw_switches(vhdl_arch *arch, ivl_scope_t scope);
 
 vhdl_expr *translate_expr(ivl_expr_t e);
