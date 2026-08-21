@@ -472,6 +472,18 @@ static void seen_nexus(ivl_nexus_t nexus)
  * encountered before, the necessary code to connect up the nexus
  * will be generated.
  */
+// Non-asserting probe: is some signal on this nexus visible in scope?
+// (nexus_to_var_ref asserts on failure; icg2en needs a soft test)
+bool nexus_visible_in_scope(vhdl_scope *scope, ivl_nexus_t nexus)
+{
+   seen_nexus(nexus);
+   nexus_private_t *priv =
+      static_cast<nexus_private_t*>(ivl_nexus_get_private(nexus));
+   if (priv == NULL)
+      return false;
+   return visible_nexus(priv, scope) != NULL;
+}
+
 vhdl_var_ref *nexus_to_var_ref(vhdl_scope *scope, ivl_nexus_t nexus)
 {
    seen_nexus(nexus);

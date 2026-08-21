@@ -28,6 +28,8 @@
 #include <typeinfo>
 #include <limits>
 #include <set>
+#include <map>
+#include <vector>
 #include <algorithm>
 #include <iomanip>
 
@@ -37,6 +39,8 @@ static void emit_wait_for_0(vhdl_procedural *proc, stmt_container *container,
                             ivl_statement_t stmt, vhdl_expr *expr);
 static bool number_is_long(ivl_expr_t expr);
 static long get_number_as_long(ivl_expr_t expr);
+static vhdl_expr *icg2en_pos_term(vhdl_process *proc, ivl_nexus_t gnex,
+                                  std::string *sens_name);
 
 /*
  * VHDL has no real equivalent of Verilog's $finish task. The
@@ -1988,28 +1992,49 @@ static bool draw_synthesisable_wait(vhdl_process *proc, stmt_container *containe
 
    // Build a test for the clock event
    vhdl_fcall *edge = NULL;
+   bool clock_rising = false;
    ivl_nexus_t the_clock_net = *clock_net.begin();
    for (int i = 0; i < nevents; i++) {
       ivl_event_t event = ivl_stmt_events(stmt, i);
 
       const unsigned npos = ivl_event_npos(event);
       for (unsigned j = 0; j < npos; j++) {
-         if (ivl_event_pos(event, j) == the_clock_net)
+         if (ivl_event_pos(event, j) == the_clock_net) {
             edge = new vhdl_fcall("rising_edge", vhdl_type::boolean());
+            clock_rising = true;
+         }
       }
 
       const unsigned nneg = ivl_event_nneg(event);
       for (unsigned j = 0; j < nneg; j++)
-         if (ivl_event_neg(event, j) == the_clock_net)
+         if (ivl_event_neg(event, j) == the_clock_net) {
             edge = new vhdl_fcall("falling_edge", vhdl_type::boolean());
+            clock_rising = false;
+         }
    }
    assert(edge);
 
-   edge->add_expr(nexus_to_var_ref(proc->get_scope(), *clock_net.begin()));
+   // ICG->enable rewrite for the async-reset template: the reset elsif
+   // structure is untouched, only the clock term moves to the root
+   // clock + latched-enable guard (see icg2en_pos_term)
+   vhdl_expr *edge_test = NULL;
+   std::string icg_sens;
+   bool icg_rewrote = false;
+   if (clock_rising) {
+      edge_test = icg2en_pos_term(proc, the_clock_net, &icg_sens);
+      if (edge_test != NULL)
+         icg_rewrote = true;
+   }
+   if (edge_test == NULL) {
+      edge->add_expr(nexus_to_var_ref(proc->get_scope(), the_clock_net));
+      edge_test = edge;
+   }
+   else
+      delete edge;
 
    // Draw the clocked branch
    // For an asynchronous reset we just want this around the else branch,
-   stmt_container *else_container = body->add_elsif(edge);
+   stmt_container *else_container = body->add_elsif(edge_test);
 
    draw_stmt(proc, else_container, ivl_stmt_cond_false(sub_stmt));
 
@@ -2023,9 +2048,14 @@ static bool draw_synthesisable_wait(vhdl_process *proc, stmt_container *containe
    else
       container->add_stmt(body);
 
-   // Add all the edge triggered signals to the sensitivity list
+   // Add all the edge triggered signals to the sensitivity list (the
+   // rewritten gated clock pends on the root instead)
    for (set<ivl_nexus_t>::const_iterator it = edge_triggered.begin();
         it != edge_triggered.end(); ++it) {
+      if (icg_rewrote && *it == the_clock_net) {
+         proc->add_sensitivity(icg_sens);
+         continue;
+      }
       // Get the signal that represents this nexus in this scope
       vhdl_var_ref *ref = nexus_to_var_ref(proc->get_scope(), *it);
 
@@ -2039,6 +2069,386 @@ static bool draw_synthesisable_wait(vhdl_process *proc, stmt_container *containe
 
    // Don't bother with the default draw_wait
    return true;
+}
+
+
+/*
+ * SV2VHDL_ICG2EN: integrated-clock-gate -> clock-enable rewrite at
+ * translation (interp twin of the gsm GSM_ICG2EN pass).  A gated clock
+ *   assign gclk = clk & en_ff;            // AND
+ *   always @(clk, en) if (!clk) en_ff = en;   // transparent-LOW latch
+ * freezes en_ff across the clk-high phase, so for a posedge consumer
+ *   always @(posedge gclk) BODY
+ * the value of en_ff AT the root posedge equals the pre-edge value of
+ * its input cone and
+ *   always @(posedge clk) if (en_ff) BODY
+ * is delta-race-free (the latch does nothing at clk high).  Consumers
+ * then pend on the ROOT clock: one fastclk table / fused block covers
+ * the design.  Transparent-HIGH latches are NOT equivalent (decline).
+ * NEGEDGE consumers race the latch reopening in the same delta ->
+ * decline (poisons the net).  The gated net itself is kept: value
+ * readers and declined nets see it unchanged.  Per-net all-or-nothing:
+ * one non-rewritable edge consumer poisons the net so a rewritten
+ * (delta-earlier) flop can never feed a declined (delta-later) one on
+ * the SAME net; cross-net skew against declined nets is accepted and
+ * arbitrated by the differential gates.  Nested ICGs chase to the root
+ * and conjoin each level's latched enable.
+ */
+
+struct icg_info_t {
+   bool matched = false;
+   bool poisoned = false;
+   ivl_nexus_t root = NULL;                    // root clock after chasing
+   std::vector<ivl_scope_t> en_scopes;         // ICG scope per level
+   std::vector<ivl_signal_t> en_sigs;          // latched enable per level
+};
+
+static std::map<ivl_nexus_t, icg_info_t> g_icg_cache;
+static std::map<ivl_signal_t, std::pair<ivl_process_t, int> > g_sig_assigns;
+static bool g_icg_scanned = false;
+
+static bool icg2en_enabled()
+{
+   static int en = -1;
+   if (en < 0) {
+      const char *e = getenv("SV2VHDL_ICG2EN");
+      en = (e != NULL && *e == '1') ? 1 : 0;
+   }
+   return en != 0;
+}
+
+// Debug sink: "1" -> stderr; any other value -> append to that path
+// (the sv2ghdl driver redirects the backend's stderr to /dev/null)
+static FILE *icg2en_debug_fp()
+{
+   static FILE *fp = NULL;
+   static int init = 0;
+   if (!init) {
+      init = 1;
+      const char *e = getenv("SV2VHDL_ICG2EN_DEBUG");
+      if (e != NULL)
+         fp = (e[0] == '1' && e[1] == '\0') ? stderr : fopen(e, "a");
+   }
+   return fp;
+}
+
+static bool icg2en_debug()
+{
+   return icg2en_debug_fp() != NULL;
+}
+
+// Recursive lval collector for the assign map
+static void icg_collect_lvals(ivl_statement_t stmt, ivl_process_t proc)
+{
+   if (stmt == NULL)
+      return;
+   switch (ivl_statement_type(stmt)) {
+   case IVL_ST_ASSIGN:
+   case IVL_ST_ASSIGN_NB:
+      for (unsigned i = 0; i < ivl_stmt_lvals(stmt); i++) {
+         ivl_signal_t sig = ivl_lval_sig(ivl_stmt_lval(stmt, i));
+         if (sig == NULL)
+            continue;
+         std::pair<ivl_process_t, int> &e = g_sig_assigns[sig];
+         if (e.first != proc)
+            e.second++;         // count DISTINCT assigning processes
+         e.first = proc;
+      }
+      break;
+   case IVL_ST_BLOCK:
+   case IVL_ST_FORK:
+      for (unsigned i = 0; i < ivl_stmt_block_count(stmt); i++)
+         icg_collect_lvals(ivl_stmt_block_stmt(stmt, i), proc);
+      break;
+   case IVL_ST_CONDIT:
+      icg_collect_lvals(ivl_stmt_cond_true(stmt), proc);
+      icg_collect_lvals(ivl_stmt_cond_false(stmt), proc);
+      break;
+   case IVL_ST_CASE:
+   case IVL_ST_CASEX:
+   case IVL_ST_CASEZ:
+      for (unsigned i = 0; i < ivl_stmt_case_count(stmt); i++)
+         icg_collect_lvals(ivl_stmt_case_stmt(stmt, i), proc);
+      break;
+   case IVL_ST_WAIT:
+   case IVL_ST_DELAY:
+   case IVL_ST_DELAYX:
+   case IVL_ST_WHILE:
+   case IVL_ST_FOREVER:
+   case IVL_ST_REPEAT:
+      icg_collect_lvals(ivl_stmt_sub_stmt(stmt), proc);
+      break;
+   default:
+      break;
+   }
+}
+
+extern "C" int icg_scan_assigns_cb(ivl_process_t proc, void *)
+{
+   icg_collect_lvals(ivl_process_stmt(proc), proc);
+   return 0;
+}
+
+// Unwrap single-statement begin/end blocks
+static ivl_statement_t icg_unwrap(ivl_statement_t stmt)
+{
+   while (stmt != NULL && ivl_statement_type(stmt) == IVL_ST_BLOCK
+          && ivl_stmt_block_count(stmt) == 1)
+      stmt = ivl_stmt_block_stmt(stmt, 0);
+   return stmt;
+}
+
+// Is `s` the output of a transparent-LOW latch on ck_nexus?
+//   always @(ck, ...) if (!ck) s = <expr>;   (blocking or NBA, no else)
+static bool icg_match_latch(ivl_signal_t s, ivl_nexus_t ck_nexus)
+{
+   std::map<ivl_signal_t, std::pair<ivl_process_t, int> >::iterator it =
+      g_sig_assigns.find(s);
+   if (it == g_sig_assigns.end() || it->second.second != 1)
+      return false;
+   ivl_process_t proc = it->second.first;
+   if (ivl_process_type(proc) != IVL_PR_ALWAYS)
+      return false;
+   ivl_statement_t w = ivl_process_stmt(proc);
+   if (w == NULL || ivl_statement_type(w) != IVL_ST_WAIT)
+      return false;
+   bool ck_in_any = false;
+   for (unsigned i = 0; i < (unsigned)ivl_stmt_nevent(w); i++) {
+      ivl_event_t ev = ivl_stmt_events(w, i);
+      if (ivl_event_npos(ev) > 0 || ivl_event_nneg(ev) > 0)
+         return false;                      // edge-sensitive: not a latch
+      for (unsigned j = 0; j < ivl_event_nany(ev); j++)
+         if (ivl_event_any(ev, j) == ck_nexus)
+            ck_in_any = true;
+   }
+   if (!ck_in_any)
+      return false;
+   ivl_statement_t c = icg_unwrap(ivl_stmt_sub_stmt(w));
+   if (c == NULL || ivl_statement_type(c) != IVL_ST_CONDIT)
+      return false;
+   if (ivl_stmt_cond_false(c) != NULL)
+      return false;
+   ivl_expr_t cond = ivl_stmt_cond_expr(c);
+   if (cond == NULL || ivl_expr_type(cond) != IVL_EX_UNARY
+       || ivl_expr_opcode(cond) != '!')
+      return false;
+   ivl_expr_t ck = ivl_expr_oper1(cond);
+   if (ck == NULL || ivl_expr_type(ck) != IVL_EX_SIGNAL
+       || ivl_signal_nex(ivl_expr_signal(ck), 0) != ck_nexus)
+      return false;
+   ivl_statement_t a = icg_unwrap(ivl_stmt_cond_true(c));
+   if (a == NULL || (ivl_statement_type(a) != IVL_ST_ASSIGN
+                     && ivl_statement_type(a) != IVL_ST_ASSIGN_NB))
+      return false;
+   if (ivl_stmt_lvals(a) != 1 || ivl_lval_sig(ivl_stmt_lval(a, 0)) != s)
+      return false;
+   return true;
+}
+
+static icg_info_t &icg_classify(ivl_nexus_t gnex, int depth);
+
+static icg_info_t &icg_classify(ivl_nexus_t gnex, int depth)
+{
+   std::map<ivl_nexus_t, icg_info_t>::iterator hit = g_icg_cache.find(gnex);
+   if (hit != g_icg_cache.end())
+      return hit->second;
+   icg_info_t &info = g_icg_cache[gnex];    // inserted unmatched = cycle guard
+   if (depth > 4)
+      return info;
+
+   // Exactly one driver and it is a 1-bit two-input AND
+   ivl_net_logic_t gate = NULL;
+   for (unsigned i = 0; i < ivl_nexus_ptrs(gnex); i++) {
+      ivl_nexus_ptr_t p = ivl_nexus_ptr(gnex, i);
+      ivl_net_logic_t log = ivl_nexus_ptr_log(p);
+      if (log != NULL && ivl_logic_pin(log, 0) == gnex) {
+         if (gate != NULL)
+            return info;                    // multiple gate drivers
+         gate = log;
+      }
+      ivl_lpm_t lpm = ivl_nexus_ptr_lpm(p);
+      if (lpm != NULL && ivl_lpm_q(lpm) == gnex)
+         return info;
+      if (ivl_nexus_ptr_con(p) != NULL)
+         return info;
+      if (ivl_nexus_ptr_switch(p) != NULL)
+         return info;
+   }
+   if (gate == NULL || ivl_logic_type(gate) != IVL_LO_AND
+       || ivl_logic_pins(gate) != 3 || ivl_logic_width(gate) != 1)
+      return info;
+
+   ivl_scope_t gscope = ivl_logic_scope(gate);
+   ivl_nexus_t in[2] = { ivl_logic_pin(gate, 1), ivl_logic_pin(gate, 2) };
+
+   for (int orient = 0; orient < 2 && !info.matched; orient++) {
+      ivl_nexus_t en_nex = in[orient], ck_nex = in[1 - orient];
+      for (unsigned i = 0; i < ivl_nexus_ptrs(en_nex); i++) {
+         ivl_signal_t sig = ivl_nexus_ptr_sig(ivl_nexus_ptr(en_nex, i));
+         if (sig == NULL || ivl_signal_scope(sig) != gscope)
+            continue;
+         if (icg_match_latch(sig, ck_nex)) {
+            icg_info_t &inner = icg_classify(ck_nex, depth + 1);
+            info.matched = true;
+            if (inner.matched) {
+               info.root = inner.root;
+               info.en_scopes = inner.en_scopes;
+               info.en_sigs = inner.en_sigs;
+            }
+            else
+               info.root = ck_nex;
+            info.en_scopes.push_back(gscope);
+            info.en_sigs.push_back(sig);
+            break;
+         }
+      }
+   }
+   if (icg2en_debug() && info.matched)
+      fprintf(icg2en_debug_fp(), "icg2en: matched gate in %s (%zu enable level(s))\n",
+              ivl_scope_name(gscope), info.en_sigs.size());
+   return info;
+}
+
+// Poison pre-pass: any edge consumer of a matched gated net that the
+// rewrite cannot carry (negedge, multi-event, mixed lists) disqualifies
+// the WHOLE net.  Visibility/path checks happen at rewrite time and
+// poison there (first consumer draws before any rewrite commits... the
+// rewrite is per-process, so a late visibility failure would split the
+// net; instead visibility is ALSO checked here, conservatively, per
+// consumer module scope).
+// A consumer is rewritable when exactly ONE matched gated net appears,
+// as a single posedge, and every other edge in the wait rides an
+// UNMATCHED net (the async-reset form: posedge gclk or negedge rst_l).
+// Anything else — negedge on a gated net, several gated clocks, a
+// gated net inside an any-edge list used as an edge — poisons every
+// matched net the consumer touches (per-net all-or-nothing).
+extern "C" int icg_poison_cb(ivl_process_t proc, void *)
+{
+   ivl_statement_t w = ivl_process_stmt(proc);
+   if (w == NULL || ivl_statement_type(w) != IVL_ST_WAIT)
+      return 0;
+   const int nevents = ivl_stmt_nevent(w);
+
+   std::vector<icg_info_t*> touched;
+   int gated_pos = 0;
+   bool bad = false;
+   for (int i = 0; i < nevents; i++) {
+      ivl_event_t ev = ivl_stmt_events(w, i);
+      for (unsigned j = 0; j < ivl_event_nneg(ev); j++) {
+         icg_info_t &inf = icg_classify(ivl_event_neg(ev, j), 0);
+         if (inf.matched) { touched.push_back(&inf); bad = true; }
+      }
+      for (unsigned j = 0; j < ivl_event_npos(ev); j++) {
+         icg_info_t &inf = icg_classify(ivl_event_pos(ev, j), 0);
+         if (inf.matched) { touched.push_back(&inf); gated_pos++; }
+      }
+   }
+   if (touched.empty())
+      return 0;
+   if (gated_pos > 1)
+      bad = true;
+   if (bad) {
+      for (size_t k = 0; k < touched.size(); k++)
+         touched[k]->poisoned = true;
+      if (icg2en_debug())
+         fprintf(icg2en_debug_fp(), "icg2en: net poisoned (unrewritable "
+                 "consumer in %s)\n",
+                 ivl_scope_name(ivl_process_scope(proc)));
+   }
+   return 0;
+}
+
+static void icg_scan_once()
+{
+   if (g_icg_scanned)
+      return;
+   g_icg_scanned = true;
+   ivl_design_process(get_vhdl_design(), icg_scan_assigns_cb, NULL);
+   ivl_design_process(get_vhdl_design(), icg_poison_cb, NULL);
+}
+
+// Relative instance path from the consumer module scope down to the ICG
+// scope, dotted; empty when not a strict descendant
+static std::string icg_rel_path(ivl_scope_t module, ivl_scope_t icg_scope)
+{
+   std::vector<std::string> chain;
+   for (ivl_scope_t s = icg_scope; s != NULL; s = ivl_scope_parent(s)) {
+      if (s == module) {
+         std::string path;
+         for (std::vector<std::string>::reverse_iterator it = chain.rbegin();
+              it != chain.rend(); ++it) {
+            if (!path.empty())
+               path += ".";
+            path += *it;
+         }
+         return path;
+      }
+      chain.push_back(ivl_scope_basename(s));
+   }
+   return "";
+}
+
+// Build the replacement posedge term for a matched, unpoisoned gated
+// nexus: rising_edge(root_clk) and is_one(<<en>>)...; NULL = decline
+static vhdl_expr *icg2en_pos_term(vhdl_process *proc, ivl_nexus_t gnex,
+                                  std::string *sens_name)
+{
+   if (!icg2en_enabled() || !get_sv2vhdl_mode())
+      return NULL;
+   icg_scan_once();
+   icg_info_t &info = icg_classify(gnex, 0);
+   if (icg2en_debug())
+      fprintf(icg2en_debug_fp(), "icg2en: pos_term probe matched=%d "
+              "poisoned=%d\n", info.matched, info.poisoned);
+   if (!info.matched || info.poisoned)
+      return NULL;
+
+   if (!nexus_visible_in_scope(proc->get_scope(), info.root)) {
+      info.poisoned = true;      // all-or-nothing: keep the net whole
+      if (icg2en_debug())
+         fprintf(icg2en_debug_fp(), "icg2en: net poisoned (root clock not visible)\n");
+      return NULL;
+   }
+
+   ivl_scope_t module = get_active_scope();
+   while (module != NULL && (ivl_scope_type(module) == IVL_SCT_GENERATE
+                             || ivl_scope_type(module) == IVL_SCT_BEGIN))
+      module = ivl_scope_parent(module);
+
+   std::vector<std::string> paths;
+   for (size_t k = 0; k < info.en_sigs.size(); k++) {
+      std::string p = icg_rel_path(module, info.en_scopes[k]);
+      if (p.empty()) {
+         info.poisoned = true;
+         if (icg2en_debug())
+            fprintf(icg2en_debug_fp(), "icg2en: net poisoned (ICG not a descendant of "
+                    "%s)\n", module ? ivl_scope_name(module) : "?");
+         return NULL;
+      }
+      paths.push_back(p + "." + ivl_signal_basename(info.en_sigs[k]));
+   }
+
+   vhdl_var_ref *clk_ref = nexus_to_var_ref(proc->get_scope(), info.root);
+   vhdl_fcall *edge = new vhdl_fcall("rising_edge", vhdl_type::boolean());
+   edge->add_expr(clk_ref);
+
+   vhdl_binop_expr *conj =
+      new vhdl_binop_expr(VHDL_BINOP_AND, vhdl_type::boolean());
+   conj->add_expr(edge);
+   for (size_t k = 0; k < paths.size(); k++) {
+      vhdl_fcall *is1 = new vhdl_fcall("is_one", vhdl_type::boolean());
+      is1->add_expr(new vhdl_var_ref(
+         ("<< signal " + paths[k] + " : logic3d >>").c_str(),
+         vhdl_type::logic3d()));
+      conj->add_expr(is1);
+   }
+
+   *sens_name = clk_ref->get_name();
+   if (icg2en_debug())
+      fprintf(icg2en_debug_fp(), "icg2en: rewrote posedge consumer in %s -> root + %zu "
+              "enable(s)\n", module ? ivl_scope_name(module) : "?",
+              paths.size());
+   return conj;
 }
 
 /*
@@ -2186,6 +2596,21 @@ static int draw_wait(vhdl_procedural *_proc, stmt_container *container,
          int npos = ivl_event_npos(event);
          for (int j = 0; j < npos; j++) {
             ivl_nexus_t nexus = ivl_event_pos(event, j);
+
+            // ICG->enable rewrite: pend on the root clock with the
+            // latched enable as a guard (see icg2en_pos_term above)
+            if (nevents == 1 && npos == 1 && ivl_event_nneg(event) == 0
+                && ivl_event_nany(event) == 0) {
+               std::string sens;
+               vhdl_expr *term = icg2en_pos_term(proc, nexus, &sens);
+               if (term != NULL) {
+                  test->add_expr(term);
+                  if (!proc->contains_wait_stmt() && is_top_level)
+                     proc->add_sensitivity(sens);
+                  continue;
+               }
+            }
+
             vhdl_var_ref *ref = nexus_to_var_ref(proc->get_scope(), nexus);
             vhdl_fcall *detect =
                new vhdl_fcall("rising_edge", vhdl_type::boolean());
