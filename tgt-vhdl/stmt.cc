@@ -3497,35 +3497,53 @@ static int draw_wait(vhdl_procedural *_proc, stmt_container *container,
          }
       }
 
-      // Wake-shadow close (guarded flops only): a rewritten flop pends on
-      // the ROOT clock and wakes one-or-more deltas EARLIER than the
-      // original gated flop did.  While it then sits at the NBA
-      // `wait for 0 ns` it is off every pending list, so an async trigger
-      // (e.g. a derived reset like VeeR's core_rst_l AND gate) committing
-      // in a later delta of the same instant is dropped forever -- the
-      // original, waking later, caught it.  Close the hole with per-trigger
-      // snapshot variables: OR value-compare "missed edge" terms into the
-      // fire test, and (in nba_defer_commits) skip the trailing re-arm wait
-      // when a trigger moved during the shadow so the process loops and
-      // handles it immediately.
-      if (icg_rewrote && !icg_async_sigs.empty()) {
+      // Wake-shadow close: while an edge-triggered process sits at the
+      // NBA `wait for 0 ns` it is off every pending list, so an async
+      // trigger (e.g. a derived reset like VeeR's core_rst_l AND gate)
+      // committing in a later delta of the same instant is dropped
+      // forever.  This is a TRANSLATION-WIDE latent hole, not an ICG2EN
+      // one: any flop whose clock event coincides with the instant a
+      // derived reset settles can miss the reset and silently hold X
+      // (the pre-fix ICG2EN control build measurably dropped 30ns
+      // resets that the closed build took).  ICG2EN merely widens the
+      // exposure by re-pointing flops one delta earlier than their old
+      // gated clocks.  Close the hole for EVERY clocked process with
+      // async arms, using per-trigger snapshot variables: OR
+      // value-compare "missed edge" terms into the fire test, and (in
+      // nba_defer_commits) skip the trailing re-arm wait when a trigger
+      // moved during the shadow so the process loops and handles it
+      // immediately.  Residual: a full pulse entirely inside the shadow
+      // stays value-invisible; vector async triggers are skipped.
+      // Escape hatch: SV2VHDL_NBA_SHADOW=0 restores the old shape.
+      static int nba_shadow = -1;
+      if (nba_shadow < 0) {
+         const char *e = getenv("SV2VHDL_NBA_SHADOW");
+         nba_shadow = (e == NULL || atoi(e) != 0);
+      }
+      if (nba_shadow && get_sv2vhdl_mode() && !icg_async_sigs.empty()) {
          for (std::list<std::pair<std::string,int> >::const_iterator it =
                  icg_async_sigs.begin(); it != icg_async_sigs.end(); ++it) {
+            // Mixed any+edge lists are exotic and a level-compare term
+            // has no statically-safe initial: skip kind-0 arms
+            if (it->second == 0)
+               continue;
+
             std::string snap = "v_icg2en_snap_" + it->first;
             while (proc->get_scope()->have_declared(snap))
                snap += "_";
-            proc->get_scope()->add_decl(
-               new vhdl_var_decl(snap, vhdl_type::logic3d()));
+            vhdl_var_decl *sd =
+               new vhdl_var_decl(snap, vhdl_type::logic3d());
+            // Initial value keeps the missed-edge term PERMANENTLY false
+            // if this process never receives the NBA epilogue (variable-
+            // only writes leave it sensitivity-style with the snapshot
+            // never assigned): fall-detect needs is_zero(snap) true,
+            // rise-detect needs is_one(snap) true
+            sd->set_initial(new vhdl_var_ref(
+               it->second < 0 ? "L3D_0" : "L3D_1", vhdl_type::logic3d()));
+            proc->get_scope()->add_decl(sd);
 
             vhdl_expr *term = NULL;
-            if (it->second == 0) {
-               term = new vhdl_binop_expr(
-                  new vhdl_var_ref(it->first.c_str(), vhdl_type::logic3d()),
-                  VHDL_BINOP_NEQ,
-                  new vhdl_var_ref(snap.c_str(), vhdl_type::logic3d()),
-                  vhdl_type::boolean());
-            }
-            else {
+            {
                const char *fn = (it->second < 0) ? "is_zero" : "is_one";
                vhdl_fcall *now_f = new vhdl_fcall(fn, vhdl_type::boolean());
                now_f->add_expr(
