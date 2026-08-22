@@ -457,7 +457,7 @@ void draw_nexus(ivl_nexus_t nexus)
  * Ensure that a nexus has been initialised. I.e. all the necessary
  * statements, declarations, etc. have been generated.
  */
-static void seen_nexus(ivl_nexus_t nexus)
+void seen_nexus(ivl_nexus_t nexus)
 {
    if (ivl_nexus_get_private(nexus) == NULL)
       draw_nexus(nexus);
@@ -1103,6 +1103,20 @@ static void map_signal(ivl_signal_t to, const vhdl_entity *parent,
 {
    // TODO: Work for multiple words
    ivl_nexus_t nexus = ivl_signal_nex(to, 0);
+
+   // ICG2EN site rewiring: a gated clock port of a signature-split
+   // child takes the gate's direct clock input as its actual (the
+   // child entity's guard supplies the enable via an upward external
+   // name).  Only the ICG-ADJACENT site can see that net; pass-through
+   // levels (a wrapper whose own clk port carries the same gated net)
+   // keep their normal wiring — the repoint at the top of the chain
+   // feeds the root down the port association chain.
+   {
+      ivl_nexus_t root = NULL;
+      if (icg2en_site_root(to, &root) && root != NULL
+          && nexus_visible_in_scope(parent->get_arch()->get_scope(), root))
+         nexus = root;
+   }
    seen_nexus(nexus);
 
    vhdl_scope *arch_scope = parent->get_arch()->get_scope();
@@ -1208,6 +1222,10 @@ static void port_map(ivl_scope_t scope, const vhdl_entity *parent,
          assert(false);
       }
    }
+
+   // ICG2EN: synthetic guard-port associations for signature-covered
+   // gated clock ports of this child (see icg2en_map_enables)
+   icg2en_map_enables(scope, parent, inst);
 }
 
 /*
@@ -1377,6 +1395,10 @@ static void create_skeleton_entity_for(ivl_scope_t scope, int depth)
    // retain a 1-to-1 mapping of scope to VHDL element)
    vhdl_arch *arch = new vhdl_arch(tname, "from_verilog");
    vhdl_entity *ent = new vhdl_entity(tname, arch, depth);
+
+   // ICG2EN: synthetic guard ports follow from the signature alone so
+   // entity and sites can never disagree (see icg2en_add_entity_ports)
+   icg2en_add_entity_ports(scope, ent);
 
    // Record the original Verilog source location as a VHDL attribute so it
    // survives translation (debug, and --accel recovering the Verilog source).
@@ -1804,6 +1826,9 @@ extern "C" int draw_hierarchy(ivl_scope_t scope, void *_parent)
       // Make sure the name doesn't collide with anything we've
       // already declared
       avoid_name_collision(inst_name, parent_arch->get_scope());
+
+      // Record the finalized label for icg2en guard-path emission
+      icg2en_note_label(scope, inst_name);
 
       vhdl_comp_inst *inst =
          new vhdl_comp_inst(inst_name.c_str(), ent->get_name().c_str());

@@ -42,6 +42,15 @@ void ensure_signal_declared(ivl_signal_t sig);
 int draw_function_in_entity(ivl_scope_t scope, vhdl_entity *ent);
 vhdl_var_ref *nexus_to_var_ref(vhdl_scope *arch_scope, ivl_nexus_t nexus);
 bool nexus_visible_in_scope(vhdl_scope *scope, ivl_nexus_t nexus);
+// ICG2EN (stmt.cc): entity-split signature + site clock repointing
+bool icg2en_key_enabled();
+std::string icg2en_scope_signature(ivl_scope_t scope);
+bool icg2en_site_root(ivl_signal_t child_port, ivl_nexus_t *root_out);
+void seen_nexus(ivl_nexus_t nexus);
+void icg2en_add_entity_ports(ivl_scope_t scope, vhdl_entity *ent);
+void icg2en_map_enables(ivl_scope_t child, const vhdl_entity *parent,
+                        vhdl_comp_inst *inst);
+void icg2en_note_label(ivl_scope_t scope, const std::string &label);
 // Convert a bit/part/word index expression to a VHDL integer honouring the
 // VERILOG signedness of the index (a signed -1 index must become -1, not
 // 2**32-1: unsigned to_integer saturates it to integer'high and every

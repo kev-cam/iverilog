@@ -995,6 +995,20 @@ public:
    bool was_deposited(const std::string& name) const
       { return deposited_.count(name) > 0; }
 
+   // ICG2EN wake-shadow close: async trigger signals whose events can land
+   // while this process sits at the NBA `wait for 0 ns` (off every pending
+   // list) and would otherwise be dropped.  kind: -1 fall, +1 rise, 0 any.
+   // Each entry pairs the signal with its snapshot variable.
+   struct icg2en_shadow_t {
+      std::string sig, snap;
+      int kind;
+   };
+   void add_icg2en_shadow(const std::string& sig, const std::string& snap,
+                          int kind)
+      { icg2en_shadow_.push_back(icg2en_shadow_t{sig, snap, kind}); }
+   const std::list<icg2en_shadow_t>& get_icg2en_shadow() const
+      { return icg2en_shadow_; }
+
 protected:
    stmt_container stmts_;
    vhdl_scope scope_;
@@ -1011,6 +1025,9 @@ protected:
 
    // Signals deposited (:=) in this process (see mark_deposited).
    std::set<std::string> deposited_;
+
+   // ICG2EN wake-shadow entries (see add_icg2en_shadow).
+   std::list<icg2en_shadow_t> icg2en_shadow_;
 };
 
 

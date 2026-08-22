@@ -378,6 +378,19 @@ static void nba_defer_commits(vhdl_process *vhdl_proc, vhdl_entity *ent)
         it != seeds.rend(); ++it)
       stmts.push_front(*it);
 
+   // ICG2EN wake-shadow close, part 2: snapshot every async trigger just
+   // before the process goes off the pending lists.  The fire test already
+   // carries value-compare "missed edge" terms against these snapshots
+   // (built in draw_stmt).
+   typedef std::list<vhdl_procedural::icg2en_shadow_t> shadow_list_t;
+   const shadow_list_t &shadow = vhdl_proc->get_icg2en_shadow();
+   for (shadow_list_t::const_iterator it = shadow.begin();
+        it != shadow.end(); ++it) {
+      stmts.push_back(new vhdl_assign_stmt(
+         new vhdl_var_ref(it->snap.c_str(), vhdl_type::logic3d()),
+         new vhdl_var_ref(it->sig.c_str(), vhdl_type::logic3d())));
+   }
+
    // One hop to the Verilog NBA region, then all commits.
    stmts.push_back(new vhdl_wait_stmt(VHDL_WAIT_FOR0));
    for (std::list<vhdl_seq_stmt*>::iterator it = commits.begin();
@@ -392,7 +405,28 @@ static void nba_defer_commits(vhdl_process *vhdl_proc, vhdl_entity *ent)
         it != sens.end(); ++it)
       trailing->add_sensitivity(*it);
    sens.clear();
-   stmts.push_back(trailing);
+
+   if (shadow.empty()) {
+      stmts.push_back(trailing);
+   }
+   else {
+      // Re-arm only if no async trigger moved while we sat at the NBA
+      // wait; otherwise fall through so the implicit process loop handles
+      // the missed event via the snapshot-compare terms in the fire test.
+      vhdl_binop_expr *unchanged =
+         new vhdl_binop_expr(VHDL_BINOP_AND, vhdl_type::boolean());
+      for (shadow_list_t::const_iterator it = shadow.begin();
+           it != shadow.end(); ++it) {
+         unchanged->add_expr(new vhdl_binop_expr(
+            new vhdl_var_ref(it->sig.c_str(), vhdl_type::logic3d()),
+            VHDL_BINOP_EQ,
+            new vhdl_var_ref(it->snap.c_str(), vhdl_type::logic3d()),
+            vhdl_type::boolean()));
+      }
+      vhdl_if_stmt *rearm = new vhdl_if_stmt(unchanged);
+      rearm->get_then_container()->add_stmt(trailing);
+      stmts.push_back(rearm);
+   }
 }
 
 static void shadow_blocking_targets(vhdl_process *vhdl_proc, vhdl_entity *ent)
