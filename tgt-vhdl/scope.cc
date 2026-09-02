@@ -495,8 +495,12 @@ static void replace_consecutive_underscores(string& str)
 
 static bool is_vhdl_reserved_word(const string& word)
 {
-   // This is the complete list of VHDL reserved words
+   // Reserved words that must never be emitted as a bare identifier.
+   // The generated VHDL is analysed at the highest standard the target
+   // simulator supports, so every word reserved by ANY revision (plus the
+   // simulator's own extensions) has to be renamed.
    const char *vhdl_reserved[] = {
+      // IEEE 1076-1993 (section 13.9)
       "abs", "access", "after", "alias", "all", "and", "architecture",
       "array", "assert", "attribute", "begin", "block", "body", "buffer",
       "bus", "case", "component", "configuration", "constant", "disconnect",
@@ -510,6 +514,19 @@ static bool is_vhdl_reserved_word(const string& word)
       "severity", "signal", "shared", "sla", "sll", "sra", "srl", "subtype",
       "then", "to", "transport", "type", "unaffected", "units", "until", "use",
       "variable", "wait", "when", "while", "with", "xnor", "xor",
+      // IEEE 1076-2000/2002
+      "protected",
+      // IEEE 1076-2008 (section 15.10): keywords and PSL reserved words
+      "assume", "assume_guarantee", "context", "cover", "default",
+      "fairness", "force", "parameter", "property", "release", "restrict",
+      "restrict_guarantee", "sequence", "strong", "vmode", "vprop", "vunit",
+      // IEEE 1076-2019
+      "private", "view", "vpkg",
+      // NVC: tokenised unconditionally in every standard (src/lexer.l)
+      "reverse_range",
+      // NVC fork (kev-cam) --std=2040 pipe construct (PIPES.md); the lexer
+      // rule is not gated on the standard so it is reserved in all modes
+      "pipe",
       NULL
    };
 
