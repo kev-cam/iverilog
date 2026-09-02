@@ -397,8 +397,16 @@ NetExpr* make_prefix_var_offset(const NetNet*reg,
 	    unsigned long stride = reg->slice_width(idx+1);
 	    long lsb = pcur->get_lsb();
 	    long msb = pcur->get_msb();
-	      // Canonicalize the index to a 0-based slice number.
-	    NetExpr*tmp = normalize_variable_base(*ecur, msb, lsb, stride, msb > lsb);
+	      // Canonicalize the index to a 0-based slice number: idx-lsb for
+	      // a descending dim, lsb-idx for an ascending one, exactly as
+	      // NetNet::sb_to_idx does for a constant index. This is a single
+	      // ELEMENT position, so normalize with wid=1/is_up=true. Do NOT
+	      // pass the stride as the width: normalize_variable_base treats
+	      // wid/is_up as an indexed part select [base +: wid]/[base -: wid]
+	      // and, for a dim with msb == lsb (e.g. [DEPTH-1:0] with DEPTH=1),
+	      // "msb > lsb" is false, which selected the -: branch and injected
+	      // a spurious -(stride-1) into the element offset.
+	    NetExpr*tmp = normalize_variable_base(*ecur, msb, lsb, 1, true);
 	    if (stride != 1) {
 		  unsigned min_wid = tmp->expr_width();
 		  if (num_bits(stride) >= min_wid) {
@@ -1642,9 +1650,14 @@ NetExpr*collapse_array_exprs(Design*des, NetScope*scope,
 	    long lsb = pcur->get_lsb();
 	    long msb = pcur->get_msb();
 	      // This normalizes the expression of this index based on
-	      // the msb/lsb values.
-	    NetExpr*tmp = normalize_variable_base(*ecur, msb, lsb,
-						  cur_slice_width, msb > lsb);
+	      // the msb/lsb values: a 0-based ELEMENT number (idx-lsb for a
+	      // descending dim, lsb-idx for an ascending one), as
+	      // NetNet::sb_to_idx does for a constant index. Normalize with
+	      // wid=1/is_up=true -- passing the slice width as wid made
+	      // normalize_variable_base apply its [base -: wid] adjustment
+	      // whenever "msb > lsb" was false, i.e. for a dim with msb == lsb
+	      // (e.g. s_t [0:0] arr; arr[i].m), injecting -(stride-1).
+	    NetExpr*tmp = normalize_variable_base(*ecur, msb, lsb, 1, true);
 
 	      // If this slice has width, then scale it.
 	    if (net->slice_width(idx+1) != 1) {
