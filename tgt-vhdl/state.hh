@@ -44,6 +44,10 @@ vhdl_entity* find_entity(const std::string& name);
 void emit_all_entities(std::ostream& os, int max_depth);
 void fuse_comb_in_all_entities();
 void fuse_comb_processes(vhdl_entity *ent);   // defined in process.cc
+// Compose same-edge always blocks that assign a common signal into one
+// process (single VHDL driver), then run the deferred NBA/blocking shadow
+// passes. Must run after every process has been drawn. Defined in process.cc.
+void merge_edge_processes_in_all_entities();
 void free_all_vhdl_objects();
 
 // Get and set the active entity

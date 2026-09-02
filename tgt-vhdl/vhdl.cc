@@ -118,6 +118,12 @@ extern "C" int target_design(ivl_design_t des)
    if (0 == g_errors)
       ivl_design_process(des, draw_process, NULL);
 
+   // Same-edge always blocks assigning a common signal become one process
+   // (a Verilog variable has one driver); also runs the deferred NBA and
+   // blocking-shadow passes on edge processes (kill-switch: SV2VHDL_NO_MERGE=1).
+   if (0 == g_errors)
+      merge_edge_processes_in_all_entities();
+
    // Fuse per-intermediate comb processes into one topologically-ordered
    // block per architecture (kill-switch: SV2VHDL_NO_FUSE=1).
    if (0 == g_errors && getenv("SV2VHDL_NO_FUSE") == NULL)

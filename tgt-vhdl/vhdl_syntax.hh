@@ -540,6 +540,10 @@ public:
    void emit(std::ostream &of, int level) const;
    void add_sensitivity(const std::string &s) { sensitivity_.push_back(s); }
    vhdl_wait_type_t get_type() const { return type_; }
+   // The `until`/`for` expression (the edge-form promotion in process.cc
+   // moves a leading `wait until <edge test>` into a guarding `if`; the
+   // wait statement does not own the expression, see ~vhdl_wait_stmt).
+   vhdl_expr *get_expr() const { return expr_; }
    void find_vars(vhdl_var_set_t& read, vhdl_var_set_t& write);
 private:
    vhdl_wait_type_t type_;
@@ -731,6 +735,10 @@ public:
    virtual ~vhdl_decl();
 
    const std::string &get_name() const { return name_; }
+   // Rename in place (the merge pass renames process-local variables whose
+   // names would rebind when always-block bodies are joined; the references
+   // are renamed alongside via find_vars).
+   void set_name(const std::string &name) { name_ = name; }
    const vhdl_type *get_type() const;
    void set_type(const vhdl_type *t) { type_ = t; }
    void set_initial(vhdl_expr *initial);
@@ -980,6 +988,10 @@ public:
 
    void added_wait_stmt() { contains_wait_stmt_ = true; }
    bool contains_wait_stmt() const { return contains_wait_stmt_; }
+   // The only waits left in the body are `wait for 0 ns` that the
+   // blocking-shadow pass deletes (process.cc promote_wait_until_edge_form):
+   // the process can carry a sensitivity list again.
+   void clear_wait_stmts() { contains_wait_stmt_ = false; }
 
    // Managing set of blocking assignment targets in this block
    void add_blocking_target(const vhdl_var_ref* ref);

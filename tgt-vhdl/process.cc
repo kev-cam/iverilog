@@ -32,6 +32,9 @@
 #include <map>
 #include <climits>
 #include <utility>
+#include <cstdlib>
+#include <cctype>
+#include <strings.h>
 
 // ---------------------------------------------------------------------------
 // Shadow blocking-target signals with process variables.
@@ -273,6 +276,11 @@ static vhdl_expr *clone_slice(vhdl_expr *e)
 // then commit all of them after `wait for 0 ns` -- which STD_MX routes to
 // the INACTIVE region, i.e. after every same-timestep edge process (gated or
 // not) has evaluated with the pre-edge snapshot.
+// (process, signal) pairs whose NBA commit had to be WHOLE-signal -- the
+// only commits that can clobber another process's bits; consulted by the
+// merge pass diagnostics below.
+static std::set<std::pair<vhdl_process*, std::string> > g_whole_commits;
+
 static void nba_defer_commits(vhdl_process *vhdl_proc, vhdl_entity *ent)
 {
    if (!get_sv2vhdl_mode())
@@ -316,8 +324,10 @@ static void nba_defer_commits(vhdl_process *vhdl_proc, vhdl_entity *ent)
       // (possibly dynamic) index into the variable, commit the whole signal.
       // The dynamic index expression itself still reads SIGNALS (pre-edge,
       // Verilog statement-time evaluation). Whole commits assume this
-      // process is the signal's only driver -- true for the memory/buffer
-      // always blocks this matters for (the gated-clock fill buffers).
+      // process is the signal's only driver: merge_edge_processes_in_all_
+      // entities() (below) establishes that for same-edge always blocks by
+      // composing them into one process before this pass runs; blocks with
+      // different sensitivities that share a signal are reported there.
       vhdl_expr *commit_lhs_slice = NULL;
       vhdl_expr *commit_rhs_slice = NULL;
       if (!info.ambiguous && info.slice) {
@@ -329,6 +339,8 @@ static void nba_defer_commits(vhdl_process *vhdl_proc, vhdl_entity *ent)
             commit_lhs_slice = commit_rhs_slice = NULL;  // whole-signal
          }
       }
+      if (commit_lhs_slice == NULL)
+         g_whole_commits.insert(std::make_pair(vhdl_proc, sig_name));
 
       std::string var_name = "v_nba_" + sig_name;
       while (proc_scope->have_declared(var_name))
@@ -378,8 +390,32 @@ static void nba_defer_commits(vhdl_process *vhdl_proc, vhdl_entity *ent)
         it != seeds.rend(); ++it)
       stmts.push_front(*it);
 
-   // One hop to the Verilog NBA region, then all commits.
-   stmts.push_back(new vhdl_wait_stmt(VHDL_WAIT_FOR0));
+   // One hop to the Verilog NBA region, then all commits -- except on the
+   // initialisation run. Every process runs its body once at time 0 (the
+   // guard is false, so the commits just re-drive the seeds); a `wait for
+   // 0 ns` there leaves the process not yet parked on its clock/reset when
+   // the initial blocks' time-0 deposits (`initial begin clr = 1; ...`) fire
+   // their events at delta 1, and that X->1 posedge -- which the Verilog
+   // always block does see -- is lost (case5: async reset at time 0). So on
+   // the first pass commit at once and reach the `wait on` within delta 0.
+   {
+      std::string flag = "nba_init_run";
+      while (proc_scope->have_declared(flag))
+         flag += "_";
+      vhdl_var_decl *flag_decl =
+         new vhdl_var_decl(flag, vhdl_type::boolean());
+      flag_decl->set_initial(new vhdl_const_bool(true));
+      proc_scope->add_decl(flag_decl);
+
+      vhdl_if_stmt *first =
+         new vhdl_if_stmt(new vhdl_var_ref(flag, vhdl_type::boolean()));
+      first->get_then_container()->add_stmt(
+         new vhdl_assign_stmt(new vhdl_var_ref(flag, vhdl_type::boolean()),
+                              new vhdl_const_bool(false)));
+      first->get_else_container()->add_stmt(
+         new vhdl_wait_stmt(VHDL_WAIT_FOR0));
+      stmts.push_back(first);
+   }
    for (std::list<vhdl_seq_stmt*>::iterator it = commits.begin();
         it != commits.end(); ++it)
       stmts.push_back(*it);
@@ -574,7 +610,610 @@ static void shadow_blocking_targets(vhdl_process *vhdl_proc, vhdl_entity *ent)
    }
 }
 
+// ---------------------------------------------------------------------------
+// Same-edge always-block merging (STD_MX).
+//
+// A Verilog variable has exactly ONE driver -- the variable itself -- however
+// many always blocks assign to it. nba_defer_commits() above turns each
+// always block into a VHDL process that commits a WHOLE-signal snapshot
+// whenever its write set is not one static slice (dynamic index, mixed
+// slices). Two such processes on one signal are two VHDL drivers, each
+// re-asserting a stale copy of the other's bits. Under --std=2040 nvc does
+// not reject several sources on an unresolved signal (rt/model.c
+// check_multiple_sources) and, with no resolution function, its driving
+// value is simply the FIRST source's (calculate_driving_value, r == NULL):
+// every update by the other process is silently lost (VX_pipe_register
+// g_partial_reset: the data bits never left 'X').
+//
+// Rule. Within one architecture, always blocks that
+//   (a) are edge-triggered with a sensitivity list (no wait statement in the
+//       body, not postponed) and whose top-level statements are all the edge
+//       guard `if` (draw_wait's `if <edge test>` wrap or the async-reset
+//       template's `if rst .. elsif rising_edge(clk)`),
+//   (b) have the SAME sensitivity SET (sorted name list),
+//   (c) assign (`<=`) a common architecture-scope signal or port,
+//       transitively (A,B share x and B,C share y -> A,B,C), and
+//   (d) do not pair a BLOCKING write of a signal in one member with a
+//       NONBLOCKING write of it in another (blocking_vs_nba): the merged
+//       blocking shadow would rename the NBA member's pre-edge reads,
+//   (an always_ff drawn in the `wait until <edge>` form because it reads a
+//   blocking temporary is first promoted to the guarded form by
+//   promote_wait_until_edge_form, so it qualifies for (a) too)
+// are composed into ONE process, bodies concatenated in source order, BEFORE
+// the shadow passes run. Every member keeps its own edge guard, every
+// nonblocking right-hand side and index still reads signals (pre-edge
+// values, rename_nbassign_lhs only renames LHS bases), and the shadow then
+// collects every member's writes before the single commit -- the
+// composition Verilog's NBA region performs. Seeds are NOT weakened: the
+// survivor is the signal's only driver, so `v := sig` copies its own previous
+// output and every bit no member writes this edge holds exactly. Opposite
+// edges of one clock have the same sensitivity set and merge too; each
+// guard filters its own edge. Two members writing the SAME bit is a Verilog
+// race (unordered between blocks); source order wins here, one of the legal
+// outcomes. Blocks that share a signal but not a sensitivity set cannot be
+// composed; they are reported below when a whole-signal commit would clobber
+// the others' bits.
+//
+// Process-local variables (block-scope `for (int i ..)` indices, OOB/case
+// temporaries) move into the survivor's scope. So that joining the bodies
+// rebinds nothing, a member's local is renamed throughout that member's body
+// when (i) an earlier member already owns a local of that name, or (ii) any
+// other member references that name as an OUTER name (an arch signal the
+// local would capture). Renamed locals get a legal `<name>_<n>` suffix.
+// Kill-switch: SV2VHDL_NO_MERGE=1.
+// ---------------------------------------------------------------------------
+
+struct pending_edge_t {
+   vhdl_entity *ent;
+   vhdl_process *proc;
+   std::string comment;         // "Generated from always process ..."
+   std::string where;           // file:line of the always block
+   unsigned order;              // generation (source) order
+   std::string key;             // sorted sensitivity list
+   std::set<std::string> sigs;  // arch-scope signals it assigns
+};
+
+static std::list<pending_edge_t> g_pending_edge;
+
+static bool is_mergeable_edge_process(vhdl_process *p)
+{
+   return get_sv2vhdl_mode()
+      && getenv("SV2VHDL_NO_MERGE") == NULL
+      && p->is_edge_triggered()
+      && !p->contains_wait_stmt()
+      && !p->is_postponed()
+      && !p->get_sensitivity().empty();
+}
+
+// Every top-level statement of a body we concatenate must be the edge guard
+// so that nothing runs unguarded on the other members' activations.
+static bool is_edge_guarded_body(vhdl_process *p)
+{
+   stmt_container::stmt_list_t &stmts = p->get_container()->get_stmts();
+   if (stmts.empty())
+      return false;
+   for (vhdl_seq_stmt *s : stmts)
+      if (dynamic_cast<vhdl_if_stmt*>(s) == NULL)
+         return false;
+   return true;
+}
+
+// VHDL identifiers are case-insensitive.
+static std::string lc(const std::string &s)
+{
+   std::string r(s);
+   for (size_t i = 0; i < r.size(); i++)
+      r[i] = tolower(static_cast<unsigned char>(r[i]));
+   return r;
+}
+
+// `name` declared directly in `scope` (not in a parent scope)?
+static vhdl_decl *own_decl(vhdl_scope *scope, const std::string &name)
+{
+   for (vhdl_decl *d : scope->get_decls())
+      if (strcasecmp(d->get_name().c_str(), name.c_str()) == 0)
+         return d;
+   return NULL;
+}
+
+// Every wait statement in `c` (recursively), other than `skip`, is a
+// `wait for 0 ns`?
+static bool only_wait_for_0_after(stmt_container *c, vhdl_seq_stmt *skip)
+{
+   for (vhdl_seq_stmt *s : c->get_stmts()) {
+      if (s == skip)
+         continue;
+      if (vhdl_wait_stmt *w = dynamic_cast<vhdl_wait_stmt*>(s))
+         if (w->get_type() != VHDL_WAIT_FOR0)
+            return false;
+      std::vector<stmt_container*> subs;
+      s->get_sub_containers(subs);
+      for (stmt_container *sc : subs)
+         if (!only_wait_for_0_after(sc, NULL))
+            return false;
+   }
+   return true;
+}
+
+// An always_ff body that assigns a blocking temporary and reads it later is
+// drawn by draw_wait (stmt.cc, form "D"): no sensitivity list, a leading
+// `wait until <edge test>`, and a `wait for 0 ns` after each such read --
+// a process with a sensitivity list may not contain waits. In sv2vhdl mode
+// shadow_blocking_targets() then deletes every `wait for 0 ns` (the target
+// became a variable), so the only reason for the wait-until form is gone;
+// yet the process is no longer edge-guarded, gets no NBA-region deferral
+// (nba_defer_commits skips it) and cannot be merged, so two such blocks
+// writing dynamic indices of one reg stayed two whole-prefix VHDL drivers
+// with no diagnostic. Rewrite it into form "C" before the shadow passes:
+// `if <edge test> then <body> end if` plus the edge signals as sensitivity.
+// Equivalent by construction (`wait until c` is `loop wait on <signals of
+// c>; exit when c; end loop`). Applies only when every other wait in the
+// body is a `wait for 0 ns`; a `wait for <delay>` or a second event control
+// keeps the process as drawn.
+static bool promote_wait_until_edge_form(vhdl_process *p)
+{
+   if (!get_sv2vhdl_mode() || !p->is_edge_triggered()
+       || !p->contains_wait_stmt() || p->is_postponed()
+       || !p->get_sensitivity().empty())
+      return false;
+
+   stmt_container *body = p->get_container();
+   stmt_container::stmt_list_t &stmts = body->get_stmts();
+   if (stmts.empty())
+      return false;
+   vhdl_wait_stmt *lead = dynamic_cast<vhdl_wait_stmt*>(stmts.front());
+   if (lead == NULL || lead->get_type() != VHDL_WAIT_UNTIL
+       || lead->get_expr() == NULL)
+      return false;
+   if (!only_wait_for_0_after(body, lead))
+      return false;
+
+   vhdl_expr *test = lead->get_expr();
+   vhdl_var_set_t reads;
+   test->find_vars(reads);
+   std::set<std::string> seen;
+   for (vhdl_var_ref *r : reads) {
+      std::string n = r->get_name();
+      static const std::string ev = "'Event";   // draw_wait's any-edge operand
+      if (n.size() > ev.size()
+          && n.compare(n.size() - ev.size(), ev.size(), ev) == 0)
+         n = n.substr(0, n.size() - ev.size());
+      if (seen.insert(lc(n)).second)
+         p->add_sensitivity(n);
+   }
+   if (seen.empty())
+      return false;
+
+   stmts.pop_front();          // the wait statement does not own `test`
+   delete lead;
+   vhdl_if_stmt *guard = new vhdl_if_stmt(test);
+   guard->get_then_container()->move_stmts_from(body);
+   body->add_stmt(guard);
+   p->clear_wait_stmts();
+   debug_msg("Promoted wait-until edge process to a guarded sensitised one");
+   return true;
+}
+
+// Non-initial processes that did NOT go through the merge pass (a real wait
+// in the body, a non-edge always) but assign architecture signals with `<=`:
+// they are VHDL drivers too, and a whole-signal or dynamically indexed
+// assignment from one of them clobbers whatever another process writes to
+// that signal. Recorded by generate_vhdl_process for the multi-writer
+// diagnostic in merge_edge_processes_in_all_entities.
+struct extra_writer_t {
+   vhdl_entity *ent;
+   std::string where;
+   std::set<std::string> sigs;    // arch-scope signals assigned with `<=`
+   std::set<std::string> whole;   // ... via a whole-signal/dynamic driver
+};
+
+static std::list<extra_writer_t> g_extra_writers;
+
+static void collect_nba_targets(stmt_container *c, std::set<std::string> &out);
+
+static void collect_nba_targets_recurse(vhdl_seq_stmt *s,
+                                        std::set<std::string> &out)
+{
+   if (vhdl_nbassign_stmt *nb = dynamic_cast<vhdl_nbassign_stmt*>(s))
+      out.insert(nb->get_lhs()->get_name());
+   std::vector<stmt_container*> subs;
+   s->get_sub_containers(subs);
+   for (stmt_container *sc : subs)
+      collect_nba_targets(sc, out);
+}
+
+static void collect_nba_targets(stmt_container *c, std::set<std::string> &out)
+{
+   for (vhdl_seq_stmt *s : c->get_stmts())
+      collect_nba_targets_recurse(s, out);
+}
+
+// Architecture-scope signals/ports assigned with `<=` by this process (seen
+// before the shadow passes rename anything). A process-local variable that
+// shadows an arch name is not a signal write.
+static std::set<std::string> written_signals(vhdl_process *p, vhdl_entity *ent)
+{
+   std::set<std::string> names, out;
+   collect_nba_targets(p->get_container(), names);
+   vhdl_scope *arch_scope = ent->get_arch()->get_scope();
+   for (const std::string &n : names) {
+      if (own_decl(p->get_scope(), n))
+         continue;
+      vhdl_decl *d = arch_scope->get_decl(n);   // arch signals, entity ports
+      if (d && (dynamic_cast<vhdl_signal_decl*>(d)
+                || dynamic_cast<vhdl_port_decl*>(d)))
+         out.insert(n);
+   }
+   return out;
+}
+
+// Does this body's `<=` to `sig` make the process a driver of the WHOLE
+// signal (or of an element it selects dynamically -- the same thing under
+// VHDL's longest-static-prefix rule)? Mirrors nba_defer_commits' choice.
+static bool drives_whole(stmt_container *body, const std::string &sig)
+{
+   WriteInfo info;
+   find_write_info(body, sig, info);
+   if (!info.found)
+      return false;
+   if (info.ambiguous || info.slice == NULL)
+      return true;
+   vhdl_expr *cl = clone_slice(info.slice);
+   if (cl == NULL)
+      return true;
+   delete cl;
+   return false;
+}
+
+// A signal `x` written with a BLOCKING assignment by member X and with a
+// NONBLOCKING one by member Y: merging would extend X's blocking shadow over
+// Y's body, so Y's reads of `x` (which Verilog evaluates against the pre-edge
+// value in the NBA region) would see X's in-process write -- not a legal
+// outcome under any inter-block ordering. Sets `sig` to the first such name.
+static bool blocking_vs_nba(pending_edge_t *x, pending_edge_t *y,
+                            std::string &sig)
+{
+   const std::set<std::string> &blk_x = x->proc->get_blocking_targets();
+   const std::set<std::string> &blk_y = y->proc->get_blocking_targets();
+   for (const std::string &s : blk_x) {
+      if (y->sigs.count(s) && !blk_y.count(s)) {
+         sig = s;
+         return true;
+      }
+   }
+   return false;
+}
+
+// Partition `procs` into connected components under "assign a common
+// arch-scope signal" (transitive); members keep their relative order.
+static std::vector<std::vector<pending_edge_t*> >
+split_by_shared_sigs(const std::vector<pending_edge_t*> &procs)
+{
+   std::vector<std::vector<pending_edge_t*> > comps;
+   std::vector<std::set<std::string> > comp_sigs;
+   for (pending_edge_t *m : procs) {
+      std::vector<size_t> hits;
+      for (size_t c = 0; c < comps.size(); c++) {
+         for (const std::string &s : m->sigs) {
+            if (comp_sigs[c].count(s)) {
+               hits.push_back(c);
+               break;
+            }
+         }
+      }
+      if (hits.empty()) {
+         comps.push_back(std::vector<pending_edge_t*>(1, m));
+         comp_sigs.push_back(m->sigs);
+         continue;
+      }
+      size_t d = hits[0];
+      comps[d].push_back(m);
+      comp_sigs[d].insert(m->sigs.begin(), m->sigs.end());
+      for (size_t h = hits.size(); h-- > 1; ) {
+         comps[d].insert(comps[d].end(), comps[hits[h]].begin(),
+                         comps[hits[h]].end());
+         comp_sigs[d].insert(comp_sigs[hits[h]].begin(),
+                             comp_sigs[hits[h]].end());
+         comps.erase(comps.begin() + hits[h]);
+         comp_sigs.erase(comp_sigs.begin() + hits[h]);
+      }
+   }
+   for (std::vector<pending_edge_t*> &c : comps)
+      std::sort(c.begin(), c.end(),
+                [](pending_edge_t *a, pending_edge_t *b) {
+                   return a->order < b->order;
+                });
+   return comps;
+}
+
+// The sensitivity SET as a canonical string (sorted, deduplicated,
+// case-folded): `@(posedge clk or negedge clk)` keys like `@(posedge clk)`.
+static std::string sens_key(vhdl_process *p)
+{
+   std::set<std::string> v;
+   for (const std::string &s : p->get_sensitivity())
+      v.insert(lc(s));
+   std::string k;
+   for (const std::string &s : v) {
+      k += s;
+      k += ',';
+   }
+   return k;
+}
+
+// Only plain variables can be moved between process scopes.
+static bool can_move_decls(vhdl_process *m)
+{
+   for (vhdl_decl *d : m->get_scope()->get_decls())
+      if (dynamic_cast<vhdl_var_decl*>(d) == NULL)
+         return false;
+   return true;
+}
+
+struct proc_names_t {
+   std::set<std::string> decls;   // lower-cased process-local declarations
+   std::set<std::string> refs;    // lower-cased names referenced in the body
+   vhdl_var_set_t reads, writes;  // the reference objects (for renaming)
+};
+
+static void collect_proc_names(vhdl_process *p, proc_names_t &n)
+{
+   for (vhdl_decl *d : p->get_scope()->get_decls())
+      n.decls.insert(lc(d->get_name()));
+   p->get_container()->find_vars(n.reads, n.writes);
+   for (vhdl_var_ref *r : n.reads)
+      n.refs.insert(lc(r->get_name()));
+   for (vhdl_var_ref *r : n.writes)
+      n.refs.insert(lc(r->get_name()));
+}
+
+// Rename process-local `d` to `nn` throughout its own process body. Every
+// reference to a locally declared name IS the local (inner scope wins in
+// both Verilog and VHDL), so all of them move.
+static void rename_local(vhdl_decl *d, proc_names_t &n, const std::string &nn)
+{
+   const std::string old = d->get_name();
+   for (vhdl_var_ref *r : n.reads)
+      if (strcasecmp(r->get_name().c_str(), old.c_str()) == 0)
+         r->set_name(nn);
+   for (vhdl_var_ref *r : n.writes)
+      if (strcasecmp(r->get_name().c_str(), old.c_str()) == 0)
+         r->set_name(nn);
+   d->set_name(nn);
+   n.decls.erase(lc(old));
+   n.decls.insert(lc(nn));
+   n.refs.erase(lc(old));
+   n.refs.insert(lc(nn));
+}
+
+// Make the members' process-local names disjoint from everything the other
+// members declare or reference, so that concatenating the bodies into one
+// scope rebinds nothing (see the header comment).
+static void resolve_local_name_conflicts(std::vector<pending_edge_t*> &procs,
+                                         std::vector<proc_names_t> &names,
+                                         vhdl_scope *arch_scope)
+{
+   std::set<std::string> taken;
+   for (proc_names_t &n : names) {
+      taken.insert(n.decls.begin(), n.decls.end());
+      taken.insert(n.refs.begin(), n.refs.end());
+   }
+   for (size_t k = 0; k < procs.size(); k++) {
+      // Copy: rename_local edits the decl objects, not the list.
+      decl_list_t decls = procs[k]->proc->get_scope()->get_decls();
+      for (vhdl_decl *d : decls) {
+         const std::string name = lc(d->get_name());
+         bool conflict = false;
+         for (size_t j = 0; j < procs.size() && !conflict; j++) {
+            if (j == k)
+               continue;
+            if (names[j].refs.count(name) && !names[j].decls.count(name))
+               conflict = true;   // j reads an outer `name`: capture
+            else if (j < k && names[j].decls.count(name))
+               conflict = true;   // an earlier member owns local `name`
+         }
+         if (!conflict)
+            continue;
+         std::string nn;
+         for (int idx = 2; ; idx++) {
+            nn = d->get_name() + "_" + std::to_string(idx);
+            if (!taken.count(lc(nn)) && !arch_scope->have_declared(nn))
+               break;
+         }
+         taken.insert(lc(nn));
+         debug_msg("Renamed process-local %s to %s for merge",
+                   d->get_name().c_str(), nn.c_str());
+         rename_local(d, names[k], nn);
+      }
+   }
+}
+
+// Compose `procs` (>= 2 members, source order, same sensitivity set, joined
+// by shared signals) into procs[0]; the others leave the architecture.
+static void merge_cluster(std::vector<pending_edge_t*> &procs,
+                          vhdl_scope *arch_scope, conc_stmt_list_t &items,
+                          std::set<pending_edge_t*> &gone)
+{
+   std::vector<proc_names_t> names(procs.size());
+   for (size_t k = 0; k < procs.size(); k++)
+      collect_proc_names(procs[k]->proc, names[k]);
+   resolve_local_name_conflicts(procs, names, arch_scope);
+
+   pending_edge_t *target = procs[0];
+   std::string merged_from;
+   for (size_t k = 1; k < procs.size(); k++) {
+      pending_edge_t *m = procs[k];
+      for (vhdl_decl *d : m->proc->get_scope()->get_decls())
+         target->proc->get_scope()->add_decl(d);
+      target->proc->get_container()->move_stmts_from(m->proc->get_container());
+      for (const std::string &bt : m->proc->get_blocking_targets()) {
+         vhdl_var_ref tmp(bt, NULL);
+         target->proc->add_blocking_target(&tmp);
+      }
+      target->sigs.insert(m->sigs.begin(), m->sigs.end());
+      items.remove(static_cast<vhdl_conc_stmt*>(m->proc));
+      gone.insert(m);
+      merged_from += (merged_from.empty() ? "" : ", ") + m->where;
+      debug_msg("Merged same-edge always block %s into %s",
+                m->where.c_str(), target->where.c_str());
+   }
+   target->proc->set_comment(target->comment
+                             + " [+ merged same-edge always block(s): "
+                             + merged_from + "]");
+}
+
 }  // namespace
+
+// Called once every process of the design has been drawn (vhdl.cc).
+void merge_edge_processes_in_all_entities()
+{
+   std::map<vhdl_entity*, std::vector<pending_edge_t*> > by_ent;
+   std::vector<vhdl_entity*> ent_order;
+   for (pending_edge_t &p : g_pending_edge) {
+      if (by_ent.find(p.ent) == by_ent.end())
+         ent_order.push_back(p.ent);
+      by_ent[p.ent].push_back(&p);
+   }
+   for (extra_writer_t &w : g_extra_writers) {
+      if (by_ent.find(w.ent) == by_ent.end()) {
+         ent_order.push_back(w.ent);
+         by_ent[w.ent];   // entity with only unmergeable writers: census only
+      }
+   }
+
+   for (vhdl_entity *ent : ent_order) {
+      std::vector<pending_edge_t*> &members = by_ent[ent];
+      vhdl_scope *arch_scope = ent->get_arch()->get_scope();
+
+      // Candidates grouped by sensitivity set, in source order.
+      std::map<std::string, std::vector<pending_edge_t*> > by_key;
+      std::vector<std::string> key_order;
+      for (pending_edge_t *m : members) {
+         m->sigs = written_signals(m->proc, ent);
+         m->key = sens_key(m->proc);
+         if (m->sigs.empty() || !is_edge_guarded_body(m->proc))
+            continue;
+         if (by_key.find(m->key) == by_key.end())
+            key_order.push_back(m->key);
+         by_key[m->key].push_back(m);
+      }
+
+      std::set<pending_edge_t*> gone;
+      conc_stmt_list_t &items = ent->get_arch()->get_stmts();
+
+      for (const std::string &key : key_order) {
+         for (std::vector<pending_edge_t*> &cluster
+                 : split_by_shared_sigs(by_key[key])) {
+            if (cluster.size() < 2)
+               continue;
+
+            // The first (source-order) block survives. A member whose scope
+            // holds something other than plain variables stays separate, as
+            // does one that assigns with `=` a signal another member assigns
+            // with `<=` (see blocking_vs_nba): the merged blocking shadow
+            // would rename the other member's pre-edge reads.
+            std::vector<pending_edge_t*> procs;
+            for (pending_edge_t *cand : cluster) {
+               if (!procs.empty() && !can_move_decls(cand->proc)) {
+                  std::cerr << "sv2vhdl: warning: cannot merge always block at "
+                            << cand->where << " into " << procs[0]->where
+                            << " (unsupported local declaration); its"
+                            << " whole-signal nonblocking commits may lose"
+                            << " updates" << std::endl;
+                  continue;
+               }
+               std::string sig;
+               pending_edge_t *other = NULL;
+               for (pending_edge_t *kept : procs) {
+                  if (blocking_vs_nba(kept, cand, sig)
+                      || blocking_vs_nba(cand, kept, sig)) {
+                     other = kept;
+                     break;
+                  }
+               }
+               if (other) {
+                  std::cerr << "sv2vhdl: warning: " << ent->get_name()
+                            << ": signal " << sig << " is assigned with a"
+                            << " blocking assignment in one always block and"
+                            << " a nonblocking assignment in another ("
+                            << other->where << ", " << cand->where
+                            << "); they cannot be merged, so the signal keeps"
+                            << " two VHDL drivers" << std::endl;
+                  continue;
+               }
+               procs.push_back(cand);
+            }
+            if (procs.size() < 2)
+               continue;
+
+            // Dropping members can disconnect the rest: merge only what is
+            // still joined by a shared signal.
+            for (std::vector<pending_edge_t*> &comp
+                    : split_by_shared_sigs(procs)) {
+               if (comp.size() >= 2)
+                  merge_cluster(comp, arch_scope, items, gone);
+            }
+         }
+      }
+
+      // Deferred per-process passes on the survivors.
+      for (pending_edge_t *m : members) {
+         if (gone.count(m))
+            continue;
+         shadow_blocking_targets(m->proc, ent);
+         nba_defer_commits(m->proc, ent);
+      }
+
+      // Anything still shared is written from blocks with different
+      // sensitivities, an unmergeable body, or a process outside this pass
+      // (g_extra_writers: real waits, non-edge always). Static-slice commits
+      // from several such blocks are fine (distinct sub-element drivers); a
+      // WHOLE-signal or dynamically indexed driver from any of them clobbers
+      // the others' bits -- report that rather than losing updates silently.
+      struct writer_t {
+         std::string where;
+         bool whole;
+      };
+      std::map<std::string, std::vector<writer_t> > writers;
+      for (pending_edge_t *m : members) {
+         if (gone.count(m))
+            continue;
+         for (const std::string &s : m->sigs) {
+            writer_t w = { m->where,
+                           g_whole_commits.count(std::make_pair(m->proc, s)) > 0 };
+            writers[s].push_back(w);
+         }
+      }
+      for (extra_writer_t &x : g_extra_writers) {
+         if (x.ent != ent)
+            continue;
+         for (const std::string &s : x.sigs) {
+            writer_t w = { x.where, x.whole.count(s) > 0 };
+            writers[s].push_back(w);
+         }
+      }
+      for (auto &w : writers) {
+         if (w.second.size() < 2)
+            continue;
+         bool whole = false;
+         for (const writer_t &m : w.second)
+            if (m.whole)
+               whole = true;
+         if (!whole)
+            continue;
+         std::cerr << "sv2vhdl: warning: " << ent->get_name() << ": signal "
+                   << w.first << " is assigned by " << w.second.size()
+                   << " always blocks that cannot be merged (";
+         for (size_t k = 0; k < w.second.size(); k++)
+            std::cerr << (k ? ", " : "") << w.second[k].where;
+         std::cerr << ") and at least one drives the whole signal (or a"
+                   << " dynamically indexed element); that driver will"
+                   << " clobber the other blocks' bits" << std::endl;
+      }
+   }
+   g_pending_edge.clear();
+   g_extra_writers.clear();
+}
 
 // Signals whose initial value was hoisted to a declaration default.
 // These signals should have their first assignment skipped in the
@@ -707,9 +1346,23 @@ static int generate_vhdl_process(vhdl_entity *ent, ivl_process_t proc)
    // on self-sensitive always-comb blocks.  Only applied to non-initial
    // processes (initial blocks have different semantics and are emitted
    // as deposit-style assignments anyway).
+   // Waitless edge-triggered (always_ff-style) processes defer both passes
+   // to merge_edge_processes_in_all_entities(): same-edge blocks assigning a
+   // common signal are first composed into one process so the signal keeps
+   // a single VHDL driver.
+   bool deferred = false;
    if (ivl_process_type(proc) != IVL_PR_INITIAL) {
-      shadow_blocking_targets(vhdl_proc, ent);
-      nba_defer_commits(vhdl_proc, ent);
+      // A wait-until edge process whose only other waits are the blocking
+      // read `wait for 0 ns` (deleted by shadow_blocking_targets) becomes a
+      // guarded sensitised process first, so it gets the NBA deferral and
+      // takes part in the merge like any other always_ff.
+      promote_wait_until_edge_form(vhdl_proc);
+      if (is_mergeable_edge_process(vhdl_proc))
+         deferred = true;
+      else {
+         shadow_blocking_targets(vhdl_proc, ent);
+         nba_defer_commits(vhdl_proc, ent);
+      }
    }
 
    // Initial processes are translated to VHDL processes with
@@ -761,6 +1414,31 @@ static int generate_vhdl_process(vhdl_entity *ent, ivl_process_t proc)
       << ivl_process_file(proc) << ":"
       << ivl_process_lineno(proc) << ")";
    vhdl_proc->set_comment(ss.str());
+
+   std::ostringstream where;
+   where << ivl_process_file(proc) << ":" << ivl_process_lineno(proc);
+   if (deferred) {
+      pending_edge_t p;
+      p.ent = ent;
+      p.proc = vhdl_proc;
+      p.comment = ss.str();
+      p.where = where.str();
+      p.order = g_pending_edge.size();
+      g_pending_edge.push_back(p);
+   }
+   else if (get_sv2vhdl_mode() && !is_initial && !is_empty) {
+      // Outside the merge pass but still a driver of whatever it assigns:
+      // enter the multi-writer census (see extra_writer_t).
+      extra_writer_t w;
+      w.ent = ent;
+      w.where = where.str();
+      w.sigs = written_signals(vhdl_proc, ent);
+      for (const std::string &s : w.sigs)
+         if (drives_whole(vhdl_proc->get_container(), s))
+            w.whole.insert(s);
+      if (!w.sigs.empty())
+         g_extra_writers.push_back(w);
+   }
 
    set_active_entity(NULL);
    return 0;
