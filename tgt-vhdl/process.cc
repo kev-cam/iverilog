@@ -431,6 +431,29 @@ static void nba_defer_commits(vhdl_process *vhdl_proc, vhdl_entity *ent)
    stmts.push_back(trailing);
 }
 
+// A Verilog block-local reg (`begin : b reg t; ... end`, which sv2v emits
+// for every cast temporary) is a signal to ivl, so an `always @*` collects
+// it into the sensitivity list; draw_block then declares it as a process
+// VARIABLE, which VHDL cannot be sensitive to. Drop such names here, after
+// the body has been drawn and the variables are known.
+static void strip_local_vars_from_sensitivity(vhdl_process *vhdl_proc)
+{
+   vhdl_scope *proc_scope = vhdl_proc->get_scope();
+   string_list_t &sens = vhdl_proc->get_sensitivity();
+   for (string_list_t::iterator it = sens.begin(); it != sens.end();) {
+      vhdl_decl *d = NULL;
+      for (vhdl_decl *cand : proc_scope->get_decls())
+         if (strcasecmp(cand->get_name().c_str(), it->c_str()) == 0) {
+            d = cand;
+            break;
+         }
+      if (d != NULL && dynamic_cast<vhdl_var_decl*>(d) != NULL)
+         it = sens.erase(it);
+      else
+         ++it;
+   }
+}
+
 static void shadow_blocking_targets(vhdl_process *vhdl_proc, vhdl_entity *ent)
 {
    const std::set<std::string> &targets = vhdl_proc->get_blocking_targets();
@@ -1360,6 +1383,7 @@ static int generate_vhdl_process(vhdl_entity *ent, ivl_process_t proc)
       if (is_mergeable_edge_process(vhdl_proc))
          deferred = true;
       else {
+         strip_local_vars_from_sensitivity(vhdl_proc);
          shadow_blocking_targets(vhdl_proc, ent);
          nba_defer_commits(vhdl_proc, ent);
       }
