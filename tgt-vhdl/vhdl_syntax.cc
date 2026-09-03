@@ -833,6 +833,21 @@ void vhdl_var_ref::set_slice(vhdl_expr *s, int w)
    }
 }
 
+void vhdl_var_ref::slice_element(vhdl_expr *s, int w)
+{
+   assert(type_);
+   assert(slice_);   // the element select must already be in place
+
+   add_extra_slice(s, w);
+
+   vhdl_type_name_t tname = type_->get_name();
+   if (tname == VHDL_TYPE_LOGIC3D_VECTOR)
+      type_ = (w > 0) ? vhdl_type::logic3d_vector(w, 0) : vhdl_type::logic3d();
+   else if (tname == VHDL_TYPE_UNSIGNED || tname == VHDL_TYPE_SIGNED)
+      type_ = (w > 0) ? new vhdl_type(tname, w) : vhdl_type::std_logic();
+   // a scalar element stays a scalar
+}
+
 void vhdl_var_ref::find_vars(vhdl_var_set_t& read)
 {
    read.insert(this);

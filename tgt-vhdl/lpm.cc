@@ -129,8 +129,42 @@ static vhdl_expr *part_select_vp_lpm_to_expr(vhdl_scope *scope, ivl_lpm_t lpm)
    if (NULL == off)
       return NULL;
 
-   if (selfrom->get_type()->get_width() > 1)
-      selfrom->set_slice(off, ivl_lpm_width(lpm) - 1);
+   const int w = ivl_lpm_width(lpm);
+
+   if (selfrom->get_type()->get_width() > 1) {
+      if (selfrom->get_slice() != NULL) {
+         // The nexus is one word of an unpacked array (nexus_to_var_ref
+         // selected it): the part select applies to that word,
+         // mem(word)(base + w downto base). set_slice would have replaced
+         // the word index with the bit offset, selecting the wrong word.
+         selfrom->slice_element(off, w - 1);
+      }
+      else
+         selfrom->set_slice(off, w - 1);
+      return selfrom;
+   }
+
+   // A bit-select of a 1-bit value (a scalar wire, or a word of an
+   // unpacked array of 1-bit words: `wire [0:0] m [0:3]; m[2][idx]`):
+   // VHDL cannot index a scalar. Index 0 is the value itself (as
+   // translate_select does for the expression path); any other index
+   // reads x in Verilog, so in sv2vhdl mode a runtime (or non-zero) base
+   // goes through the bounds-safe reader on the bit lifted to a
+   // 1-element vector.
+   if (get_sv2vhdl_mode()
+       && (ivl_lpm_data(lpm, 1) != NULL || ivl_lpm_base(lpm) != 0)
+       && selfrom->get_type()->get_name() == VHDL_TYPE_LOGIC3D) {
+      vhdl_fcall *as_u = new vhdl_fcall("l3d_to_unsigned",
+                                        vhdl_type::nunsigned(1));
+      as_u->add_expr(selfrom);
+      vhdl_fcall *vec = new vhdl_fcall("unsigned_to_l3d",
+                                       vhdl_type::logic3d_vector(0, 0));
+      vec->add_expr(as_u);
+      vhdl_fcall *f = new vhdl_fcall("l3d_bit_read", vhdl_type::logic3d());
+      f->add_expr(vec);
+      f->add_expr(off);
+      return f;
+   }
 
    return selfrom;
 }

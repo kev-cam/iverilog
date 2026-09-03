@@ -82,6 +82,10 @@ public:
    void set_slice(vhdl_expr *s, int w=0);
    vhdl_expr *get_slice() const { return slice_; }
    unsigned get_slice_width() const { return slice_width_; }
+   // Bit/part-select of an array element that set_slice already picked:
+   // mem(word)(idx) for w==0, mem(word)(base + w downto base) otherwise.
+   // Unlike add_extra_slice this also narrows the type as set_slice would.
+   void slice_element(vhdl_expr *s, int w = 0);
    // Append an additional select to the chain (emits as `(idx)` for w==0 or
    // `(idx + w downto idx)` for a range). Used by `$set_val(arr, i, j, val)`
    // and by array-word part-selects: mem(word)(base+w-1 downto base).
