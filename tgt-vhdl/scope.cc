@@ -1564,9 +1564,9 @@ extern "C" int draw_constant_drivers(ivl_scope_t scope, void *)
 
             if (priv->const_driver
                 && ivl_signal_port(sig) != IVL_SIP_INPUT) { // Don't drive inputs
-               // TODO: Make work for more words (multi-element arrays)
-               if (j != 0) continue;
-
+               // nexus_to_var_ref selects the word of an unpacked array
+               // (`m(j) <= const'), so every word's constant driver is
+               // drawn, not only word 0's.
                vhdl_var_ref *ref = nexus_to_var_ref(arch_scope, nex);
 
                ent->get_arch()->add_stmt
