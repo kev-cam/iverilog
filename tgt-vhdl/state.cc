@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <string>
 #include <map>
+#include <set>
 #include <vector>
 #include <cstring>
 #include <iostream>
@@ -224,11 +225,39 @@ void fuse_comb_in_all_entities()
       fuse_comb_processes(*it);
 }
 
+// Emit `ent' after every entity its architecture instantiates (post-order
+// over the `entity work.X' references), so a direct instantiation never
+// names a design unit that has not been analysed yet.
+static void emit_entity_after_deps(vhdl_entity *ent, std::ostream& os,
+                                   std::set<vhdl_entity*>& done)
+{
+   if (!done.insert(ent).second)
+      return;   // already emitted (an elaborated hierarchy has no cycles)
+
+   vhdl_arch *arch = ent->get_arch();
+   if (arch) {
+      conc_stmt_list_t& stmts = arch->get_stmts();
+      for (conc_stmt_list_t::iterator it = stmts.begin();
+           it != stmts.end(); ++it) {
+         vhdl_comp_inst *inst = dynamic_cast<vhdl_comp_inst*>(*it);
+         if (inst == NULL)
+            continue;
+         vhdl_entity *dep = find_entity(inst->get_comp_name());
+         if (dep != NULL && dep != ent)
+            emit_entity_after_deps(dep, os, done);
+      }
+   }
+
+   ent->emit(os);
+}
+
 // Print all VHDL entities to the specified output stream.
-// Emit in reverse discovery order: the skeleton walker uses DFS which
-// visits parents before children, so reversing gives children first.
-// This ensures entity instantiation targets are analyzed before the
-// entities that instantiate them.
+// The skeleton walker discovers entities parent-first (DFS), so the
+// reverse of that order is child-first for a tree -- but a module reused
+// under two parents is discovered once, where it was first met, and a
+// parent discovered later (in a sibling's subtree) then comes out BEFORE
+// it: top -> {leaf, mid -> leaf} emits mid before leaf. Walk the reversed
+// list and emit each entity after its instantiation targets instead.
 void emit_all_entities(std::ostream& os, int max_depth)
 {
    std::vector<vhdl_entity*> all;
@@ -240,8 +269,9 @@ void emit_all_entities(std::ostream& os, int max_depth)
    }
    // Reverse: DFS discovery order is parent-first, we need child-first
    std::reverse(all.begin(), all.end());
+   std::set<vhdl_entity*> done;
    for (auto *ent : all)
-      ent->emit(os);
+      emit_entity_after_deps(ent, os, done);
 }
 
 // Release all memory for the VHDL objects. No vhdl_element pointers
