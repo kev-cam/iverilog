@@ -1009,7 +1009,7 @@ static vhdl_expr *translate_ufunc(ivl_expr_t e)
    }
    assert(parent_ent);
 
-   const char *funcname = ivl_scope_tname(defscope);
+   const std::string funcname = vhdl_function_name(defscope);
 
    // The result type must track the function's declared return type: a real
    // function's width-based type would be logic3d, and every caller would then
@@ -1019,7 +1019,7 @@ static vhdl_expr *translate_ufunc(ivl_expr_t e)
       rettype = vhdl_type::real();
    else
       rettype = vhdl_type::type_for(ivl_expr_width(e), ivl_expr_signed(e) != 0);
-   vhdl_fcall *fcall = new vhdl_fcall(funcname, rettype);
+   vhdl_fcall *fcall = new vhdl_fcall(funcname.c_str(), rettype);
 
    int nparams = ivl_expr_parms(e);
    for (int i = 0; i < nparams; i++) {

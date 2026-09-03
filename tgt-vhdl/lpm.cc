@@ -178,7 +178,8 @@ static vhdl_expr *part_select_pv_lpm_to_expr(vhdl_scope *scope, ivl_lpm_t lpm)
 static vhdl_expr *ufunc_lpm_to_expr(vhdl_scope *scope, ivl_lpm_t lpm)
 {
    ivl_scope_t f_scope = ivl_lpm_define(lpm);
-   vhdl_fcall *fcall = new vhdl_fcall(ivl_scope_basename(f_scope), NULL);
+   const std::string fname = vhdl_function_name(f_scope);
+   vhdl_fcall *fcall = new vhdl_fcall(fname.c_str(), NULL);
 
    // The function's input formals, in order (port 0 may be the return
    // value, see draw_function_in_entity).

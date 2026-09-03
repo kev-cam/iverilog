@@ -38,6 +38,9 @@ void ensure_signal_declared(ivl_signal_t sig);
 // Emit a function scope's VHDL function into a specific entity (used to draw
 // package functions on demand into whichever entity first calls them).
 int draw_function_in_entity(ivl_scope_t scope, vhdl_entity *ent);
+// The VHDL name of a function scope: its Verilog name plus the flattening
+// suffix of an enclosing generate block (see scope.cc).
+std::string vhdl_function_name(ivl_scope_t fscope);
 vhdl_var_ref *nexus_to_var_ref(vhdl_scope *arch_scope, ivl_nexus_t nexus);
 // Convert a bit/part/word index expression to a VHDL integer honouring the
 // VERILOG signedness of the index (a signed -1 index must become -1, not

@@ -1190,6 +1190,22 @@ static void port_map(ivl_scope_t scope, const vhdl_entity *parent,
 /*
  * Create a VHDL function from a Verilog function definition.
  */
+// The VHDL name of the function defined by Verilog scope `fscope'.
+// A function declared inside a generate block is a distinct function per
+// generate instance -- sv2v emits one sv2v_cast_<hash> per scope and its
+// formal width follows that scope's localparams (VX_csa_tree: WI = W +
+// level) -- and generate blocks are flattened into the architecture, so
+// it takes the same suffix as the scope's signals. Every declaration and
+// call site must go through here.
+string vhdl_function_name(ivl_scope_t fscope)
+{
+   string name(ivl_scope_tname(fscope));
+   ivl_scope_t parent = ivl_scope_parent(fscope);
+   if (parent != NULL && ivl_scope_type(parent) == IVL_SCT_GENERATE)
+      name += genvar_unique_suffix(parent);
+   return name;
+}
+
 int draw_function_in_entity(ivl_scope_t scope, vhdl_entity *ent)
 {
    assert(ivl_scope_type(scope) == IVL_SCT_FUNCTION);
@@ -1197,7 +1213,8 @@ int draw_function_in_entity(ivl_scope_t scope, vhdl_entity *ent)
    debug_msg("Generating function %s (%s)", ivl_scope_tname(scope),
              ivl_scope_name(scope));
 
-   const char *funcname = ivl_scope_tname(scope);
+   const string funcname_str = vhdl_function_name(scope);
+   const char *funcname = funcname_str.c_str();
 
    // Already emitted here (e.g. a package function drawn on demand by an
    // earlier call site in this entity)
