@@ -77,6 +77,7 @@ static vhdl_expr *binop_lpm_to_expr(vhdl_scope *scope, ivl_lpm_t lpm, vhdl_binop
    const vhdl_type *result_type =
       vhdl_type::type_for(out_width, ivl_lpm_signed(lpm) != 0);
    vhdl_binop_expr *expr = new vhdl_binop_expr(op, result_type);
+   bool all_scalar_l3d = true;
 
    for (unsigned i = 0; i < ivl_lpm_size(lpm); i++) {
       vhdl_expr *e = readable_ref(scope, ivl_lpm_data(lpm, i));
@@ -87,6 +88,8 @@ static vhdl_expr *binop_lpm_to_expr(vhdl_scope *scope, ivl_lpm_t lpm, vhdl_binop
       // in which case we must cast them to the output type
       e = e->cast(vhdl_type::type_for(e->get_type()->get_width(),
                                       ivl_lpm_signed(lpm) != 0));
+      if (!e->get_type() || e->get_type()->get_name() != VHDL_TYPE_LOGIC3D)
+         all_scalar_l3d = false;
 
       // Bit of a hack: the LPM inputs are in the wrong order for concatenation
       if (op == VHDL_BINOP_CONCAT)
@@ -94,6 +97,13 @@ static vhdl_expr *binop_lpm_to_expr(vhdl_scope *scope, ivl_lpm_t lpm, vhdl_binop
       else
          expr->add_expr(e);
    }
+
+   // sv2vhdl: a 1-bit product of two scalar logic3d bits is emitted as bit 0
+   // of the package's vector multiply (vhdl_binop_expr::emit) and is already
+   // the single logic3d the LPM produces; Resize has no scalar overload.
+   if (op == VHDL_BINOP_MULT && get_sv2vhdl_mode() && out_width == 1
+       && all_scalar_l3d)
+      return expr;
 
    if (op == VHDL_BINOP_MULT) {
       // Need to resize the output to the desired size,

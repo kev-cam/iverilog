@@ -1445,6 +1445,41 @@ void vhdl_binop_expr::emit(std::ostream &of, int level) const
          return;
       }
       }  // end logic3d type check
+
+      // Arithmetic on two SCALAR logic3d operands (a 1-bit Verilog context,
+      // e.g. VX_lane_dispatch's `wire [0:0] pid = a + b`): logic3d is a
+      // subtype of natural, so the predefined integer operator would combine
+      // the 3-bit ENCODINGS (L3D_0 + L3D_0 = 2 + 2 = 4 = L3D_Z). Lift both
+      // bits to 1-element logic3d_vectors (the same value-plane round trip
+      // cast.cc uses to widen a bit), apply the package's vector operator so
+      // the 1-bit case has exactly the semantics of every wider add/sub/mul/
+      // div/mod, and keep bit 0 of the result.
+      const char *arith = NULL;
+      switch (op_) {
+      case VHDL_BINOP_ADD:  arith = "+";   break;
+      case VHDL_BINOP_SUB:  arith = "-";   break;
+      case VHDL_BINOP_MULT: arith = "*";   break;
+      case VHDL_BINOP_DIV:  arith = "/";   break;
+      case VHDL_BINOP_MOD:  arith = "mod"; break;
+      default: break;
+      }
+      const auto scalar_l3d = [](const vhdl_expr *e) {
+         return e->get_type()
+            && e->get_type()->get_name() == VHDL_TYPE_LOGIC3D;
+      };
+      if (arith && scalar_l3d(operands_.front())
+          && scalar_l3d(operands_.back())) {
+         of << "l3d_bit_read(";
+         auto it = operands_.begin();
+         for (int k = 0; k < 2; k++, ++it) {
+            if (k) of << " " << arith << " ";
+            of << "unsigned_to_l3d(l3d_to_unsigned(";
+            (*it)->emit(of, level);
+            of << "))";
+         }
+         of << ", 0)";
+         return;
+      }
    }
 
    open_parens(of);
