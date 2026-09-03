@@ -805,7 +805,7 @@ static vhdl_expr *translate_binary(ivl_expr_t e)
    return result;
 }
 
-vhdl_expr *index_to_integer(ivl_expr_t e, vhdl_expr *v)
+vhdl_expr *index_to_integer(vhdl_expr *v, bool is_signed)
 {
    // A constant index converts at compile time -- bits_to_int knows the true
    // signed value regardless of the emitted vector's width, and a constant
@@ -821,12 +821,16 @@ vhdl_expr *index_to_integer(ivl_expr_t e, vhdl_expr *v)
       // selects nothing).
       vhdl_fcall *f = new vhdl_fcall("l3d_index", vhdl_type::integer());
       f->add_expr(v);
-      f->add_expr(new vhdl_const_bool(
-         e != NULL && ivl_expr_signed(e) != 0));
+      f->add_expr(new vhdl_const_bool(is_signed));
       return f;
    }
    vhdl_type integer(VHDL_TYPE_INTEGER);
    return v->cast(&integer);
+}
+
+vhdl_expr *index_to_integer(ivl_expr_t e, vhdl_expr *v)
+{
+   return index_to_integer(v, e != NULL && ivl_expr_signed(e) != 0);
 }
 
 static vhdl_expr *translate_select(ivl_expr_t e)

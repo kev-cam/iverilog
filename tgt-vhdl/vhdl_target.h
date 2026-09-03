@@ -47,6 +47,9 @@ vhdl_var_ref *nexus_to_var_ref(vhdl_scope *arch_scope, ivl_nexus_t nexus);
 // 2**32-1: unsigned to_integer saturates it to integer'high and every
 // bounds-guard then misfires).
 vhdl_expr *index_to_integer(ivl_expr_t e, vhdl_expr *v);
+// Same for an index that is a net (an LPM part-select base): the caller
+// supplies the signedness it derived from the nexus.
+vhdl_expr *index_to_integer(vhdl_expr *v, bool is_signed);
 vhdl_var_ref* readable_ref(vhdl_scope* scope, ivl_nexus_t nex);
 std::string make_safe_name(ivl_signal_t sig);
 void require_support_function(support_function_t f);

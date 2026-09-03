@@ -25,16 +25,46 @@
 #include <cassert>
 
 /*
+ * The Verilog signedness of the value carried by `nex': that of the LPM
+ * whose output it is, else of a signal on it, else of a constant driver.
+ */
+static bool nexus_is_signed(ivl_nexus_t nex)
+{
+   ivl_signal_t sig = NULL;
+   ivl_net_const_t con = NULL;
+   for (unsigned i = 0; i < ivl_nexus_ptrs(nex); i++) {
+      ivl_nexus_ptr_t p = ivl_nexus_ptr(nex, i);
+      ivl_lpm_t lpm = ivl_nexus_ptr_lpm(p);
+      if (lpm != NULL && ivl_lpm_q(lpm) == nex)
+         return ivl_lpm_signed(lpm) != 0;
+      if (sig == NULL)
+         sig = ivl_nexus_ptr_sig(p);
+      if (con == NULL)
+         con = ivl_nexus_ptr_con(p);
+   }
+   if (sig != NULL)
+      return ivl_signal_signed(sig) != 0;
+   if (con != NULL)
+      return ivl_const_signed(con) != 0;
+   return false;
+}
+
+/*
  * Return the base of a part select.
  */
 static vhdl_expr *part_select_base(vhdl_scope *scope, ivl_lpm_t lpm)
 {
    vhdl_expr *off;
    ivl_nexus_t base = ivl_lpm_data(lpm, 1);
-   if (base != NULL)
+   if (base != NULL) {
       off = readable_ref(scope, base);
-   else
-      off = new vhdl_const_int(ivl_lpm_base(lpm));
+      // A runtime base converts like an expression-path index (l3d_index in
+      // sv2vhdl mode, so an x/z index does not blow up in To_Integer, and
+      // a signed index keeps its sign: x[i] with a 4-bit i = -1 reads x,
+      // not x[15]).
+      return index_to_integer(off, nexus_is_signed(base));
+   }
+   off = new vhdl_const_int(ivl_lpm_base(lpm));
 
    // Array indexes must be integers
    vhdl_type integer(VHDL_TYPE_INTEGER);
@@ -130,6 +160,26 @@ static vhdl_expr *part_select_vp_lpm_to_expr(vhdl_scope *scope, ivl_lpm_t lpm)
       return NULL;
 
    const int w = ivl_lpm_width(lpm);
+
+   // sv2vhdl: a select whose base is a runtime value can fall outside the
+   // vector -- Verilog then reads x (an x index selects nothing), where a
+   // VHDL index raises a bounds error (`s_man(To_Integer(dsh - 1))` with dsh
+   // still x: "index 2147483647 outside of NATURAL range"). Route it through
+   // the bounds-safe readers exactly as translate_select does for the
+   // expression path; a constant base keeps the direct slice.
+   if (get_sv2vhdl_mode() && ivl_lpm_data(lpm, 1) != NULL
+       && selfrom->get_type()->get_name() == VHDL_TYPE_LOGIC3D_VECTOR) {
+      vhdl_fcall *f;
+      if (w == 1)
+         f = new vhdl_fcall("l3d_bit_read", vhdl_type::logic3d());
+      else
+         f = new vhdl_fcall("l3d_part_read", vhdl_type::logic3d_vector(w - 1, 0));
+      f->add_expr(selfrom);   // an array word keeps its word select
+      f->add_expr(off);
+      if (w != 1)
+         f->add_expr(new vhdl_const_int(w));
+      return f;
+   }
 
    if (selfrom->get_type()->get_width() > 1) {
       if (selfrom->get_slice() != NULL) {
