@@ -870,22 +870,51 @@ static std::set<std::string> written_signals(vhdl_process *p, vhdl_entity *ent)
    return out;
 }
 
-// Does this body's `<=` to `sig` make the process a driver of the WHOLE
-// signal (or of an element it selects dynamically -- the same thing under
-// VHDL's longest-static-prefix rule)? Mirrors nba_defer_commits' choice.
-static bool drives_whole(stmt_container *body, const std::string &sig)
+// Does `body` assign `sig` as a whole, or through a slice whose bounds are
+// not compile-time constants (a dynamically selected element is the whole
+// signal under VHDL's longest-static-prefix rule, which is also what
+// nba_defer_commits keys its whole-signal shadow on)? This does NOT count
+// two different constant slices as a whole-signal write: a process that
+// keeps its direct slice assignments (no shadow variable -- a comb block)
+// drives exactly the union of those bits, one source per scalar
+// subelement, so two such processes on disjoint slices of one signal are
+// legal VHDL and match the Verilog. Used for the multi-writer census of
+// the processes the merge pass does not touch; the earlier rule there
+// (any write set that is not one static slice) warned on every per-lane
+// `always @*` that writes data[i*W +: W] and then a sub-slice of it
+// (VX_lsu_slice g_mem_req_data) although nothing clobbers anything.
+static void has_whole_or_dynamic_write_recurse(vhdl_seq_stmt *s,
+                                               const std::string &name,
+                                               bool &hit)
 {
-   WriteInfo info;
-   find_write_info(body, sig, info);
-   if (!info.found)
-      return false;
-   if (info.ambiguous || info.slice == NULL)
-      return true;
-   vhdl_expr *cl = clone_slice(info.slice);
-   if (cl == NULL)
-      return true;
-   delete cl;
-   return false;
+   if (hit)
+      return;
+   if (vhdl_nbassign_stmt *nb = dynamic_cast<vhdl_nbassign_stmt*>(s)) {
+      if (nb->get_lhs()->get_name() == name) {
+         vhdl_expr *slice = nb->get_lhs()->get_slice();
+         vhdl_expr *extra = nb->get_lhs()->last_extra_base();
+         int64_t v;
+         if (slice == NULL || !const_value_of(slice, v)
+             || (extra != NULL && !const_value_of(extra, v))) {
+            hit = true;
+            return;
+         }
+      }
+   }
+   std::vector<stmt_container*> subs;
+   s->get_sub_containers(subs);
+   for (stmt_container *sc : subs)
+      for (vhdl_seq_stmt *t : sc->get_stmts())
+         has_whole_or_dynamic_write_recurse(t, name, hit);
+}
+
+static bool has_whole_or_dynamic_write(stmt_container *body,
+                                       const std::string &sig)
+{
+   bool hit = false;
+   for (vhdl_seq_stmt *s : body->get_stmts())
+      has_whole_or_dynamic_write_recurse(s, sig, hit);
+   return hit;
 }
 
 // A signal `x` written with a BLOCKING assignment by member X and with a
@@ -1458,7 +1487,7 @@ static int generate_vhdl_process(vhdl_entity *ent, ivl_process_t proc)
       w.where = where.str();
       w.sigs = written_signals(vhdl_proc, ent);
       for (const std::string &s : w.sigs)
-         if (drives_whole(vhdl_proc->get_container(), s))
+         if (has_whole_or_dynamic_write(vhdl_proc->get_container(), s))
             w.whole.insert(s);
       if (!w.sigs.empty())
          g_extra_writers.push_back(w);
