@@ -1777,17 +1777,26 @@ void fuse_comb_processes(vhdl_entity *ent)
    }
 
    // Group the ordered members by DSU component, preserving topo order.
+   // Components are visited in order of first appearance, not by root
+   // address: the map is keyed by pointer and its iteration order changed
+   // with the heap layout (the length of argv was enough), which numbered
+   // and ordered the comb_fused_N processes differently from run to run.
    std::map<member_t*, std::list<member_t*> > comps;
-   for (std::list<member_t*>::iterator it = order.begin(); it != order.end(); ++it)
-      comps[dsu::find(*it)].push_back(*it);
+   std::vector<member_t*> comp_order;
+   for (std::list<member_t*>::iterator it = order.begin(); it != order.end(); ++it) {
+      member_t *root = dsu::find(*it);
+      if (comps.find(root) == comps.end())
+         comp_order.push_back(root);
+      comps[root].push_back(*it);
+   }
 
    vhdl_scope *ascope = arch->get_scope();
    std::set<vhdl_cassign_stmt*> fused;
    unsigned blkno = 0;
 
-   for (std::map<member_t*, std::list<member_t*> >::iterator ci = comps.begin();
-        ci != comps.end(); ++ci) {
-      std::list<member_t*> &mem = ci->second;
+   for (std::vector<member_t*>::iterator ci = comp_order.begin();
+        ci != comp_order.end(); ++ci) {
+      std::list<member_t*> &mem = comps[*ci];
       if (mem.size() < 2)
          continue;
 
