@@ -894,10 +894,15 @@ static int draw_block(vhdl_procedural *proc, stmt_container *container,
          // Guard against re-entry: when a parent module elaborates this same
          // block via different paths (e.g. in iterated/loop unrolling), the
          // signal may already be remembered. remember_signal asserts on dups.
-         if (!seen_signal_before(sig))
-            remember_signal(sig, proc->get_scope());
-
          std::string safe_name = make_safe_name(sig);
+         if (!seen_signal_before(sig)) {
+            remember_signal(sig, proc->get_scope());
+            // The variable is declared under its VHDL-safe name; every
+            // reference must use that name too (sv2v's `integer __i' is
+            // declared as `sig_i' -- looked up as `__i' it was never found).
+            rename_signal(sig, safe_name);
+         }
+
          if (!proc->get_scope()->have_declared(safe_name)) {
             proc->get_scope()->add_decl
                (new vhdl_var_decl(safe_name, vhdl_type_for_signal(sig)));
@@ -955,7 +960,16 @@ static vhdl_var_ref *make_assign_lhs(ivl_lval_t lval, vhdl_scope *scope)
 
    string signame(get_renamed_signal(sig));
    vhdl_decl *decl = scope->get_decl(signame);
-   assert(decl);
+   if (decl == NULL) {
+      // Nothing declared this signal in the scope chain the statement is
+      // drawn into: report where it lives rather than trip an assertion
+      // the user cannot act on.
+      error("assignment to %s (declared in %s, scope type %d) has no VHDL "
+            "declaration visible from the process/function that assigns it",
+            ivl_signal_name(sig), ivl_scope_name(ivl_signal_scope(sig)),
+            (int)ivl_scope_type(ivl_signal_scope(sig)));
+      return NULL;
+   }
 
    // Verilog allows assignments to elements that are constant in VHDL:
    // function parameters, for example

@@ -117,7 +117,15 @@ static vhdl_var_ref *translate_signal(ivl_expr_t e)
    const char *renamed = get_renamed_signal(sig).c_str();
 
    vhdl_decl *decl = scope->get_decl(renamed);
-   assert(decl);
+   if (decl == NULL) {
+      // Same situation as make_assign_lhs: name the signal instead of
+      // aborting on an assertion.
+      error("reference to %s (declared in %s, scope type %d, VHDL name %s) "
+            "has no VHDL declaration in its scope",
+            ivl_signal_name(sig), ivl_scope_name(ivl_signal_scope(sig)),
+            (int)ivl_scope_type(ivl_signal_scope(sig)), renamed);
+      return NULL;
+   }
 
    // Make sure we can read from this declaration
    // E.g. if this is an `out' port then we need to make it a buffer
