@@ -180,6 +180,15 @@ static vhdl_expr *ufunc_lpm_to_expr(vhdl_scope *scope, ivl_lpm_t lpm)
    ivl_scope_t f_scope = ivl_lpm_define(lpm);
    vhdl_fcall *fcall = new vhdl_fcall(ivl_scope_basename(f_scope), NULL);
 
+   // The function's input formals, in order (port 0 may be the return
+   // value, see draw_function_in_entity).
+   std::vector<ivl_signal_t> formals;
+   for (unsigned p = 0; p < ivl_scope_ports(f_scope); p++) {
+      ivl_signal_t fsig = ivl_scope_port(f_scope, p);
+      if (ivl_signal_port(fsig) == IVL_SIP_INPUT)
+         formals.push_back(fsig);
+   }
+
    for (unsigned i = 0; i < ivl_lpm_size(lpm); i++) {
       vhdl_var_ref *ref = readable_ref(scope, ivl_lpm_data(lpm, i));
       if (NULL == ref) {
@@ -187,7 +196,20 @@ static vhdl_expr *ufunc_lpm_to_expr(vhdl_scope *scope, ivl_lpm_t lpm)
          return NULL;
       }
 
-      fcall->add_expr(ref);
+      // Verilog sizes the actual to the formal on the call (a wider
+      // expression is truncated, a narrower one extended); VHDL rejects
+      // an actual of a different length or signedness. Cast to the
+      // formal's type exactly as the procedural path (translate_ufunc)
+      // does, which covers width, sign and scalar/vector alike.
+      vhdl_expr *arg = ref;
+      if (i < formals.size() && ref->get_type() != NULL
+          && ref->get_type()->get_name() != VHDL_TYPE_ARRAY) {
+         vhdl_type *ft = vhdl_type_for_signal(formals[i]);
+         arg = ref->cast(ft);
+         delete ft;
+      }
+
+      fcall->add_expr(arg);
    }
 
    return fcall;
