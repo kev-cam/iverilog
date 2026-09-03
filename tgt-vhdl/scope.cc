@@ -26,6 +26,9 @@
 #include <sstream>
 #include <cassert>
 #include <cstring>
+#include <cctype>
+#include <algorithm>
+#include <vector>
 
 using namespace std;
 
@@ -608,60 +611,42 @@ static void avoid_name_collision(string& name, const vhdl_scope* scope)
    }
 }
 
-// Concatenate the expanded genvar values together to make a unique
-// instance name
+// Make a suffix that keeps the contents of one generate scope apart from
+// every other generate scope of the containing module, since generate
+// blocks are flattened into the enclosing architecture.
 // This isn't ideal: it would be better to replace the Verilog
 // generate with an equivalent VHDL generate, but this isn't possible
 // with the current API
+//
+// The suffix is the path of generate-block names from the module down to
+// `scope', `name[idx]' loop iterations rendered as `name_idx'. Verilog
+// scope names are unique within their parent, so the path is unique by
+// construction and stays short. (Earlier versions folded the numeric
+// parameters of loop-iteration scopes in instead: two sibling conditional
+// blocks -- e.g. two interface-port modules that sv2v inlined as named
+// generate blocks -- got the same empty suffix, and two loops with equal
+// genvar values under different siblings collided as well, so `rsp_buf'
+// in alu_unit and in lsu_unit became one label.)
 static string genvar_unique_suffix(ivl_scope_t scope)
 {
-   ostringstream suffix;
+   std::vector<std::string> path;
    while (scope && ivl_scope_type(scope) == IVL_SCT_GENERATE) {
-      // Only a loop-iteration scope (`name[idx]`) needs a suffix to keep
-      // its instances apart. A conditional/case generate block -- or a
-      // module that sv2v inlined as a named generate block, which carries
-      // every localparam of that module -- has a single instance, and
-      // folding all of its parameters into every identifier makes names
-      // hundreds of characters long for no gain.
-      if (strchr(ivl_scope_basename(scope), '[') == NULL) {
-         scope = ivl_scope_parent(scope);
-         continue;
+      std::string part(ivl_scope_basename(scope));
+      for (std::string::size_type i = 0; i < part.size(); i++) {
+         if (part[i] == '[')
+            part[i] = '_';
+         else if (!isalnum((unsigned char)part[i]) && part[i] != '_')
+            part[i] = '\0';
       }
-      for (unsigned i = 0; i < ivl_scope_params(scope); i++) {
-         ivl_parameter_t param = ivl_scope_param(scope, i);
-         ivl_expr_t e = ivl_parameter_expr(param);
-
-         if (ivl_expr_type(e) == IVL_EX_NUMBER) {
-            vhdl_expr* value = translate_expr(e);
-            assert(value);
-
-            value = value->cast(vhdl_type::integer());
-
-            suffix << "_" << ivl_parameter_basename(param);
-            value->emit(suffix, 0);
-
-            delete value;
-         }
-         else if (ivl_expr_type(e) == IVL_EX_STRING
-                  || ivl_expr_type(e) == IVL_EX_REALNUM) {
-            // Not a genvar: a string or real parameter carried by the
-            // scope (sv2v inlines a module with interface ports as a
-            // named generate block that keeps the module's parameters,
-            // e.g. `localparam INSTANCE_ID = "alu0"`). It cannot index an
-            // instance, so it contributes nothing to the suffix.
-            continue;
-         }
-         else {
-            error("Only numeric genvars supported at the moment "
-                  "(scope %s, parameter %s, expression type %d)",
-                  ivl_scope_name(scope), ivl_parameter_basename(param),
-                  (int)ivl_expr_type(e));
-            return "_ERROR";  // Never used
-         }
-      }
-
+      part.erase(std::remove(part.begin(), part.end(), '\0'), part.end());
+      path.push_back(part);
       scope = ivl_scope_parent(scope);
    }
+
+   ostringstream suffix;
+   for (std::vector<std::string>::reverse_iterator it = path.rbegin();
+        it != path.rend(); ++it)
+      suffix << "_" << *it;
 
    return suffix.str();
 }
