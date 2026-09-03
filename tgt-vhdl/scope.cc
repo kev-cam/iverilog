@@ -617,6 +617,16 @@ static string genvar_unique_suffix(ivl_scope_t scope)
 {
    ostringstream suffix;
    while (scope && ivl_scope_type(scope) == IVL_SCT_GENERATE) {
+      // Only a loop-iteration scope (`name[idx]`) needs a suffix to keep
+      // its instances apart. A conditional/case generate block -- or a
+      // module that sv2v inlined as a named generate block, which carries
+      // every localparam of that module -- has a single instance, and
+      // folding all of its parameters into every identifier makes names
+      // hundreds of characters long for no gain.
+      if (strchr(ivl_scope_basename(scope), '[') == NULL) {
+         scope = ivl_scope_parent(scope);
+         continue;
+      }
       for (unsigned i = 0; i < ivl_scope_params(scope); i++) {
          ivl_parameter_t param = ivl_scope_param(scope, i);
          ivl_expr_t e = ivl_parameter_expr(param);
@@ -632,8 +642,20 @@ static string genvar_unique_suffix(ivl_scope_t scope)
 
             delete value;
          }
+         else if (ivl_expr_type(e) == IVL_EX_STRING
+                  || ivl_expr_type(e) == IVL_EX_REALNUM) {
+            // Not a genvar: a string or real parameter carried by the
+            // scope (sv2v inlines a module with interface ports as a
+            // named generate block that keeps the module's parameters,
+            // e.g. `localparam INSTANCE_ID = "alu0"`). It cannot index an
+            // instance, so it contributes nothing to the suffix.
+            continue;
+         }
          else {
-            error("Only numeric genvars supported at the moment");
+            error("Only numeric genvars supported at the moment "
+                  "(scope %s, parameter %s, expression type %d)",
+                  ivl_scope_name(scope), ivl_parameter_basename(param),
+                  (int)ivl_expr_type(e));
             return "_ERROR";  // Never used
          }
       }
