@@ -361,6 +361,9 @@ bool get_sv2vhdl_mode()
  */
 static bool same_scope_type_name(ivl_scope_t a, ivl_scope_t b)
 {
+   if (ivl_scope_type(a) != ivl_scope_type(b))
+      return false;
+
    const char *ta = ivl_scope_tname(a), *tb = ivl_scope_tname(b);
    if (strcmp(ta, tb) != 0)
       return false;
@@ -427,11 +430,25 @@ static bool same_scope_type_name(ivl_scope_t a, ivl_scope_t b)
    // per-iteration outer genvar in the comparison; jumping straight to
    // the module collapsed B[0].G[0]..B[7].G[0] to one "default" scope,
    // so only B[0]'s child logic got drawn.)
-   if (ivl_scope_type(a) == IVL_SCT_GENERATE) {
+   // The same holds for a function, task or named block: its tname is
+   // just its name, so `function cast' in module m1 and `function cast'
+   // in module m2 (sv2v emits one sv2v_cast_<hash> per module) matched
+   // as one type and only the first module's body was ever drawn --
+   // "no visible declaration for CAST" in the second architecture.
+   switch (ivl_scope_type(a)) {
+   case IVL_SCT_GENERATE:
+   case IVL_SCT_FUNCTION:
+   case IVL_SCT_TASK:
+   case IVL_SCT_BEGIN:
+   case IVL_SCT_FORK: {
       ivl_scope_t pa = ivl_scope_parent(a);
       ivl_scope_t pb = ivl_scope_parent(b);
       if (pa != NULL && pb != NULL)
          return same_scope_type_name(pa, pb);
+      break;
+   }
+   default:
+      break;
    }
 
    return true;
