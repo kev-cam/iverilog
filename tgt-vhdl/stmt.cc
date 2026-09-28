@@ -4623,8 +4623,97 @@ static int draw_release(vhdl_procedural *proc, stmt_container *container,
  * in a block or process. It avoids generating useless `wait for 0ns'
  * statements if the next statement would be a wait anyway.
  */
+/*
+ * Pre-statement hook.  A few system functions have side effects that a VHDL
+ * expression cannot express ($value$plusargs writes its second argument).
+ * While a statement is being drawn, g_pre_container is the container it will
+ * be added to; expression translation can append statements there, and they
+ * land before the statement being built (whose condition/RHS is translated
+ * before the statement itself is added).
+ */
+static vhdl_procedural *g_pre_proc = NULL;
+static stmt_container *g_pre_container = NULL;
+
+static int draw_stmt_inner(vhdl_procedural *proc, stmt_container *container,
+                           ivl_statement_t stmt, bool is_last);
+
 int draw_stmt(vhdl_procedural *proc, stmt_container *container,
               ivl_statement_t stmt, bool is_last)
+{
+   vhdl_procedural *save_proc = g_pre_proc;
+   stmt_container *save_container = g_pre_container;
+   g_pre_proc = proc;
+   g_pre_container = container;
+   int rc = draw_stmt_inner(proc, container, stmt, is_last);
+   g_pre_proc = save_proc;
+   g_pre_container = save_container;
+   return rc;
+}
+
+/*
+ * $value$plusargs(fmt, var): emit, ahead of the current statement,
+ *    if sv_value_plusargs(fmt) /= 0 then var := <converted plusarg>; end if;
+ * (':=' or '<=' per the target's declaration, as for $random's seed).
+ * make_fmt builds a fresh VHDL expression for the format string each call.
+ */
+bool emit_value_plusargs_pre(ivl_expr_t target, vhdl_expr *(*make_fmt)(ivl_expr_t),
+                             ivl_expr_t fmt)
+{
+   if (g_pre_proc == NULL || g_pre_container == NULL) {
+      error("$value$plusargs outside a procedural statement is not supported");
+      return false;
+   }
+   if (ivl_expr_type(target) != IVL_EX_SIGNAL) {
+      error("$value$plusargs second argument must be a variable");
+      return false;
+   }
+   ivl_signal_t sig = ivl_expr_signal(target);
+   string name = get_renamed_signal(sig);
+   vhdl_decl *decl = g_pre_proc->get_scope()->get_decl(name);
+   if (decl == NULL) {
+      error("$value$plusargs: no declaration for %s", name.c_str());
+      return false;
+   }
+   const vhdl_type *t = decl->get_type();
+   vhdl_expr *rhs = NULL;
+   switch (t->get_name()) {
+   case VHDL_TYPE_REAL: {
+      vhdl_fcall *f = new vhdl_fcall("sv_plusarg_real", vhdl_type::real());
+      f->add_expr(make_fmt(fmt));
+      rhs = f;
+      break;
+   }
+   case VHDL_TYPE_LOGIC3D_VECTOR: {
+      const int w = t->get_width();
+      vhdl_fcall *f = new vhdl_fcall("sv_plusarg_vec", new vhdl_type(*t));
+      f->add_expr(make_fmt(fmt));
+      f->add_expr(new vhdl_const_int(w));
+      rhs = f;
+      break;
+   }
+   default:
+      error("$value$plusargs: unsupported target type for %s", name.c_str());
+      return false;
+   }
+
+   vhdl_fcall *found = new vhdl_fcall("sv_value_plusargs", vhdl_type::integer());
+   found->add_expr(make_fmt(fmt));
+   vhdl_expr *test = new vhdl_binop_expr(found, VHDL_BINOP_NEQ,
+                                         new vhdl_const_int(0),
+                                         vhdl_type::boolean());
+   vhdl_if_stmt *vif = new vhdl_if_stmt(test);
+   vhdl_decl::assign_type_t atype = decl->assignment_type();
+   if (g_pre_proc->get_scope()->initializing()
+       && atype == vhdl_decl::ASSIGN_NONBLOCK)
+      atype = vhdl_decl::ASSIGN_BLOCK;
+   vif->get_then_container()->add_stmt(
+      assign_for(atype, new vhdl_var_ref(name.c_str(), new vhdl_type(*t)), rhs));
+   g_pre_container->add_stmt(vif);
+   return true;
+}
+
+static int draw_stmt_inner(vhdl_procedural *proc, stmt_container *container,
+                           ivl_statement_t stmt, bool is_last)
 {
    assert(stmt);
 

@@ -69,6 +69,27 @@ static vhdl_expr *correct_signedness(vhdl_expr *vhd_e, ivl_expr_t vl_e)
 }
 
 /*
+ * ivl_expr_string() returns escaped text: verinum::as_string() writes '"',
+ * '\' and every non-printable byte (including the zero padding of a string
+ * widened to its target) as a 4-character "\ooo" octal escape. Decode back
+ * to the raw bytes.
+ */
+std::string ivl_string_unescape(const char *str)
+{
+   std::string out;
+   for (const char *p = str; *p; ) {
+      if (p[0] == '\\' && p[1] >= '0' && p[1] <= '7' && p[2] >= '0'
+          && p[2] <= '7' && p[3] >= '0' && p[3] <= '7') {
+         out += (char)(((p[1] - '0') << 6) | ((p[2] - '0') << 3) | (p[3] - '0'));
+         p += 4;
+      }
+      else
+         out += *p++;
+   }
+   return out;
+}
+
+/*
  * Convert a constant Verilog string to a constant VHDL string.
  */
 static vhdl_expr *translate_string(ivl_expr_t e)
@@ -81,14 +102,17 @@ static vhdl_expr *translate_string(ivl_expr_t e)
    // arg). $display format strings never reach this function -- the display
    // builder reads ivl_expr_string directly.
    if (get_sv2vhdl_mode()) {
-      size_t len = strlen(str);
+      // Decode ivl's escapes first: "\000" is ONE zero byte, not 4 chars
+      // (a string widened to a 72-bit reg arrived as "000hex=%h").
+      const std::string raw = ivl_string_unescape(str);
+      size_t len = raw.size();
       string bits;
       if (len == 0)
          bits = "00000000";               // "" is 8'b0
       else {
          // ivl bit order: LSB first -- last character's low bit leads.
          for (size_t i = len; i-- > 0; ) {
-            unsigned char c = str[i];
+            unsigned char c = raw[i];
             for (int b = 0; b < 8; b++)
                bits += ((c >> b) & 1) ? '1' : '0';
          }
@@ -240,6 +264,14 @@ static vhdl_expr *translate_unary(ivl_expr_t e)
    char opcode = ivl_expr_opcode(e);
    switch (opcode) {
    case '!':
+      // Logical not is "operand == 0": a bitwise NOT is only equivalent for a
+      // 1-bit operand. On a wider one (e.g. !$value$plusargs(...), !count)
+      // bitwise NOT of 0...01 is non-zero, so the test was always true.
+      // Reduce with NOR, as for the ~| operator.
+      if (ivl_expr_width(ivl_expr_oper1(e)) > 1)
+         return translate_reduction(SF_REDUCE_OR, true, operand);
+      return new vhdl_unaryop_expr
+         (VHDL_UNARYOP_NOT, operand, new vhdl_type(*operand->get_type()));
    case '~':
       return new vhdl_unaryop_expr
          (VHDL_UNARYOP_NOT, operand, new vhdl_type(*operand->get_type()));
@@ -1075,6 +1107,24 @@ static vhdl_expr *translate_ternary(ivl_expr_t e)
    return fcall;
 }
 
+/*
+ * $value$plusargs format argument as a VHDL string expression: a literal
+ * stays a literal; a runtime vector holding the format goes through
+ * sv_math_pkg.l3d_to_string.  Called once per use site (each needs its own
+ * expression node).
+ */
+static vhdl_expr *plusargs_fmt_expr(ivl_expr_t fe)
+{
+   if (ivl_expr_type(fe) == IVL_EX_STRING)
+      return new vhdl_const_string(ivl_string_unescape(ivl_expr_string(fe)));
+   vhdl_expr *v = translate_expr(fe);
+   if (v == NULL)
+      return new vhdl_const_string("");
+   vhdl_fcall *f = new vhdl_fcall("l3d_to_string", vhdl_type::string());
+   f->add_expr(v);
+   return f;
+}
+
 static vhdl_expr *translate_concat(ivl_expr_t e)
 {
    const vhdl_type *rtype =
@@ -1345,7 +1395,34 @@ vhdl_expr *translate_sfunc(ivl_expr_t e)
          return NULL;
       }
       vhdl_fcall *f = new vhdl_fcall("sv_test_plusargs", vhdl_type::integer());
-      f->add_expr(new vhdl_const_string(ivl_expr_string(pe)));
+      f->add_expr(new vhdl_const_string(ivl_string_unescape(ivl_expr_string(pe))));
+      const int w = ivl_expr_width(e);
+      if (w <= 1)
+         return f;
+      vhdl_fcall *ts = new vhdl_fcall("to_signed", vhdl_type::nsigned(w));
+      ts->add_expr(f);
+      ts->add_expr(new vhdl_const_int(w));
+      vhdl_fcall *tu = new vhdl_fcall("unsigned", vhdl_type::nunsigned(w));
+      tu->add_expr(ts);
+      vhdl_fcall *l3 = new vhdl_fcall("unsigned_to_l3d",
+                                      vhdl_type::logic3d_vector(w - 1, 0));
+      l3->add_expr(tu);
+      return l3;
+   }
+   else if (strcmp(name, "$value$plusargs") == 0) {
+      // $value$plusargs(fmt, var): the assignment to var is emitted ahead of
+      // the current statement (emit_value_plusargs_pre); the value of the
+      // call itself is "a matching +plusarg exists", from the same runtime
+      // helper.  fmt may be a literal or a runtime vector (l3d_to_string).
+      if (ivl_expr_parms(e) < 2) {
+         error("$value$plusargs requires two arguments");
+         return NULL;
+      }
+      ivl_expr_t fe = ivl_expr_parm(e, 0);
+      if (!emit_value_plusargs_pre(ivl_expr_parm(e, 1), plusargs_fmt_expr, fe))
+         return NULL;
+      vhdl_fcall *f = new vhdl_fcall("sv_value_plusargs", vhdl_type::integer());
+      f->add_expr(plusargs_fmt_expr(fe));
       const int w = ivl_expr_width(e);
       if (w <= 1)
          return f;

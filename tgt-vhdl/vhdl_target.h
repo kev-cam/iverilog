@@ -24,6 +24,8 @@ void emit_strength_buf(vhdl_arch *arch, vhdl_expr *y, vhdl_expr *data,
 void draw_switches(vhdl_arch *arch, ivl_scope_t scope);
 
 vhdl_expr *translate_expr(ivl_expr_t e);
+bool emit_value_plusargs_pre(ivl_expr_t target, vhdl_expr *(*make_fmt)(ivl_expr_t),
+                             ivl_expr_t fmt);
 vhdl_expr *translate_time_expr(ivl_expr_t e);
 
 std::string nexus_to_signal_basename(ivl_nexus_t nex);
