@@ -1334,6 +1334,31 @@ vhdl_expr *translate_sfunc(ivl_expr_t e)
       l3->add_expr(tu);
       return l3;
    }
+   else if (strcmp(name, "$test$plusargs") == 0) {
+      // sv_math_pkg.sv_test_plusargs (VHPIDIRECT into libresolver, which
+      // reads the simulator's plusargs from the VHPI tool argv): 1 when a
+      // +plusarg starts with the given text.  Wrapped at the expression width
+      // like $rtoi so it composes with the logic3d arithmetic.
+      ivl_expr_t pe = ivl_expr_parms(e) >= 1 ? ivl_expr_parm(e, 0) : NULL;
+      if (!pe || ivl_expr_type(pe) != IVL_EX_STRING) {
+         error("$test$plusargs argument must be a string literal");
+         return NULL;
+      }
+      vhdl_fcall *f = new vhdl_fcall("sv_test_plusargs", vhdl_type::integer());
+      f->add_expr(new vhdl_const_string(ivl_expr_string(pe)));
+      const int w = ivl_expr_width(e);
+      if (w <= 1)
+         return f;
+      vhdl_fcall *ts = new vhdl_fcall("to_signed", vhdl_type::nsigned(w));
+      ts->add_expr(f);
+      ts->add_expr(new vhdl_const_int(w));
+      vhdl_fcall *tu = new vhdl_fcall("unsigned", vhdl_type::nunsigned(w));
+      tu->add_expr(ts);
+      vhdl_fcall *l3 = new vhdl_fcall("unsigned_to_l3d",
+                                      vhdl_type::logic3d_vector(w - 1, 0));
+      l3->add_expr(tu);
+      return l3;
+   }
    else if (strcmp(name, "$isunknown") == 0) {
       // The explicit certainty observer: L3D_1 when any bit of the operand
       // has certainty 0. Value-plane reads never consult certainty; test
