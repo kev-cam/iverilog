@@ -329,10 +329,87 @@ bool get_sv2vhdl_mode()
 /*
  * True if two scopes have the same type name.
  */
+// Per-instance netlist fingerprint.  iverilog constant-folds per
+// INSTANCE (a ternary select tied to a constant collapses the mux to a
+// buffer in that instance's netlist), so two instances of the same
+// module with identical parameters can carry structurally different
+// gate/LPM inventories.  Sharing one arch across them emits whichever
+// instance was elaborated first as the body for ALL of them -- a
+// silent wrong-logic (VeeR -s dec: an en=const rvdffs instance was
+// drawn first, so every enable flop in the design lost its input mux
+// and held reset forever).  Folding the inventory into the dedup key
+// splits folded variants into their own entities.
+static uint64_t scope_netlist_fp(ivl_scope_t s)
+{
+   static std::map<ivl_scope_t, uint64_t> cache;
+   std::map<ivl_scope_t, uint64_t>::const_iterator hit = cache.find(s);
+   if (hit != cache.end())
+      return hit->second;
+
+   uint64_t h = UINT64_C(1469598103934665603);
+   #define FP_MIX(v) do { h ^= (uint64_t)(v); \
+                          h *= UINT64_C(1099511628211); } while (0)
+
+   unsigned nlogs = ivl_scope_logs(s);
+   FP_MIX(nlogs);
+   for (unsigned i = 0; i < nlogs; i++) {
+      ivl_net_logic_t log = ivl_scope_log(s, i);
+      FP_MIX(ivl_logic_type(log));
+      FP_MIX(ivl_logic_width(log));
+      unsigned npins = ivl_logic_pins(log);
+      FP_MIX(npins);
+      for (unsigned p = 0; p < npins; p++) {
+         ivl_nexus_t nex = ivl_logic_pin(log, p);
+         if (nex == NULL) { FP_MIX(0xdead); continue; }
+         unsigned nptr = ivl_nexus_ptrs(nex);
+         bool has_const = false;
+         for (unsigned k = 0; k < nptr; k++) {
+            ivl_net_const_t con =
+               ivl_nexus_ptr_con(ivl_nexus_ptr(nex, k));
+            if (con != NULL) {
+               has_const = true;
+               const char *bits = ivl_const_bits(con);
+               for (const char *c = bits; c != NULL && *c; c++)
+                  FP_MIX(*c);
+            }
+         }
+         FP_MIX(has_const ? 3 : 5);
+      }
+   }
+
+   unsigned nlpms = ivl_scope_lpms(s);
+   FP_MIX(nlpms);
+   for (unsigned i = 0; i < nlpms; i++) {
+      ivl_lpm_t lpm = ivl_scope_lpm(s, i);
+      FP_MIX(ivl_lpm_type(lpm));
+      FP_MIX(ivl_lpm_width(lpm));
+   }
+   #undef FP_MIX
+
+   cache[s] = h;
+   return h;
+}
+
 static bool same_scope_type_name(ivl_scope_t a, ivl_scope_t b)
 {
    const char *ta = ivl_scope_tname(a), *tb = ivl_scope_tname(b);
    if (strcmp(ta, tb) != 0)
+      return false;
+
+   // Split same-name instances whose per-instance folded netlists
+   // differ (see scope_netlist_fp)
+   if (ivl_scope_type(a) == IVL_SCT_MODULE
+       && ivl_scope_type(b) == IVL_SCT_MODULE
+       && scope_netlist_fp(a) != scope_netlist_fp(b))
+      return false;
+
+   // ICG2EN: gated-clock context is part of the specialization key —
+   // instances whose clock port is fed by a matched clock gate emit a
+   // separate entity from raw-clocked instances of the same module
+   if (icg2en_key_enabled()
+       && ivl_scope_type(a) == IVL_SCT_MODULE
+       && ivl_scope_type(b) == IVL_SCT_MODULE
+       && icg2en_scope_signature(a) != icg2en_scope_signature(b))
       return false;
 
    unsigned nparams_a = ivl_scope_params(a);

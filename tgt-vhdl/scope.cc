@@ -52,9 +52,28 @@ struct scope_nexus_t {
  * contained_within to allow several nested scopes to reference
  * the same signal.
  */
+struct const_drv_t {
+   vhdl_expr  *expr;
+   ivl_drive_t drive0, drive1;
+   // Raw constant bit chars (LSB first, from ivl_const_bits): the
+   // per-bit strength-buffer emission for vector constants needs the
+   // individual bit values, not the packed vhdl expression
+   string      bits;
+};
+
 struct nexus_private_t {
    list<scope_nexus_t> signals;
    vhdl_expr *const_driver;
+   // Drive strengths of the constant driver's nexus pointer: a
+   // strength-spec assign with a constant r-value has no BUFZ device,
+   // so the strengths live only here
+   ivl_drive_t const_drive0 = IVL_DR_STRONG;
+   ivl_drive_t const_drive1 = IVL_DR_STRONG;
+   string const_bits;          // raw bit chars of const_driver (LSB first)
+   // Second and later constant drivers on the same nexus (opposing
+   // strength-spec assigns): the single const_driver slot kept only
+   // the last one and silently dropped the rest
+   list<const_drv_t> const_extra;
    bool has_inout = false;     // nexus touches an inout port => bidirectional
    string inout_module;        // module type of that inout (for origin markup)
 };
@@ -324,15 +343,31 @@ void draw_nexus(ivl_nexus_t nexus)
       else if ((con = ivl_nexus_ptr_con(nexus_ptr))) {
          if (ivl_const_type(con) == IVL_VT_REAL) {
             priv->const_driver = new vhdl_const_real(ivl_const_real(con));
+            priv->const_drive0 = ivl_nexus_ptr_drive0(nexus_ptr);
+            priv->const_drive1 = ivl_nexus_ptr_drive1(nexus_ptr);
             ndrivers++;
             continue;
          }
+         vhdl_expr *cexpr;
          if (ivl_const_width(con) == 1)
-            priv->const_driver = new vhdl_const_bit(ivl_const_bits(con)[0]);
+            cexpr = new vhdl_const_bit(ivl_const_bits(con)[0]);
          else
-            priv->const_driver =
+            cexpr =
                new vhdl_const_bits(ivl_const_bits(con), ivl_const_width(con),
                                    ivl_const_signed(con) != 0);
+         const string cbits(ivl_const_bits(con), ivl_const_width(con));
+
+         if (priv->const_driver == NULL) {
+            priv->const_driver = cexpr;
+            priv->const_drive0 = ivl_nexus_ptr_drive0(nexus_ptr);
+            priv->const_drive1 = ivl_nexus_ptr_drive1(nexus_ptr);
+            priv->const_bits = cbits;
+         }
+         else {
+            const_drv_t extra = { cexpr, ivl_nexus_ptr_drive0(nexus_ptr),
+                                  ivl_nexus_ptr_drive1(nexus_ptr), cbits };
+            priv->const_extra.push_back(extra);
+         }
 
          // A constant is a sort of driver
          ndrivers++;
@@ -422,7 +457,7 @@ void draw_nexus(ivl_nexus_t nexus)
  * Ensure that a nexus has been initialised. I.e. all the necessary
  * statements, declarations, etc. have been generated.
  */
-static void seen_nexus(ivl_nexus_t nexus)
+void seen_nexus(ivl_nexus_t nexus)
 {
    if (ivl_nexus_get_private(nexus) == NULL)
       draw_nexus(nexus);
@@ -437,6 +472,18 @@ static void seen_nexus(ivl_nexus_t nexus)
  * encountered before, the necessary code to connect up the nexus
  * will be generated.
  */
+// Non-asserting probe: is some signal on this nexus visible in scope?
+// (nexus_to_var_ref asserts on failure; icg2en needs a soft test)
+bool nexus_visible_in_scope(vhdl_scope *scope, ivl_nexus_t nexus)
+{
+   seen_nexus(nexus);
+   nexus_private_t *priv =
+      static_cast<nexus_private_t*>(ivl_nexus_get_private(nexus));
+   if (priv == NULL)
+      return false;
+   return visible_nexus(priv, scope) != NULL;
+}
+
 vhdl_var_ref *nexus_to_var_ref(vhdl_scope *scope, ivl_nexus_t nexus)
 {
    seen_nexus(nexus);
@@ -1056,6 +1103,20 @@ static void map_signal(ivl_signal_t to, const vhdl_entity *parent,
 {
    // TODO: Work for multiple words
    ivl_nexus_t nexus = ivl_signal_nex(to, 0);
+
+   // ICG2EN site rewiring: a gated clock port of a signature-split
+   // child takes the gate's direct clock input as its actual (the
+   // child entity's guard supplies the enable via an upward external
+   // name).  Only the ICG-ADJACENT site can see that net; pass-through
+   // levels (a wrapper whose own clk port carries the same gated net)
+   // keep their normal wiring — the repoint at the top of the chain
+   // feeds the root down the port association chain.
+   {
+      ivl_nexus_t root = NULL;
+      if (icg2en_site_root(to, &root) && root != NULL
+          && nexus_visible_in_scope(parent->get_arch()->get_scope(), root))
+         nexus = root;
+   }
    seen_nexus(nexus);
 
    vhdl_scope *arch_scope = parent->get_arch()->get_scope();
@@ -1161,6 +1222,10 @@ static void port_map(ivl_scope_t scope, const vhdl_entity *parent,
          assert(false);
       }
    }
+
+   // ICG2EN: synthetic guard-port associations for signature-covered
+   // gated clock ports of this child (see icg2en_map_enables)
+   icg2en_map_enables(scope, parent, inst);
 }
 
 /*
@@ -1330,6 +1395,10 @@ static void create_skeleton_entity_for(ivl_scope_t scope, int depth)
    // retain a 1-to-1 mapping of scope to VHDL element)
    vhdl_arch *arch = new vhdl_arch(tname, "from_verilog");
    vhdl_entity *ent = new vhdl_entity(tname, arch, depth);
+
+   // ICG2EN: synthetic guard ports follow from the signature alone so
+   // entity and sites can never disagree (see icg2en_add_entity_ports)
+   icg2en_add_entity_ports(scope, ent);
 
    // Record the original Verilog source location as a VHDL attribute so it
    // survives translation (debug, and --accel recovering the Verilog source).
@@ -1528,8 +1597,73 @@ extern "C" int draw_constant_drivers(ivl_scope_t scope, void *)
 
                vhdl_var_ref *ref = nexus_to_var_ref(arch_scope, nex);
 
-               ent->get_arch()->add_stmt
-                  (new vhdl_cassign_stmt(ref, priv->const_driver));
+               // Scalar constant with a strength spec (assign
+               // (pull1, pull0) w = 1'b1): drive through the strength
+               // buffer so resolution sees the specified level instead
+               // of a full-strength assignment.  Opposing constant
+               // drivers on the same net each get their own driver.
+               list<const_drv_t> all;
+               const_drv_t first = { priv->const_driver,
+                                     priv->const_drive0,
+                                     priv->const_drive1,
+                                     priv->const_bits };
+               all.push_back(first);
+               all.splice(all.end(), priv->const_extra);
+               // If ANY constant driver has a strength spec, route ALL
+               // of them through strength buffers: the kernel solver
+               // then owns the whole resolution.  A remaining plain
+               // driver would re-resolve against the exported view in
+               // the two-level l3d alphabet, where supply-vs-strong
+               // collapses to X (drive_strength su1st0)
+               bool any_nonstrong = false;
+               for (list<const_drv_t>::iterator it = all.begin();
+                    it != all.end(); ++it)
+                  if (it->drive0 != IVL_DR_STRONG
+                      || it->drive1 != IVL_DR_STRONG)
+                     any_nonstrong = true;
+               const unsigned sig_w = ivl_signal_width(sig);
+               int cd_n = 0;
+               for (list<const_drv_t>::iterator it = all.begin();
+                    it != all.end(); ++it, ++cd_n) {
+                  vhdl_var_ref *dref =
+                     cd_n == 0 ? ref : nexus_to_var_ref(arch_scope, nex);
+                  if (get_sv2vhdl_mode() && sig_w == 1
+                      && any_nonstrong) {
+                     ostringstream bs;
+                     bs << "cd" << cd_n << "_" << ivl_signal_basename(sig);
+                     emit_strength_buf(ent->get_arch(), dref, it->expr,
+                                       it->drive1, it->drive0,
+                                       bs.str().c_str());
+                  }
+                  else if (get_sv2vhdl_mode() && sig_w > 1
+                           && any_nonstrong
+                           && it->bits.length() == sig_w
+                           && dref->get_type() != NULL
+                           && dref->get_type()->get_name()
+                              == VHDL_TYPE_LOGIC3D_VECTOR) {
+                     // Vector constant with a strength spec: one
+                     // strength buffer per bit so each bit's kernel
+                     // net resolves at the specified level and the
+                     // str1/str0 selection happens per bit value
+                     // (multi_bit_strength).  bits[b] is canonical
+                     // LSB-first, matching the (b) slice.
+                     for (unsigned b = 0; b < sig_w; b++) {
+                        vhdl_var_ref *bref =
+                           nexus_to_var_ref(arch_scope, nex);
+                        bref->set_slice(new vhdl_const_int(b));
+                        ostringstream bs;
+                        bs << "cd" << cd_n << "b" << b << "_"
+                           << ivl_signal_basename(sig);
+                        emit_strength_buf(ent->get_arch(), bref,
+                                          new vhdl_const_bit(it->bits[b]),
+                                          it->drive1, it->drive0,
+                                          bs.str().c_str());
+                     }
+                  }
+                  else
+                     ent->get_arch()->add_stmt
+                        (new vhdl_cassign_stmt(dref, it->expr));
+               }
                priv->const_driver = NULL;
             }
 
@@ -1692,6 +1826,9 @@ extern "C" int draw_hierarchy(ivl_scope_t scope, void *_parent)
       // Make sure the name doesn't collide with anything we've
       // already declared
       avoid_name_collision(inst_name, parent_arch->get_scope());
+
+      // Record the finalized label for icg2en guard-path emission
+      icg2en_note_label(scope, inst_name);
 
       vhdl_comp_inst *inst =
          new vhdl_comp_inst(inst_name.c_str(), ent->get_name().c_str());
