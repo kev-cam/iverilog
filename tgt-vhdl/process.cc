@@ -281,10 +281,21 @@ static vhdl_expr *clone_slice(vhdl_expr *e)
 // merge pass diagnostics below.
 static std::set<std::pair<vhdl_process*, std::string> > g_whole_commits;
 
+static void strip_local_vars_from_sensitivity(vhdl_process *vhdl_proc);
+
 static void nba_defer_commits(vhdl_process *vhdl_proc, vhdl_entity *ent)
 {
    if (!get_sv2vhdl_mode())
       return;
+
+   // The trailing `wait on' below is built from the sensitivity list, which
+   // promote_wait_until_edge_form filled from every name the fire test reads
+   // -- including the NBA wake-shadow snapshot VARIABLES (v_icg2en_snap_*)
+   // that test compares against. The per-process path strips variables
+   // before calling here, the post-merge pass did not ("name
+   // V_ICG2EN_SNAP_CLK in sensitivity list is not a signal"); strip here so
+   // every caller is covered.
+   strip_local_vars_from_sensitivity(vhdl_proc);
    if (!vhdl_proc->is_edge_triggered() || vhdl_proc->contains_wait_stmt())
       return;
 
