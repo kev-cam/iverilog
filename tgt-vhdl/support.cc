@@ -71,7 +71,11 @@ vhdl_type *support_function::function_type(support_function_t type)
    case SF_UNSIGNED_TO_LOGIC:
       return get_sv2vhdl_mode() ? vhdl_type::logic3d() : vhdl_type::std_logic();
    case SF_TERNARY_SIGNED:
-      return new vhdl_type(VHDL_TYPE_SIGNED);
+      // sv2vhdl carries signed values as logic3d_vector too (signedness lives
+      // in the l3d_*_s operators), so the branches arrive as logic3d_vector.
+      return get_sv2vhdl_mode()
+         ? new vhdl_type(VHDL_TYPE_LOGIC3D_VECTOR)
+         : new vhdl_type(VHDL_TYPE_SIGNED);
    case SF_TERNARY_UNSIGNED:
       return get_sv2vhdl_mode()
          ? new vhdl_type(VHDL_TYPE_LOGIC3D_VECTOR)
@@ -189,7 +193,10 @@ void support_function::emit(std::ostream &of, int level) const
       emit_ternary(of, level);
       break;
    case SF_TERNARY_SIGNED:
-      of << "(T : Boolean; X, Y : signed) return signed is";
+      if (get_sv2vhdl_mode())
+         of << "(T : Boolean; X, Y : logic3d_vector) return logic3d_vector is";
+      else
+         of << "(T : Boolean; X, Y : signed) return signed is";
       emit_ternary(of, level);
       break;
    case SF_TERNARY_UNSIGNED:
