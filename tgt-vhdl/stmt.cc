@@ -799,6 +799,106 @@ static int draw_queue_method(vhdl_procedural *proc, stmt_container *container,
 }
 
 /*
+ * $readmemh / $readmemb (file, mem [, start [, finish]]):
+ *
+ *   sv_readmem_load("file", hex, start);
+ *   for sv_rm_i in 0 to sv_readmem_count - 1 loop
+ *     if sv_readmem_addr(sv_rm_i) >= LO and sv_readmem_addr(sv_rm_i) <= HI then
+ *       mem(sv_readmem_addr(sv_rm_i)) <= sv_readmem_word(sv_rm_i, W);   -- := in an initializing process
+ *     end if;
+ *   end loop;
+ *
+ * The file is parsed by the support package (logic3d_types_pkg); start
+ * defaults to the lowest address of the memory and [start, finish] narrows
+ * the accepted address window. Previously the task was dropped with a
+ * warning, leaving the memory all X.
+ */
+static int draw_stask_readmem(vhdl_procedural *proc, stmt_container *container,
+                              ivl_statement_t stmt, bool hex)
+{
+   const char *name = ivl_stmt_name(stmt);
+   const unsigned nparms = ivl_stmt_parm_count(stmt);
+   ivl_expr_t fe = nparms > 0 ? ivl_stmt_parm(stmt, 0) : NULL;
+   ivl_expr_t me = nparms > 1 ? ivl_stmt_parm(stmt, 1) : NULL;
+   // A whole memory passed to a system task is an IVL_EX_ARRAY expression.
+   if (!fe || ivl_expr_type(fe) != IVL_EX_STRING
+       || !me || (ivl_expr_type(me) != IVL_EX_ARRAY
+                  && ivl_expr_type(me) != IVL_EX_SIGNAL)) {
+      error("%s: expected a constant file name and a memory (%s:%d)", name,
+            ivl_stmt_file(stmt), ivl_stmt_lineno(stmt));
+      return 1;
+   }
+   ivl_signal_t sig = ivl_expr_signal(me);
+   const string mname(get_renamed_signal(sig));
+   vhdl_decl *decl = proc->get_scope()->get_decl(mname);
+   if (!decl) {
+      error("%s: memory %s not declared", name, mname.c_str());
+      return 1;
+   }
+   const int lo = ivl_signal_array_base(sig);
+   const int hi = lo + (int)ivl_signal_array_count(sig) - 1;
+   const int width = ivl_signal_width(sig);
+
+   vhdl_expr *start = NULL, *finish = NULL;
+   if (nparms > 2 && ivl_stmt_parm(stmt, 2))
+      start = translate_expr(ivl_stmt_parm(stmt, 2))->cast(vhdl_type::integer());
+   if (nparms > 3 && ivl_stmt_parm(stmt, 3))
+      finish = translate_expr(ivl_stmt_parm(stmt, 3))->cast(vhdl_type::integer());
+
+   vhdl_pcall_stmt *load = new vhdl_pcall_stmt("sv_readmem_load");
+   load->add_expr(new vhdl_const_string(ivl_expr_string(fe)));
+   load->add_expr(new vhdl_var_ref(hex ? "true" : "false", vhdl_type::boolean()));
+   load->add_expr(start ? start : new vhdl_const_int(lo));
+   container->add_stmt(load);
+
+   const char *iv = "sv_rm_i";
+   vhdl_fcall *count = new vhdl_fcall("sv_readmem_count", vhdl_type::integer());
+   vhdl_for_stmt *loop = new vhdl_for_stmt(
+      iv, new vhdl_const_int(0),
+      new vhdl_binop_expr(count, VHDL_BINOP_SUB, new vhdl_const_int(1),
+                          vhdl_type::integer()));
+
+   auto addr = [&]() {
+      vhdl_fcall *a = new vhdl_fcall("sv_readmem_addr", vhdl_type::integer());
+      a->add_expr(new vhdl_var_ref(iv, vhdl_type::integer()));
+      return a;
+   };
+   // Accepted window: the memory's address range, narrowed by start/finish
+   // (a finish below start reads downward in Verilog; the window test is
+   // the same either way).
+   vhdl_expr *win_lo = new vhdl_const_int(lo), *win_hi = new vhdl_const_int(hi);
+   vhdl_binop_expr *test = new vhdl_binop_expr(VHDL_BINOP_AND, vhdl_type::boolean());
+   test->add_expr(new vhdl_binop_expr(addr(), VHDL_BINOP_GEQ, win_lo, vhdl_type::boolean()));
+   test->add_expr(new vhdl_binop_expr(addr(), VHDL_BINOP_LEQ, win_hi, vhdl_type::boolean()));
+   if (finish) {
+      vhdl_binop_expr *in_fin = new vhdl_binop_expr(addr(), VHDL_BINOP_LEQ, finish,
+                                                    vhdl_type::boolean());
+      test->add_expr(in_fin);
+   }
+   vhdl_if_stmt *inrange = new vhdl_if_stmt(test);
+
+   vhdl_var_ref *lhs = new vhdl_var_ref(mname.c_str(), new vhdl_type(*decl->get_type()));
+   lhs->set_slice(addr());
+   vhdl_fcall *word = new vhdl_fcall("sv_readmem_word",
+                                     vhdl_type::logic3d_vector(width - 1, 0));
+   word->add_expr(new vhdl_var_ref(iv, vhdl_type::integer()));
+   word->add_expr(new vhdl_const_int(width));
+
+   // Same discipline as $set_val: a signal in a running process gets `<=`
+   // (fires events for its readers); an initializing process deposits `:=`
+   // so a read right after the load already sees the data.
+   if (decl->assignment_type() == vhdl_decl::ASSIGN_NONBLOCK
+       && !proc->get_scope()->initializing())
+      inrange->get_then_container()->add_stmt(new vhdl_nbassign_stmt(lhs, word));
+   else
+      inrange->get_then_container()->add_stmt(new vhdl_assign_stmt(lhs, word));
+
+   loop->get_container()->add_stmt(inrange);
+   container->add_stmt(loop);
+   return 0;
+}
+
+/*
  * Generate VHDL for system tasks (like $display). Not all of
  * these are supported.
  */
@@ -831,6 +931,10 @@ static int draw_stask(vhdl_procedural *proc, stmt_container *container,
       return draw_stask_finish(proc, container, stmt);
    else if (strcmp(name, "$set_val") == 0)
       return draw_stask_set_val(proc, container, stmt);
+   else if (strcmp(name, "$readmemh") == 0)
+      return draw_stask_readmem(proc, container, stmt, true);
+   else if (strcmp(name, "$readmemb") == 0)
+      return draw_stask_readmem(proc, container, stmt, false);
    else if (strncmp(name, "$ivl_queue_method$", 18) == 0
             || strncmp(name, "$ivl_darray_method$", 19) == 0)
       return draw_queue_method(proc, container, stmt);
