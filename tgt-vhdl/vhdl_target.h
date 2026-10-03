@@ -52,6 +52,8 @@ vhdl_expr *index_to_integer(ivl_expr_t e, vhdl_expr *v);
 vhdl_expr *index_to_integer(vhdl_expr *v, bool is_signed);
 vhdl_var_ref* readable_ref(vhdl_scope* scope, ivl_nexus_t nex);
 std::string make_safe_name(ivl_signal_t sig);
+void replace_consecutive_underscores(std::string& str);
+bool is_vhdl_reserved_word(const std::string& word);
 void require_support_function(support_function_t f);
 
 bool is_hoisted_signal(ivl_signal_t sig);

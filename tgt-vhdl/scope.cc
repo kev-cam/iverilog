@@ -487,7 +487,7 @@ static void declare_logic(vhdl_arch *arch, ivl_scope_t scope)
 }
 
 // Replace consecutive underscores with a single underscore
-static void replace_consecutive_underscores(string& str)
+void replace_consecutive_underscores(string& str)
 {
    size_t pos = str.find("__");
    while (pos != string::npos) {
@@ -496,7 +496,7 @@ static void replace_consecutive_underscores(string& str)
    }
 }
 
-static bool is_vhdl_reserved_word(const string& word)
+bool is_vhdl_reserved_word(const string& word)
 {
    // Reserved words that must never be emitted as a bare identifier.
    // The generated VHDL is analysed at the highest standard the target

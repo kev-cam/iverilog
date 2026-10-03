@@ -1348,22 +1348,37 @@ static bool is_time_zero_only(ivl_statement_t stmt,
 
 /*
  * Check to see if the process should have a name.
+ *
+ * The label is qualified by the enclosing generate scopes: generate
+ * blocks are flattened into the module's architecture, so
+ *    for (j...) begin : MR  always @(*) begin : RD ... end  end
+ * must become MR_0_RD, MR_1_RD, ... rather than repeating RD (a duplicate
+ * declaration in VHDL). Index brackets and other non-identifier characters
+ * become underscores.
  */
-static const char * get_process_name(ivl_process_t proc)
+static std::string get_process_name(ivl_process_t proc)
 {
-   const char* name = "";
    // Look for always @(...) begin : <name> to find the name
-   if (ivl_process_type(proc) == IVL_PR_ALWAYS) {
-      ivl_statement_t stmt = ivl_process_stmt(proc);
-      if (ivl_statement_type(stmt) == IVL_ST_WAIT) {
-	 stmt = ivl_stmt_sub_stmt(stmt);
-	 if (ivl_statement_type(stmt) == IVL_ST_BLOCK) {
-	    ivl_scope_t proc_scope = ivl_stmt_block_scope(stmt);
-	    if (proc_scope) name = ivl_scope_basename(proc_scope);
-	 }
-      }
-   }
+   if (ivl_process_type(proc) != IVL_PR_ALWAYS) return "";
+   ivl_statement_t stmt = ivl_process_stmt(proc);
+   if (ivl_statement_type(stmt) != IVL_ST_WAIT) return "";
+   stmt = ivl_stmt_sub_stmt(stmt);
+   if (ivl_statement_type(stmt) != IVL_ST_BLOCK) return "";
+   ivl_scope_t proc_scope = ivl_stmt_block_scope(stmt);
+   if (!proc_scope) return "";
 
+   std::string name = ivl_scope_basename(proc_scope);
+   for (ivl_scope_t s = ivl_scope_parent(proc_scope);
+        s && ivl_scope_type(s) == IVL_SCT_GENERATE; s = ivl_scope_parent(s))
+      name = std::string(ivl_scope_basename(s)) + "_" + name;
+
+   for (char &c : name)
+      if (!isalnum((unsigned char)c) && c != '_') c = '_';
+   replace_consecutive_underscores(name);
+   while (!name.empty() && name.back() == '_') name.pop_back();
+   if (name.empty()) return "";
+   if (name[0] == '_' || isdigit((unsigned char)name[0])) name = "p" + name;
+   if (is_vhdl_reserved_word(name)) name += "_proc";
    return name;
 }
 
@@ -1379,7 +1394,7 @@ static int generate_vhdl_process(vhdl_entity *ent, ivl_process_t proc)
    // architecture. This needs to be done first or the
    // parent link won't be valid (and draw_stmt needs this
    // to add information to the architecture)
-   vhdl_process *vhdl_proc = new vhdl_process(get_process_name(proc));
+   vhdl_process *vhdl_proc = new vhdl_process(get_process_name(proc).c_str());
    ent->get_arch()->add_stmt(vhdl_proc);
 
    // If this is an initial process, push signal initialisation
