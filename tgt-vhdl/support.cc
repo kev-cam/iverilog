@@ -49,6 +49,8 @@ const char *support_function::function_name(support_function_t type)
    case SF_LOGIC_TO_INTEGER:    return "Logic_To_Integer";
    case SF_SIGNED_TO_LOGIC:     return "Signed_To_Logic";
    case SF_UNSIGNED_TO_LOGIC:   return "Unsigned_To_Logic";
+   case SF_TIME_FIELD:          return "Verilog_Time_Field";
+   case SF_REM_SIGNED:          return "Verilog_Rem_S";
    default:
       assert(false);
    }
@@ -82,6 +84,10 @@ vhdl_type *support_function::function_type(support_function_t type)
          : new vhdl_type(VHDL_TYPE_UNSIGNED);
    case SF_LOGIC_TO_INTEGER:
       return vhdl_type::integer();
+   case SF_TIME_FIELD:
+      return vhdl_type::string();
+   case SF_REM_SIGNED:
+      return new vhdl_type(VHDL_TYPE_LOGIC3D_VECTOR);
    }
    assert(false);
    return vhdl_type::boolean();
@@ -210,6 +216,48 @@ void support_function::emit(std::ostream &of, int level) const
       of << "(X : std_logic) return integer is" << nl_string(level)
          << "begin" << nl_string(indent(level))
          << "if X = '1' then return 1; else return 0; end if;";
+      break;
+   case SF_TIME_FIELD:
+      // The field width of %0t, %<N>t and %0<N>t: S is sv_tstr's text,
+      // right-justified to the $timeformat width (the formatted time never
+      // starts with a blank, so leading blanks are only that padding).
+      // Drop the padding, then pad to W -- with zeros if Z, ahead of any
+      // sign as vvp does -- never truncating.
+      of << "(S : string; W : natural; Z : Boolean) return string is"
+         << nl_string(indent(level))
+         << "variable F : integer := S'low;" << nl_string(level)
+         << "begin" << nl_string(indent(level))
+         << "while F < S'high and S(F) = ' ' loop"
+         << nl_string(indent(indent(level)))
+         << "F := F + 1;" << nl_string(indent(level))
+         << "end loop;" << nl_string(indent(level))
+         << "if S'high - F + 1 >= W then" << nl_string(indent(indent(level)))
+         << "return S(F to S'high);" << nl_string(indent(level))
+         << "elsif Z then" << nl_string(indent(indent(level)))
+         << "return (1 to W - (S'high - F + 1) => '0') & S(F to S'high);"
+         << nl_string(indent(level))
+         << "else" << nl_string(indent(indent(level)))
+         << "return (1 to W - (S'high - F + 1) => ' ') & S(F to S'high);"
+         << nl_string(indent(level))
+         << "end if;";
+      break;
+   case SF_REM_SIGNED:
+      // Verilog's signed %: the remainder takes the DIVIDEND's sign (VHDL
+      // rem); a % 0 is all x. (sv2vhdl's l3d_mod_s uses VHDL mod, whose
+      // result takes the divisor's sign: -7 % 3 gave 2 where Verilog gives
+      // -1.) Value planes only, as l3d_div_s.
+      of << "(A, B : logic3d_vector) return logic3d_vector is"
+         << nl_string(indent(level))
+         << "variable R : logic3d_vector(A'range) := (others => L3D_X);"
+         << nl_string(level)
+         << "begin" << nl_string(indent(level))
+         << "if l3d_to_unsigned(B) = 0 then" << nl_string(indent(indent(level)))
+         << "return R;" << nl_string(indent(level))
+         << "end if;" << nl_string(indent(level))
+         << "return unsigned_to_l3d(unsigned(std_logic_vector("
+            "ieee.numeric_std.resize(" << nl_string(indent(indent(level)))
+         << "signed(std_logic_vector(l3d_to_unsigned(A))) rem "
+            "signed(std_logic_vector(l3d_to_unsigned(B))), A'length))));";
       break;
    default:
       assert(false);

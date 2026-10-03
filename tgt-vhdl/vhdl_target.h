@@ -14,14 +14,19 @@ void error(const char *fmt, ...);
 void debug_msg(const char *fmt, ...);
 
 int draw_scope(ivl_scope_t scope, void *_parent);
+void report_unplaced_pulls();
 extern "C" int draw_process(ivl_process_t net, void *cd);
 int draw_stmt(vhdl_procedural *proc, stmt_container *container,
               ivl_statement_t stmt, bool is_last = false);
 int draw_lpm(vhdl_arch *arch, ivl_lpm_t lpm);
 void draw_logic(vhdl_arch *arch, ivl_net_logic_t log);
+void emit_strength_buf(vhdl_arch *arch, vhdl_expr *y, vhdl_expr *data,
+                       ivl_drive_t d1, ivl_drive_t d0, const char *basename);
 void draw_switches(vhdl_arch *arch, ivl_scope_t scope);
 
 vhdl_expr *translate_expr(ivl_expr_t e);
+bool emit_value_plusargs_pre(ivl_expr_t target, vhdl_expr *(*make_fmt)(ivl_expr_t),
+                             ivl_expr_t fmt);
 vhdl_expr *translate_time_expr(ivl_expr_t e);
 
 std::string nexus_to_signal_basename(ivl_nexus_t nex);
@@ -42,6 +47,16 @@ int draw_function_in_entity(ivl_scope_t scope, vhdl_entity *ent);
 // suffix of an enclosing generate block (see scope.cc).
 std::string vhdl_function_name(ivl_scope_t fscope);
 vhdl_var_ref *nexus_to_var_ref(vhdl_scope *arch_scope, ivl_nexus_t nexus);
+bool nexus_visible_in_scope(vhdl_scope *scope, ivl_nexus_t nexus);
+// ICG2EN (stmt.cc): entity-split signature + site clock repointing
+bool icg2en_key_enabled();
+std::string icg2en_scope_signature(ivl_scope_t scope);
+bool icg2en_site_root(ivl_signal_t child_port, ivl_nexus_t *root_out);
+void seen_nexus(ivl_nexus_t nexus);
+void icg2en_add_entity_ports(ivl_scope_t scope, vhdl_entity *ent);
+void icg2en_map_enables(ivl_scope_t child, const vhdl_entity *parent,
+                        vhdl_comp_inst *inst);
+void icg2en_note_label(ivl_scope_t scope, const std::string &label);
 // Convert a bit/part/word index expression to a VHDL integer honouring the
 // VERILOG signedness of the index (a signed -1 index must become -1, not
 // 2**32-1: unsigned to_integer saturates it to integer'high and every
@@ -54,7 +69,30 @@ vhdl_var_ref* readable_ref(vhdl_scope* scope, ivl_nexus_t nex);
 std::string make_safe_name(ivl_signal_t sig);
 void replace_consecutive_underscores(std::string& str);
 bool is_vhdl_reserved_word(const std::string& word);
+// The core's transparent buffer between an input port and a variable or
+// expression actual: drawn in the parent, per instance (scope.cc)
+bool is_input_port_buffer(ivl_net_logic_t log);
+// A core node between such a buffer and the port: the pad, prune or
+// instance-array split of the actual, drawn in the parent too (scope.cc)
+bool is_input_port_network_lpm(ivl_lpm_t lpm);
+// A buffer of that kind the translation cannot draw: reports the error
+bool untranslated_port_buffer(ivl_net_logic_t log);
+// Whether the one-way copy drawn for part-select tran `sw' needs the
+// "connected one way only" warning (scope.cc, T2)
+bool tran_vp_copy_needs_warning(vhdl_scope *sc, ivl_switch_t sw);
+// A part-select tran the port map draws (an inout port on a concatenation)
+bool tran_vp_drawn_by_port_map(ivl_switch_t sw);
+// A real signal or constant on the nexus: real temporaries, real arithmetic
+bool nexus_is_real(ivl_nexus_t nex);
 void require_support_function(support_function_t f);
+// disable / SV return (stmt.cc): a function body is drawn between these two,
+// so a disable of the function inside it is `return <result>;' and the
+// disable targets of the caller (a process drawing a package function on
+// demand) are out of its reach
+void begin_function_disables(ivl_scope_t fscope, const std::string &result);
+void end_function_disables();
+// The Verilog process draw_process is drawing (process.cc); NULL outside one
+ivl_process_t get_active_ivl_process();
 
 bool is_hoisted_signal(ivl_signal_t sig);
 void clear_hoisted_signal(ivl_signal_t sig);

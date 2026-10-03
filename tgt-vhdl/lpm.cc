@@ -71,13 +71,127 @@ static vhdl_expr *part_select_base(vhdl_scope *scope, ivl_lpm_t lpm)
    return off->cast(&integer);
 }
 
+/*
+ * An arithmetic LPM on real values: its output or an operand is a real net
+ * (tgt-vvp decides the same way). The core casts any integer operand to
+ * real first (IVL_LPM_CAST_REAL), so every operand is real.
+ */
+static bool real_lpm(ivl_lpm_t lpm)
+{
+   if (nexus_is_real(ivl_lpm_q(lpm)))
+      return true;
+   for (unsigned i = 0; i < ivl_lpm_size(lpm); i++)
+      if (nexus_is_real(ivl_lpm_data(lpm, i)))
+         return true;
+   return false;
+}
+
+/*
+ * Real arithmetic (`r1 + 0.2', `r1 * 2.0', `r1 / 2.0', `-r1' as 0.0 - r1):
+ * real operands and a real result. Casting the operands to logic3d (as the
+ * vector arithmetic below does) would turn every value into 0 or 1.
+ */
+static vhdl_expr *real_binop_lpm_to_expr(vhdl_scope *scope, ivl_lpm_t lpm,
+                                         vhdl_binop_t op)
+{
+   if (op == VHDL_BINOP_MOD) {
+      error("No VHDL translation for %% on real values (%s:%d)",
+            ivl_lpm_file(lpm), ivl_lpm_lineno(lpm));
+      return NULL;
+   }
+   vhdl_binop_expr *expr = new vhdl_binop_expr(op, vhdl_type::real());
+   for (unsigned i = 0; i < ivl_lpm_size(lpm); i++) {
+      vhdl_expr *e = readable_ref(scope, ivl_lpm_data(lpm, i));
+      if (NULL == e)
+         return NULL;
+      if (e->get_type() == NULL || e->get_type()->get_name() != VHDL_TYPE_REAL) {
+         error("Real arithmetic at %s:%d has an operand that is not real",
+               ivl_lpm_file(lpm), ivl_lpm_lineno(lpm));
+         return NULL;
+      }
+      expr->add_expr(e);
+   }
+   return expr;
+}
+
+/*
+ * IVL_LPM_CAST_REAL (a vector to real: `r1 + i', `code * 0.1') and
+ * IVL_LPM_CAST_INT (a real to a vector, rounded to the nearest, ties away
+ * from zero, as Verilog converts). X and Z bits count as 0, as in vvp.
+ */
+static vhdl_expr *cast_real_lpm_to_expr(vhdl_scope *scope, ivl_lpm_t lpm)
+{
+   vhdl_expr *in = readable_ref(scope, ivl_lpm_data(lpm, 0));
+   if (NULL == in)
+      return NULL;
+   const vhdl_type *t = in->get_type();
+   if (t != NULL && t->get_name() == VHDL_TYPE_REAL)
+      return in;
+   if (t == NULL || (t->get_name() != VHDL_TYPE_LOGIC3D
+                     && t->get_name() != VHDL_TYPE_LOGIC3D_VECTOR)) {
+      error("No VHDL translation for the conversion to real at %s:%d",
+            ivl_lpm_file(lpm), ivl_lpm_lineno(lpm));
+      return NULL;
+   }
+   const bool vec = t->get_name() == VHDL_TYPE_LOGIC3D_VECTOR;
+   vhdl_fcall *f = new vhdl_fcall(vec && ivl_lpm_signed(lpm) ? "l3d_to_real_s"
+                                  : "l3d_to_real", vhdl_type::real());
+   f->add_expr(in);
+   return f;
+}
+
+static vhdl_expr *cast_int_lpm_to_expr(vhdl_scope *scope, ivl_lpm_t lpm)
+{
+   vhdl_expr *in = readable_ref(scope, ivl_lpm_data(lpm, 0));
+   if (NULL == in)
+      return NULL;
+   const unsigned w = ivl_lpm_width(lpm);
+   if (in->get_type() == NULL || in->get_type()->get_name() != VHDL_TYPE_REAL)
+      return in->cast(vhdl_type::type_for(w, ivl_lpm_signed(lpm) != 0));
+   if (w == 1) {
+      vhdl_fcall *f = new vhdl_fcall("real_to_l3d1", vhdl_type::logic3d());
+      f->add_expr(in);
+      return f;
+   }
+   vhdl_fcall *f = new vhdl_fcall("real_to_l3d", vhdl_type::logic3d_vector(w - 1, 0));
+   f->add_expr(in);
+   f->add_expr(new vhdl_const_int(w));
+   return f;
+}
+
 static vhdl_expr *binop_lpm_to_expr(vhdl_scope *scope, ivl_lpm_t lpm, vhdl_binop_t op)
 {
+   if (op != VHDL_BINOP_CONCAT && real_lpm(lpm))
+      return real_binop_lpm_to_expr(scope, lpm, op);
+
    unsigned out_width = ivl_lpm_width(lpm);
    const vhdl_type *result_type =
       vhdl_type::type_for(out_width, ivl_lpm_signed(lpm) != 0);
    vhdl_binop_expr *expr = new vhdl_binop_expr(op, result_type);
    bool all_scalar_l3d = true;
+
+   // sv2vhdl: the logic3d_vector "/" and "mod" are unsigned. A signed divide
+   // or modulus (both operands signed: the core sign-extended them to the
+   // LPM width) goes through the signed helpers the procedural path uses
+   // (translate_binary): l3d_div_s, and Verilog_Rem_S for %, whose result
+   // takes the dividend's sign as Verilog's does (VHDL rem; VHDL mod takes
+   // the divisor's). The unsigned operators gave 0xFFE5 / 0x0077 = 550 where
+   // Verilog gives 0 (ivtest pr2722339a/b).
+   // (a 1-bit one is a scalar here, and its signed and unsigned results agree)
+   const bool signed_divmod = get_sv2vhdl_mode() && ivl_lpm_signed(lpm)
+      && (op == VHDL_BINOP_DIV || op == VHDL_BINOP_MOD)
+      && ivl_lpm_size(lpm) == 2 && out_width > 1;
+   vhdl_fcall *sdiv = NULL;
+   if (signed_divmod) {
+      if (op == VHDL_BINOP_MOD) {
+         require_support_function(SF_REM_SIGNED);
+         sdiv = new vhdl_fcall(support_function::function_name(SF_REM_SIGNED),
+                               vhdl_type::logic3d_vector(out_width - 1, 0));
+      }
+      else
+         sdiv = new vhdl_fcall("l3d_div_s",
+                               vhdl_type::logic3d_vector(out_width - 1, 0));
+   }
 
    for (unsigned i = 0; i < ivl_lpm_size(lpm); i++) {
       vhdl_expr *e = readable_ref(scope, ivl_lpm_data(lpm, i));
@@ -91,11 +205,20 @@ static vhdl_expr *binop_lpm_to_expr(vhdl_scope *scope, ivl_lpm_t lpm, vhdl_binop
       if (!e->get_type() || e->get_type()->get_name() != VHDL_TYPE_LOGIC3D)
          all_scalar_l3d = false;
 
+      if (sdiv != NULL) {
+         sdiv->add_expr(e);
+         continue;
+      }
+
       // Bit of a hack: the LPM inputs are in the wrong order for concatenation
       if (op == VHDL_BINOP_CONCAT)
          expr->add_expr_front(e);
       else
          expr->add_expr(e);
+   }
+   if (sdiv != NULL) {
+      delete expr;
+      return sdiv;
    }
 
    // sv2vhdl: a 1-bit product of two scalar logic3d bits is emitted as bit 0
@@ -466,6 +589,16 @@ static vhdl_expr *lpm_to_expr(vhdl_scope *scope, ivl_lpm_t lpm)
       return shift_lpm_to_expr(scope, lpm, VHDL_BINOP_SR);
    case IVL_LPM_REPEAT:
       return repeat_lpm_to_expr(scope, lpm);
+   case IVL_LPM_CAST_REAL:
+      if (get_sv2vhdl_mode())
+         return cast_real_lpm_to_expr(scope, lpm);
+      error("Unsupported LPM type: %d", ivl_lpm_type(lpm));
+      return NULL;
+   case IVL_LPM_CAST_INT:
+      if (get_sv2vhdl_mode())
+         return cast_int_lpm_to_expr(scope, lpm);
+      error("Unsupported LPM type: %d", ivl_lpm_type(lpm));
+      return NULL;
    default:
       error("Unsupported LPM type: %d", ivl_lpm_type(lpm));
       return NULL;

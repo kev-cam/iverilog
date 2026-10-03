@@ -112,6 +112,7 @@ extern "C" int target_design(ivl_design_t des)
          continue;
       draw_scope(roots[i], NULL);
    }
+   report_unplaced_pulls();
 
    // Only generate processes if there were no errors generating entities
    // (otherwise the necessary information won't be present)

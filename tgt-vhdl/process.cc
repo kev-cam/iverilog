@@ -385,10 +385,50 @@ static void nba_defer_commits(vhdl_process *vhdl_proc, vhdl_entity *ent)
    if (commits.empty())
       return;
 
+   typedef std::list<vhdl_procedural::icg2en_shadow_t> shadow_list_t;
+   const shadow_list_t &shadow = vhdl_proc->get_icg2en_shadow();
+
+   // With the wake-shadow close below, a pass can loop straight back into
+   // the body, while the commits it just made are still in flight: there
+   // the shadows already hold this instant's values, and re-seeding them
+   // from the signals would revert the first pass's writes (a reset landing
+   // in the shadow would undo a capture from the same clock edge).  Like
+   // Verilog NBAs, the passes of one wake accumulate: seed only on a fresh
+   // wake.
+   std::string loopback;
    stmt_container::stmt_list_t &stmts = body->get_stmts();
-   for (std::list<vhdl_seq_stmt*>::reverse_iterator it = seeds.rbegin();
-        it != seeds.rend(); ++it)
-      stmts.push_front(*it);
+   if (!shadow.empty()) {
+      loopback = "v_nba_loopback";
+      while (proc_scope->have_declared(loopback))
+         loopback += "_";
+      vhdl_var_decl *ld = new vhdl_var_decl(loopback, vhdl_type::boolean());
+      ld->set_initial(new vhdl_const_bool(false));
+      proc_scope->add_decl(ld);
+      vhdl_if_stmt *fresh = new vhdl_if_stmt(new vhdl_unaryop_expr(
+         VHDL_UNARYOP_NOT,
+         new vhdl_var_ref(loopback.c_str(), vhdl_type::boolean()),
+         vhdl_type::boolean()));
+      for (std::list<vhdl_seq_stmt*>::iterator it = seeds.begin();
+           it != seeds.end(); ++it)
+         fresh->get_then_container()->add_stmt(*it);
+      stmts.push_front(fresh);
+   }
+   else {
+      for (std::list<vhdl_seq_stmt*>::reverse_iterator it = seeds.rbegin();
+           it != seeds.rend(); ++it)
+         stmts.push_front(*it);
+   }
+
+   // ICG2EN wake-shadow close, part 2: snapshot every async trigger just
+   // before the process goes off the pending lists.  The fire test already
+   // carries value-compare "missed edge" terms against these snapshots
+   // (built in draw_stmt).
+   for (shadow_list_t::const_iterator it = shadow.begin();
+        it != shadow.end(); ++it) {
+      stmts.push_back(new vhdl_assign_stmt(
+         new vhdl_var_ref(it->snap.c_str(), vhdl_type::logic3d()),
+         new vhdl_var_ref(it->sig.c_str(), vhdl_type::logic3d())));
+   }
 
    // One hop to the Verilog NBA region, then all commits -- except on the
    // initialisation run. Every process runs its body once at time 0 (the
@@ -428,7 +468,34 @@ static void nba_defer_commits(vhdl_process *vhdl_proc, vhdl_entity *ent)
         it != sens.end(); ++it)
       trailing->add_sensitivity(*it);
    sens.clear();
-   stmts.push_back(trailing);
+
+   if (shadow.empty()) {
+      stmts.push_back(trailing);
+   }
+   else {
+      // Re-arm only if no async trigger moved while we sat at the NBA
+      // wait; otherwise fall through so the implicit process loop handles
+      // the missed event via the snapshot-compare terms in the fire test.
+      vhdl_binop_expr *unchanged =
+         new vhdl_binop_expr(VHDL_BINOP_AND, vhdl_type::boolean());
+      for (shadow_list_t::const_iterator it = shadow.begin();
+           it != shadow.end(); ++it) {
+         unchanged->add_expr(new vhdl_binop_expr(
+            new vhdl_var_ref(it->sig.c_str(), vhdl_type::logic3d()),
+            VHDL_BINOP_EQ,
+            new vhdl_var_ref(it->snap.c_str(), vhdl_type::logic3d()),
+            vhdl_type::boolean()));
+      }
+      stmts.push_back(new vhdl_assign_stmt(
+         new vhdl_var_ref(loopback.c_str(), vhdl_type::boolean()),
+         new vhdl_const_bool(true)));
+      vhdl_if_stmt *rearm = new vhdl_if_stmt(unchanged);
+      rearm->get_then_container()->add_stmt(new vhdl_assign_stmt(
+         new vhdl_var_ref(loopback.c_str(), vhdl_type::boolean()),
+         new vhdl_const_bool(false)));
+      rearm->get_then_container()->add_stmt(trailing);
+      stmts.push_back(rearm);
+   }
 }
 
 // A Verilog block-local reg (`begin : b reg t; ... end`, which sv2v emits
@@ -1346,6 +1413,37 @@ static bool is_time_zero_only(ivl_statement_t stmt,
    }
 }
 
+// True if evaluating `e' calls a system function ($random, $time, $fopen
+// ...): such a value belongs to the time-zero process, not to a declaration
+// initial evaluated at elaboration.
+static bool expr_has_sfunc(ivl_expr_t e)
+{
+   if (e == NULL)
+      return false;
+   switch (ivl_expr_type(e)) {
+   case IVL_EX_SFUNC:
+      return true;
+   case IVL_EX_SELECT:
+   case IVL_EX_BINARY:
+      return expr_has_sfunc(ivl_expr_oper1(e))
+         || expr_has_sfunc(ivl_expr_oper2(e));
+   case IVL_EX_UNARY:
+      return expr_has_sfunc(ivl_expr_oper1(e));
+   case IVL_EX_TERNARY:
+      return expr_has_sfunc(ivl_expr_oper1(e))
+         || expr_has_sfunc(ivl_expr_oper2(e))
+         || expr_has_sfunc(ivl_expr_oper3(e));
+   case IVL_EX_CONCAT:
+   case IVL_EX_UFUNC:
+      for (unsigned i = 0; i < ivl_expr_parms(e); i++)
+         if (expr_has_sfunc(ivl_expr_parm(e, i)))
+            return true;
+      return false;
+   default:
+      return false;
+   }
+}
+
 /*
  * Check to see if the process should have a name.
  *
@@ -1381,6 +1479,10 @@ static std::string get_process_name(ivl_process_t proc)
    if (is_vhdl_reserved_word(name)) name += "_proc";
    return name;
 }
+
+// The Verilog process being drawn (draw_process), for the statements that
+// need to know which process they are in (an automatic task's callers)
+static ivl_process_t g_active_ivl_process = NULL;
 
 /*
  * Convert a Verilog process to VHDL and add it to the architecture
@@ -1468,7 +1570,10 @@ static int generate_vhdl_process(vhdl_entity *ent, ivl_process_t proc)
             break;
          }
       }
-      if (only_null)
+      // (A process with a sensitivity list suspends at its end anyway, and
+      // may not contain a wait: `always @(x) $fdisplay(..)' -- a task with
+      // no translation, a commented null -- keeps its list.)
+      if (only_null && vhdl_proc->get_sensitivity().empty())
          vhdl_proc->get_container()->add_stmt(new vhdl_wait_stmt());
    }
 
@@ -1618,13 +1723,31 @@ extern "C" int draw_process(ivl_process_t proc, void *)
          vhdl_scope *arch_scope = ent->get_arch()->get_scope();
          bool all_ok = true;
          for (auto &ia : assigns) {
-            std::string name = make_safe_name(ia.sig);
-            vhdl_decl *decl = arch_scope->get_decl(name);
+            // Resolve by the signal's own VHDL name: the collision-free name
+            // declare_one_signal chose (d_1 next to D, q_Reg for an output
+            // reg, r_i0 in a generate block), not its basename -- get_decl()
+            // matches case-insensitively and also searches the port scope.
+            // A signal with no home in this architecture yet (a named-block
+            // local, a package variable) keeps its process.
+            if (!seen_signal_before(ia.sig)
+                || find_scope_for_signal(ia.sig) != arch_scope
+                || expr_has_sfunc(ia.value)) {
+               all_ok = false;
+               break;
+            }
+            vhdl_decl *decl = arch_scope->get_decl(get_renamed_signal(ia.sig));
             if (!decl) {
                all_ok = false;
                break;
             }
-            if (!decl->has_initial()) {
+            // Already initialised (an earlier time-zero assignment, e.g. the
+            // declaration's own `reg d = 0'): this later assignment must
+            // still happen, so the process stays and deposits it at time 0.
+            if (decl->has_initial()) {
+               all_ok = false;
+               break;
+            }
+            {
                vhdl_expr *init = translate_expr(ia.value);
                // Only hoist when the value's type/width actually matches the
                // declaration -- a width-mismatched initial (e.g. a vector
@@ -1656,7 +1779,15 @@ extern "C" int draw_process(ivl_process_t proc, void *)
       // since it creates drivers for signals it assigns later.
    }
 
-   return generate_vhdl_process(ent, proc);
+   g_active_ivl_process = proc;
+   int rc = generate_vhdl_process(ent, proc);
+   g_active_ivl_process = NULL;
+   return rc;
+}
+
+ivl_process_t get_active_ivl_process()
+{
+   return g_active_ivl_process;
 }
 
 /*
@@ -1709,6 +1840,15 @@ void fuse_comb_processes(vhdl_entity *ent)
          continue;
       if (ca->get_lhs()->get_type() == NULL)
          continue;
+      // A resolved target is a net with other drivers (an inout port, a
+      // tran, an instance output): a deposit would overwrite their
+      // resolution, so it keeps its driver (e.g. a bus with a tristate pad
+      // on a bit-select, whose other bits a continuous assign drives).
+      {
+         vhdl_decl *d = arch->get_scope()->get_decl(ca->get_lhs()->get_name());
+         if (d != NULL && d->is_resolved())
+            continue;
+      }
       member_t m = { ca, ca->get_lhs()->get_name(), NULL };
       cand.push_back(m);
       def_count[m.def]++;

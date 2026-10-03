@@ -566,6 +566,118 @@ static void sv_buf_not_logic(vhdl_arch *arch, ivl_net_logic_t log)
 }
 
 /*
+ * A continuous assign with a drive-strength specification: emit the
+ * sv2vhdl strength buffer, which drives the net through y'driver with
+ * the exact l3ds strength ladder (resolved by the kernel net solver).
+ * A bare `w <= x` would enter resolution at full strength and turn
+ * weak-vs-strong contention into X.
+ */
+void emit_strength_buf(vhdl_arch *arch, vhdl_expr *y, vhdl_expr *data,
+                       ivl_drive_t d1, ivl_drive_t d0, const char *basename)
+{
+   // ivl_drive_t -> l3ds strength codes (ST_HIGHZ/WEAK/PULL/STRONG/
+   // SUPPLY).  Drive specs only produce HiZ/weak/pull/strong/supply;
+   // the charge strengths map defensively onto the nearest drive level.
+   static const int l3ds_code[8] = { 0, 2, 2, 2, 4, 4, 8, 16 };
+
+   string inst_name = make_inst_name(basename, "sv_strength_buf");
+
+   vhdl_entity_inst *inst = new vhdl_entity_inst(
+      inst_name.c_str(), "sv2vhdl", "sv_strength_buf", "strength");
+
+   inst->map_generic("str1", new vhdl_const_int(l3ds_code[d1 & 7]));
+   inst->map_generic("str0", new vhdl_const_int(l3ds_code[d0 & 7]));
+
+   inst->map_port("y", y);
+
+   if (data->get_type() != NULL
+       && (data->get_type()->get_name() == VHDL_TYPE_STD_LOGIC
+           || data->get_type()->get_name() == VHDL_TYPE_STD_ULOGIC)) {
+      vhdl_fcall *conv = new vhdl_fcall("to_logic3d", vhdl_type::logic3d());
+      conv->add_expr(data);
+      data = conv;
+   }
+   inst->map_port("data", data);
+
+   arch->add_stmt(inst);
+}
+
+static void sv_strength_logic(vhdl_arch *arch, ivl_net_logic_t log)
+{
+   vhdl_scope *scope = arch->get_scope();
+   emit_strength_buf(arch,
+      nexus_to_var_ref(scope, ivl_logic_pin(log, 0)),
+      readable_ref(scope, ivl_logic_pin(log, 1)),
+      ivl_logic_drive1(log), ivl_logic_drive0(log),
+      scoped_basename(ivl_logic_basename(log), ivl_logic_scope(log)).c_str());
+}
+
+/*
+ * A width-N strength-spec assign: one strength buffer per bit.  Each
+ * bit of the target becomes its own kernel net — registration keys
+ * nets by the indexed port-map actual (e.g. w(2)), so per-bit
+ * instances group and resolve independently, and the per-value
+ * str1/str0 selection happens per bit (vvp_scalar_value).  Falls back
+ * to a plain assign when either side is not an indexable
+ * logic3d_vector signal.
+ */
+static bool sv_strength_logic_vec(vhdl_arch *arch, ivl_net_logic_t log)
+{
+   vhdl_scope *scope = arch->get_scope();
+   const unsigned width = ivl_logic_width(log);
+
+   vhdl_var_ref *ytest = nexus_to_var_ref(scope, ivl_logic_pin(log, 0));
+   vhdl_var_ref *dtest = readable_ref(scope, ivl_logic_pin(log, 1));
+   if (ytest->get_type() == NULL || dtest->get_type() == NULL
+       || ytest->get_type()->get_name() != VHDL_TYPE_LOGIC3D_VECTOR
+       || dtest->get_type()->get_name() != VHDL_TYPE_LOGIC3D_VECTOR)
+      return false;
+
+   const string base =
+      scoped_basename(ivl_logic_basename(log), ivl_logic_scope(log));
+   for (unsigned i = 0; i < width; i++) {
+      vhdl_var_ref *y = nexus_to_var_ref(scope, ivl_logic_pin(log, 0));
+      y->set_slice(new vhdl_const_int(i));
+      vhdl_var_ref *d = readable_ref(scope, ivl_logic_pin(log, 1));
+      d->set_slice(new vhdl_const_int(i));
+      ostringstream bs;
+      bs << base << "_b" << i;
+      emit_strength_buf(arch, y, d, ivl_logic_drive1(log),
+                        ivl_logic_drive0(log), bs.str().c_str());
+   }
+   return true;
+}
+
+/*
+ * True when the nexus carries strength-bearing drivers: switches, pull
+ * gates, or any pointer with a non-strong drive spec.  A plain assign
+ * copying from such a net must re-strengthen the value — its weak
+ * alphabet codes (H/L) would otherwise enter the destination's
+ * resolution at weak strength instead of the assign's own strong.
+ */
+static bool nexus_has_strength(ivl_nexus_t nex)
+{
+   int nptrs = ivl_nexus_ptrs(nex);
+   for (int i = 0; i < nptrs; i++) {
+      ivl_nexus_ptr_t p = ivl_nexus_ptr(nex, i);
+      if (ivl_nexus_ptr_switch(p))
+         return true;
+      ivl_net_logic_t plog = ivl_nexus_ptr_log(p);
+      if (plog && (ivl_logic_type(plog) == IVL_LO_PULLUP
+                   || ivl_logic_type(plog) == IVL_LO_PULLDOWN))
+         return true;
+      ivl_drive_t d0 = ivl_nexus_ptr_drive0(p);
+      ivl_drive_t d1 = ivl_nexus_ptr_drive1(p);
+      // Input-only pins report HiZ/HiZ — not a strength spec
+      if (d0 == IVL_DR_HiZ && d1 == IVL_DR_HiZ)
+         continue;
+      if (d0 != IVL_DR_STRONG || d1 != IVL_DR_STRONG)
+         return true;
+   }
+   return false;
+}
+
+/*
  * Emit a concurrent signal assignment with optional strength comment.
  */
 static void default_logic(vhdl_arch *arch, ivl_net_logic_t log)
@@ -574,6 +686,26 @@ static void default_logic(vhdl_arch *arch, ivl_net_logic_t log)
    vhdl_var_ref *lhs = nexus_to_var_ref(arch->get_scope(), output);
 
    vhdl_expr *rhs = translate_logic_inputs(arch->get_scope(), log);
+
+   // BUFZ copy from a strength-bearing scalar net: normalize the weak
+   // alphabet codes to driven ones (the assign's strength is its own).
+   // A continuous assignment (the non-transparent BUFZ) drives its own
+   // strength whatever its input carries, and a net can turn weak after
+   // translation (the AMS cut's BIDIR A2D on an inout pad is weak while
+   // nothing else drives it; its marker bufif1 here is strong), so a
+   // scalar logic3d BUFZ always re-strengthens -- an identity on strong
+   // values.  The transparent BUFT (port buffers) keeps the old gate.
+   const ivl_logic_t ltype = ivl_logic_type(log);
+   if (is_sv2vhdl_mode() && (ltype == IVL_LO_BUFZ || ltype == IVL_LO_BUFT)
+       && ivl_logic_width(log) == 1
+       && (nexus_has_strength(ivl_logic_pin(log, 1))
+           || (ltype == IVL_LO_BUFZ && rhs != NULL && rhs->get_type() != NULL
+               && rhs->get_type()->get_name() == VHDL_TYPE_LOGIC3D))) {
+      vhdl_fcall *st =
+         new vhdl_fcall("l3d_strengthen", vhdl_type::logic3d());
+      st->add_expr(rhs);
+      rhs = st;
+   }
    vhdl_cassign_stmt *ass = new vhdl_cassign_stmt(lhs, rhs);
 
    ivl_expr_t delay = ivl_logic_delay(log, 1);
@@ -653,10 +785,26 @@ void draw_logic(vhdl_arch *arch, ivl_net_logic_t log)
          default_logic(arch, log);
       break;
 
-   // Transparent buffers / continuous assigns: always keep as signal assignment
+   // Transparent buffers / continuous assigns: signal assignment, except
+   // scalar drives with a non-strong strength spec which need the
+   // strength buffer to enter resolution at the specified level
    case IVL_LO_BUFT:
    case IVL_LO_BUFZ:
-      default_logic(arch, log);
+      // An input port buffer belongs to each instance's port association;
+      // the parent draws it (scope.cc, map_signal); one of a shape the
+      // translation cannot draw is an error, not a lost connection
+      if (ivl_logic_type(log) == IVL_LO_BUFT
+          && (is_input_port_buffer(log) || untranslated_port_buffer(log)))
+         break;
+      if (sv2vhdl && (ivl_logic_drive0(log) != IVL_DR_STRONG
+                      || ivl_logic_drive1(log) != IVL_DR_STRONG)) {
+         if (ivl_logic_width(log) == 1)
+            sv_strength_logic(arch, log);
+         else if (!sv_strength_logic_vec(arch, log))
+            default_logic(arch, log);
+      }
+      else
+         default_logic(arch, log);
       break;
 
    case IVL_LO_UDP:
@@ -689,15 +837,32 @@ static void draw_one_switch(vhdl_arch *arch, ivl_switch_t sw)
       // Part-select tran: side a is the wide vector, side b the narrow part at
       // bit offset `off`, width `part`. iverilog inserts this for an inout port
       // (or tran) connected to a bit/part-select, e.g. `.bit0(value[0])`.
-      // Previously skipped -> the part net was left floating (read as 0). Join
-      // them: drive the part net from the vector slice. nvc treats the port as
-      // inout, so the external vector's value reaches the port (the common
-      // direction; a symmetric back-drive would need full strength resolution).
+      // In sv2vhdl mode side b is normally an alias of that element/slice of
+      // side a (tran_vp_alias in scope.cc), which joins the two both ways:
+      // nothing to emit. Otherwise drive the part net from the vector slice:
+      // nvc treats the port as inout, so the external vector's value reaches
+      // the port, but the port cannot drive the vector back.
+      // An inout port on a concatenation: its port map associates the
+      // parts with the operands (scope.cc, map_concat_parts)
+      if (get_sv2vhdl_mode() && tran_vp_drawn_by_port_map(sw))
+         return;
       unsigned off  = ivl_switch_offset(sw);
       unsigned part = ivl_switch_part(sw);
       vhdl_scope *sc = arch->get_scope();
-      vhdl_var_ref *a = nexus_to_var_ref(sc, ivl_switch_a(sw));
       vhdl_var_ref *b = nexus_to_var_ref(sc, ivl_switch_b(sw));
+      if (dynamic_cast<vhdl_alias_decl*>(sc->get_decl(b->get_name())))
+         return;
+      vhdl_var_ref *a = nexus_to_var_ref(sc, ivl_switch_a(sw));
+      // No one-way copy passes silently (unless nothing uses it: a core
+      // temporary whose parts tran_vp_alias aliased to the vector itself)
+      if (tran_vp_copy_needs_warning(sc, sw)) {
+         cerr << "Warning: " << a->get_name() << "(";
+         if (part > 1)
+            cerr << off + part - 1 << " downto ";
+         cerr << off << ") at " << ivl_switch_file(sw) << ":"
+              << ivl_switch_lineno(sw) << " is connected one way only: "
+                 "its part-select tran joins a translator temporary" << endl;
+      }
       if (part == 1)
          a->set_slice(new vhdl_const_int(off));         // single bit a(off)
       else
@@ -724,9 +889,21 @@ static void draw_one_switch(vhdl_arch *arch, ivl_switch_t sw)
    // Port B
    inst->map_port("b", nexus_to_var_ref(scope, ivl_switch_b(sw)));
 
-   // Enable (ctrl) for conditional tran
+   // Enable (ctrl) for conditional tran.  The formal is std_logic; a
+   // logic3d actual must go through the lossless package conversion --
+   // a bare association byte-reinterprets in STD_MX mode, which maps
+   // the weak codes L/H to 'U'/'X' and latches the switch into X the
+   // moment the net rests on its keeper value.
    if (has_enable) {
-      inst->map_port("ctrl", readable_ref(scope, ivl_switch_enable(sw)));
+      vhdl_expr *en = readable_ref(scope, ivl_switch_enable(sw));
+      if (en->get_type() != NULL
+          && en->get_type()->get_name() == VHDL_TYPE_LOGIC3D) {
+         vhdl_fcall *conv =
+            new vhdl_fcall("to_std_logic", vhdl_type::std_logic());
+         conv->add_expr(en);
+         en = conv;
+      }
+      inst->map_port("ctrl", en);
    }
 
    // Source location comment

@@ -69,6 +69,27 @@ static vhdl_expr *correct_signedness(vhdl_expr *vhd_e, ivl_expr_t vl_e)
 }
 
 /*
+ * ivl_expr_string() returns escaped text: verinum::as_string() writes '"',
+ * '\' and every non-printable byte (including the zero padding of a string
+ * widened to its target) as a 4-character "\ooo" octal escape. Decode back
+ * to the raw bytes.
+ */
+std::string ivl_string_unescape(const char *str)
+{
+   std::string out;
+   for (const char *p = str; *p; ) {
+      if (p[0] == '\\' && p[1] >= '0' && p[1] <= '7' && p[2] >= '0'
+          && p[2] <= '7' && p[3] >= '0' && p[3] <= '7') {
+         out += (char)(((p[1] - '0') << 6) | ((p[2] - '0') << 3) | (p[3] - '0'));
+         p += 4;
+      }
+      else
+         out += *p++;
+   }
+   return out;
+}
+
+/*
  * Convert a constant Verilog string to a constant VHDL string.
  */
 static vhdl_expr *translate_string(ivl_expr_t e)
@@ -81,14 +102,17 @@ static vhdl_expr *translate_string(ivl_expr_t e)
    // arg). $display format strings never reach this function -- the display
    // builder reads ivl_expr_string directly.
    if (get_sv2vhdl_mode()) {
-      size_t len = strlen(str);
+      // Decode ivl's escapes first: "\000" is ONE zero byte, not 4 chars
+      // (a string widened to a 72-bit reg arrived as "000hex=%h").
+      const std::string raw = ivl_string_unescape(str);
+      size_t len = raw.size();
       string bits;
       if (len == 0)
          bits = "00000000";               // "" is 8'b0
       else {
          // ivl bit order: LSB first -- last character's low bit leads.
          for (size_t i = len; i-- > 0; ) {
-            unsigned char c = str[i];
+            unsigned char c = raw[i];
             for (int b = 0; b < 8; b++)
                bits += ((c >> b) & 1) ? '1' : '0';
          }
@@ -155,10 +179,11 @@ static vhdl_var_ref *translate_signal(ivl_expr_t e)
       if (get_sv2vhdl_mode()) {
          vhdl_const_int *ci = dynamic_cast<vhdl_const_int*>(ioff);
          if (ci) {
-            const int base = ivl_signal_array_base(sig);
+            // the index is canonical (0 = the lowest word), as is the VHDL
+            // array's range (count-1 downto 0, declare_one_signal)
             const int cnt  = ivl_signal_array_count(sig);
-            const int lo = std::min(base, base + cnt - 1);
-            const int hi = std::max(base, base + cnt - 1);
+            const int lo = 0;
+            const int hi = cnt - 1;
             if (ci->get_value() < lo || ci->get_value() > hi) {
                delete ref;
                int w = ivl_signal_width(sig);
@@ -248,6 +273,14 @@ static vhdl_expr *translate_unary(ivl_expr_t e)
    char opcode = ivl_expr_opcode(e);
    switch (opcode) {
    case '!':
+      // Logical not is "operand == 0": a bitwise NOT is only equivalent for a
+      // 1-bit operand. On a wider one (e.g. !$value$plusargs(...), !count)
+      // bitwise NOT of 0...01 is non-zero, so the test was always true.
+      // Reduce with NOR, as for the ~| operator.
+      if (ivl_expr_width(ivl_expr_oper1(e)) > 1)
+         return translate_reduction(SF_REDUCE_OR, true, operand);
+      return new vhdl_unaryop_expr
+         (VHDL_UNARYOP_NOT, operand, new vhdl_type(*operand->get_type()));
    case '~':
       return new vhdl_unaryop_expr
          (VHDL_UNARYOP_NOT, operand, new vhdl_type(*operand->get_type()));
@@ -572,7 +605,12 @@ static vhdl_expr *translate_binary(ivl_expr_t e)
       case 'L': cf = "l3d_le_s"; break;
       case 'G': cf = "l3d_ge_s"; break;
       case '/': vf = "l3d_div_s"; break;
-      case '%': vf = "l3d_mod_s"; break;
+      case '%':
+         // Verilog's % takes the dividend's sign (VHDL rem); sv2vhdl's
+         // l3d_mod_s is VHDL mod (the divisor's sign), so a support function
+         require_support_function(SF_REM_SIGNED);
+         vf = support_function::function_name(SF_REM_SIGNED);
+         break;
       }
       if (cf) {
          vhdl_fcall *f = new vhdl_fcall(cf, vhdl_type::boolean());
@@ -1002,6 +1040,17 @@ static vhdl_expr *translate_ufunc(ivl_expr_t e)
    ivl_scope_t defscope = ivl_expr_def(e);
    ivl_scope_t parentscope = ivl_scope_parent(defscope);
 
+   // A SystemVerilog class method (its constructor `new' included) has no
+   // VHDL translation: stop with a located diagnostic, and the module stays
+   // untranslated (a deferred stub) rather than half-translated.
+   if (parentscope != NULL && ivl_scope_type(parentscope) == IVL_SCT_CLASS) {
+      error("unsupported construct (class) at %s:%d: %s() of SystemVerilog "
+            "class %s has no VHDL translation", ivl_expr_file(e),
+            ivl_expr_lineno(e), ivl_scope_basename(defscope),
+            ivl_scope_tname(parentscope));
+      return NULL;
+   }
+
    // Normally the function's parent module already has an entity holding the
    // emitted function. A PACKAGE (or $unit) function has no entity -- draw it
    // on demand into the entity that is calling it.
@@ -1087,6 +1136,24 @@ static vhdl_expr *translate_ternary(ivl_expr_t e)
    return fcall;
 }
 
+/*
+ * $value$plusargs format argument as a VHDL string expression: a literal
+ * stays a literal; a runtime vector holding the format goes through
+ * sv_math_pkg.l3d_to_string.  Called once per use site (each needs its own
+ * expression node).
+ */
+static vhdl_expr *plusargs_fmt_expr(ivl_expr_t fe)
+{
+   if (ivl_expr_type(fe) == IVL_EX_STRING)
+      return new vhdl_const_string(ivl_string_unescape(ivl_expr_string(fe)));
+   vhdl_expr *v = translate_expr(fe);
+   if (v == NULL)
+      return new vhdl_const_string("");
+   vhdl_fcall *f = new vhdl_fcall("l3d_to_string", vhdl_type::string());
+   f->add_expr(v);
+   return f;
+}
+
 static vhdl_expr *translate_concat(ivl_expr_t e)
 {
    const vhdl_type *rtype =
@@ -1114,14 +1181,16 @@ static vhdl_expr *translate_concat(ivl_expr_t e)
    return concat;
 }
 
-// A VHDL time literal for ONE simulation tick. Delays are emitted as a count of
-// ticks in this unit (see set_time_units), so `now' divided by it is the tick
-// count. Note the base is deliberately compressed rather than true SI -- see
-// vhdl_tick_unit().
+// A VHDL time literal for ONE simulation tick ("10 ps" for a 10 ps precision).
+// Delays are emitted as a count of ticks in this base (see set_time_units), so
+// `now' divided by it is the tick count. The base is true SI for a precision of
+// 1 ms or finer and compressed above that -- see vhdl_tick_unit().
 static std::string tick_literal()
 {
    const int prec = ivl_design_time_precision(get_vhdl_design());
-   return std::string("1 ") + time_unit_name(vhdl_tick_unit(prec));
+   ostringstream ss;
+   ss << vhdl_tick_mult(prec) << " " << time_unit_name(vhdl_tick_unit(prec));
+   return ss.str();
 }
 
 // A VHDL time literal for one unit of the ACTIVE SCOPE's Verilog timescale,
@@ -1142,23 +1211,42 @@ static std::string scope_unit_literal(int units)
    for (int k = 0; k < units - prec; k++)
       ticks *= 10;
    ostringstream ss;
-   ss << ticks << " " << time_unit_name(vhdl_tick_unit(prec));
+   ss << ticks * vhdl_tick_mult(prec) << " "
+      << time_unit_name(vhdl_tick_unit(prec));
+   return ss.str();
+}
+
+// `now' in the active scope's time units, ROUNDED to the nearest unit (half
+// up), as vvp's $time does and IEEE 1364 17.7.1 says: #56.93 under
+// `timescale 1ns/1ps is 57, not 56. Half a unit is 5 * 10^(units-prec-1) ticks.
+static std::string scope_time_expr()
+{
+   const int prec = ivl_design_time_precision(get_vhdl_design());
+   const int units = active_time_units();
+   if (units <= prec)
+      return "(now / (" + scope_unit_literal(units) + "))";
+   uint64_t half = 5;
+   for (int k = 1; k < units - prec; k++)
+      half *= 10;
+   ostringstream ss;
+   ss << "((now + " << half * vhdl_tick_mult(prec) << " "
+      << time_unit_name(vhdl_tick_unit(prec)) << ") / ("
+      << scope_unit_literal(units) << "))";
    return ss.str();
 }
 
 // $time / $stime: the current simulation time scaled to the calling scope's
 // time units. The scope's units come from the scope-keyed store
-// (set_active_scope in draw_process).
+// (set_active_scope in draw_process, and for the body of a function, task or
+// named block its own scope, which has its module's timescale).
 vhdl_expr *translate_sfunc_time(ivl_expr_t)
 {
-   string e = "(now / (" + scope_unit_literal(active_time_units()) + "))";
-   return new vhdl_var_ref(e.c_str(), vhdl_type::integer());
+   return new vhdl_var_ref(scope_time_expr().c_str(), vhdl_type::integer());
 }
 
 vhdl_expr *translate_sfunc_stime(ivl_expr_t)
 {
-   string e = "(now / (" + scope_unit_literal(active_time_units()) + "))";
-   return new vhdl_var_ref(e.c_str(), vhdl_type::integer());
+   return new vhdl_var_ref(scope_time_expr().c_str(), vhdl_type::integer());
 }
 
 vhdl_expr *translate_sfunc_simtime(ivl_expr_t)
@@ -1169,16 +1257,173 @@ vhdl_expr *translate_sfunc_simtime(ivl_expr_t)
    return new vhdl_var_ref(e.c_str(), vhdl_type::integer());
 }
 
+// stmt.cc: a `null;' carrying a comment ahead of the statement being drawn.
+bool emit_pre_comment(const std::string &text);
+
+/*
+ * A system function with no translation, replaced by a constant.  Never
+ * silent: the replacement is announced where it happens, in the located
+ * form vamos reports (a warning under vcs, an error under vcs-ams):
+ *   -- Unsupported system function $fopen replaced by 0 here (<file>:<line>)
+ * Outside a procedural statement there is no place for that line, so the
+ * translation stops with the same text as an error instead.
+ */
+static vhdl_expr *unsupported_sfunc_const(ivl_expr_t e, long value)
+{
+   const char *file = ivl_expr_file(e);
+   std::ostringstream ss;
+   ss << "Unsupported system function " << ivl_expr_name(e)
+      << " replaced by " << value << " here ("
+      << (file ? file : "?") << ":" << ivl_expr_lineno(e) << ")";
+   if (!emit_pre_comment(ss.str())) {
+      error("%s (no procedural statement to annotate)", ss.str().c_str());
+      return NULL;
+   }
+   cerr << "Warning: " << ss.str() << endl;
+   return new vhdl_const_int(value);
+}
+
+/*
+ * The IEEE 1364 generator behind an unseeded $random (17.9.1, "an internal
+ * seed"): sv_math_pkg's `random', the VHPIDIRECT sv_random entry -- vvp's
+ * rtl_dist_uniform(&seed, INT_MIN, INT_MAX) on one design-wide seed, so a
+ * testbench draws vvp's (and VCS's) numbers.  An int32, two's complement.
+ */
+static vhdl_expr *rng_draw_signed32()
+{
+   vhdl_fcall *ts = new vhdl_fcall("to_signed", vhdl_type::nsigned(32));
+   ts->add_expr(new vhdl_fcall("random", new vhdl_type(VHDL_TYPE_INTEGER)));
+   ts->add_expr(new vhdl_const_int(32));
+   return ts;
+}
+
+// A 32-bit signed or unsigned VHDL value as a logic3d_vector of the Verilog
+// expression width w: its low bits, or extended -- sign-extended when the
+// value is signed (numeric_std's signed resize keeps the sign bit when it
+// truncates, so truncation always goes through unsigned).
+static vhdl_expr *rng_to_l3d(vhdl_expr *v32, int w)
+{
+   const int n = w < 1 ? 1 : w;
+   vhdl_expr *u = v32;
+   const bool is_signed = v32->get_type()->get_name() == VHDL_TYPE_SIGNED;
+   if (is_signed && n > 32) {
+      vhdl_fcall *rs = new vhdl_fcall("resize", vhdl_type::nsigned(n));
+      rs->add_expr(u);
+      rs->add_expr(new vhdl_const_int(n));
+      u = rs;
+   }
+   if (is_signed) {
+      vhdl_fcall *cu = new vhdl_fcall("unsigned",
+                                      vhdl_type::nunsigned(n > 32 ? n : 32));
+      cu->add_expr(u);
+      u = cu;
+   }
+   if (n < 32 || (n > 32 && !is_signed)) {
+      vhdl_fcall *rs = new vhdl_fcall("resize", vhdl_type::nunsigned(n));
+      rs->add_expr(u);
+      rs->add_expr(new vhdl_const_int(n));
+      u = rs;
+   }
+   vhdl_fcall *l3 = new vhdl_fcall("unsigned_to_l3d",
+                                   vhdl_type::logic3d_vector(n - 1, 0));
+   l3->add_expr(u);
+   return l3;
+}
+
+// $urandom's 32-bit value: vvp draws it with the same algorithm offset by
+// 2^31, i.e. the $random draw with bit 31 flipped.
+static vhdl_expr *rng_urandom32()
+{
+   vhdl_fcall *u = new vhdl_fcall("unsigned", vhdl_type::nunsigned(32));
+   u->add_expr(rng_draw_signed32());
+   vhdl_fcall *one = new vhdl_fcall("to_unsigned", vhdl_type::nunsigned(32));
+   one->add_expr(new vhdl_const_int(1));
+   one->add_expr(new vhdl_const_int(32));
+   vhdl_fcall *msb = new vhdl_fcall("shift_left", vhdl_type::nunsigned(32));
+   msb->add_expr(one);
+   msb->add_expr(new vhdl_const_int(31));
+   vhdl_fcall *x = new vhdl_fcall("\"xor\"", vhdl_type::nunsigned(32));
+   x->add_expr(u);
+   x->add_expr(msb);
+   return x;
+}
+
+// A $urandom_range bound (an int unsigned) as unsigned(31 downto 0), via
+// its 32-bit logic3d form so a literal never reaches numeric_std as an
+// ambiguous string.  A fresh translation per call: trees are not shared.
+static vhdl_expr *rng_bound(ivl_expr_t a)
+{
+   if (a == NULL) {
+      vhdl_fcall *z = new vhdl_fcall("to_unsigned", vhdl_type::nunsigned(32));
+      z->add_expr(new vhdl_const_int(0));
+      z->add_expr(new vhdl_const_int(32));
+      return z;
+   }
+   vhdl_expr *v = translate_expr(a);
+   if (v == NULL)
+      return NULL;
+   vhdl_type l32(VHDL_TYPE_LOGIC3D_VECTOR, 31, 0);
+   vhdl_fcall *u = new vhdl_fcall("l3d_to_unsigned", vhdl_type::nunsigned(32));
+   u->add_expr(v->cast(&l32));
+   return u;
+}
+
+/*
+ * $urandom_range(maxval [, minval]) (IEEE 1800 18.13.2): a value in
+ * [minval, maxval], the bounds swapped when maxval < minval; minval
+ * defaults to 0.  lo + (draw mod (hi - lo + 1)) in 33-bit unsigned
+ * arithmetic, so the full 32-bit range works too.
+ */
+static vhdl_expr *rng_urandom_range(ivl_expr_t e)
+{
+   ivl_expr_t amax = ivl_expr_parm(e, 0);
+   ivl_expr_t amin = ivl_expr_parms(e) >= 2 ? ivl_expr_parm(e, 1) : NULL;
+   vhdl_expr *b[6];
+   for (int i = 0; i < 6; i++) {
+      b[i] = rng_bound((i % 2) ? amin : amax);
+      if (b[i] == NULL)
+         return NULL;
+   }
+   // lo/hi of the bounds, each widened to 33 bits
+   vhdl_expr *ext[3];
+   const char *mm[3] = { "minimum", "maximum", "minimum" };
+   for (int i = 0; i < 3; i++) {
+      vhdl_fcall *m = new vhdl_fcall(mm[i], vhdl_type::nunsigned(32));
+      m->add_expr(b[2 * i]);
+      m->add_expr(b[2 * i + 1]);
+      vhdl_fcall *r = new vhdl_fcall("resize", vhdl_type::nunsigned(33));
+      r->add_expr(m);
+      r->add_expr(new vhdl_const_int(33));
+      ext[i] = r;
+   }
+   vhdl_fcall *diff = new vhdl_fcall("\"-\"", vhdl_type::nunsigned(33));
+   diff->add_expr(ext[1]);
+   diff->add_expr(ext[0]);
+   vhdl_fcall *span = new vhdl_fcall("\"+\"", vhdl_type::nunsigned(33));
+   span->add_expr(diff);
+   span->add_expr(new vhdl_const_int(1));
+   vhdl_fcall *d33 = new vhdl_fcall("resize", vhdl_type::nunsigned(33));
+   d33->add_expr(rng_urandom32());
+   d33->add_expr(new vhdl_const_int(33));
+   vhdl_fcall *off = new vhdl_fcall("\"mod\"", vhdl_type::nunsigned(33));
+   off->add_expr(d33);
+   off->add_expr(span);
+   vhdl_fcall *sum = new vhdl_fcall("\"+\"", vhdl_type::nunsigned(33));
+   sum->add_expr(ext[2]);
+   sum->add_expr(off);
+   vhdl_fcall *r32 = new vhdl_fcall("resize", vhdl_type::nunsigned(32));
+   r32->add_expr(sum);
+   r32->add_expr(new vhdl_const_int(32));
+   return rng_to_l3d(r32, ivl_expr_width(e));
+}
+
 vhdl_expr *translate_sfunc_random(ivl_expr_t e)
 {
    // sv2vhdl mode: $random(seed) -> sv_random(seed), a deterministic seeded
    // value. The seed update (seed = sv_random(seed)) is emitted by draw_assign,
    // so this stays a plain function (VHDL functions can't have inout params)
    // and composes with any lvalue and a signal- or variable-class seed.
-   // NB: $fopen also routes here (it reuses the stub-0 path), so gate on the
-   // name actually being $random before treating arg 0 as a seed.
-   if (get_sv2vhdl_mode() && strcmp(ivl_expr_name(e), "$random") == 0
-       && ivl_expr_parms(e) >= 1) {
+   if (get_sv2vhdl_mode() && ivl_expr_parms(e) >= 1) {
       vhdl_expr *seed = translate_expr(ivl_expr_parm(e, 0));
       if (seed) {
          const int w = ivl_expr_width(e);
@@ -1188,18 +1433,37 @@ vhdl_expr *translate_sfunc_random(ivl_expr_t e)
          return f;
       }
    }
-   cerr << "warning: no translation for $random (returning 0)" << endl;
-   vhdl_expr *result = new vhdl_const_int(0);
-   result->set_comment("$random not supported, returned 0 instead!");
-   return result;
+   // Unseeded: the internal-seed generator (vvp's numbers)
+   if (get_sv2vhdl_mode() && ivl_expr_parms(e) == 0)
+      return rng_to_l3d(rng_draw_signed32(), ivl_expr_width(e));
+   return unsupported_sfunc_const(e, 0);
 }
 
-vhdl_expr *translate_sfunc_fopen(ivl_expr_t)
+/*
+ * SystemVerilog $urandom / $urandom_range (sv2vhdl mode), on the same
+ * internal-seed generator as $random.  $urandom(seed) -- a caller-held
+ * seed -- has no translation: it is replaced by 0, and said so.
+ */
+static vhdl_expr *translate_sfunc_urandom(ivl_expr_t e)
 {
-   cerr << "warning: no translation for $fopen (returning 0)" << endl;
-   vhdl_expr *result = new vhdl_const_int(0);
-   result->set_comment("$fopen not supported, returned 0 instead!");
-   return result;
+   if (!get_sv2vhdl_mode())
+      return unsupported_sfunc_const(e, 0);
+   if (strcmp(ivl_expr_name(e), "$urandom_range") == 0) {
+      if (ivl_expr_parms(e) < 1) {
+         error("%s:%d: $urandom_range needs a maxval argument",
+               ivl_expr_file(e), ivl_expr_lineno(e));
+         return NULL;
+      }
+      return rng_urandom_range(e);
+   }
+   if (ivl_expr_parms(e) >= 1)
+      return unsupported_sfunc_const(e, 0);
+   return rng_to_l3d(rng_urandom32(), ivl_expr_width(e));
+}
+
+vhdl_expr *translate_sfunc_fopen(ivl_expr_t e)
+{
+   return unsupported_sfunc_const(e, 0);
 }
 
 /*
@@ -1296,30 +1560,11 @@ vhdl_expr *translate_sfunc(ivl_expr_t e)
    else if (strcmp(name, "$random") == 0)
       return translate_sfunc_random(e);
    else if (strcmp(name, "$fopen") == 0)
-      return translate_sfunc_random(e);
+      return translate_sfunc_fopen(e);
    else if (strcmp(name, "$get_val") == 0)
       return translate_sfunc_get_val(e);
-   else if (strcmp(name, "$urandom") == 0 || strcmp(name, "$urandom_range") == 0) {
-      // Map to SV2VHDL.SV_MATH_PKG.random (iverilog's own RNG via VHPIDIRECT).
-      // It returns integer; for a multi-bit context wrap it as a logic3d_vector
-      // of the context width so the assign target type matches.
-      vhdl_fcall *r = new vhdl_fcall("random", new vhdl_type(VHDL_TYPE_INTEGER));
-      const int w = ivl_expr_width(e);
-      if (w <= 1)
-         return r;   // integer is fine in 1-bit / comparison contexts
-      // random returns a SIGNED int32 that may be negative, so to_unsigned()
-      // would raise a NATURAL-range error. Reinterpret the bits instead:
-      // unsigned(to_signed(random, w)).
-      vhdl_fcall *ts = new vhdl_fcall("to_signed", vhdl_type::nsigned(w));
-      ts->add_expr(r);
-      ts->add_expr(new vhdl_const_int(w));
-      vhdl_fcall *tu = new vhdl_fcall("unsigned", vhdl_type::nunsigned(w));
-      tu->add_expr(ts);
-      vhdl_fcall *l3 = new vhdl_fcall("unsigned_to_l3d",
-                                      vhdl_type::logic3d_vector(w - 1, 0));
-      l3->add_expr(tu);
-      return l3;
-   }
+   else if (strcmp(name, "$urandom") == 0 || strcmp(name, "$urandom_range") == 0)
+      return translate_sfunc_urandom(e);
    else if (strcmp(name, "$size") == 0) {
       // SystemVerilog queue.size() -> ring-buffer (tail - head). Return it as a
       // logic3d_vector of the expression width so it composes with the logic3d
@@ -1341,6 +1586,58 @@ vhdl_expr *translate_sfunc(ivl_expr_t e)
       vhdl_fcall *tu = new vhdl_fcall("to_unsigned", vhdl_type::nunsigned(w));
       tu->add_expr(diff);
       tu->add_expr(new vhdl_const_int(w));
+      vhdl_fcall *l3 = new vhdl_fcall("unsigned_to_l3d",
+                                      vhdl_type::logic3d_vector(w - 1, 0));
+      l3->add_expr(tu);
+      return l3;
+   }
+   else if (strcmp(name, "$test$plusargs") == 0) {
+      // sv_math_pkg.sv_test_plusargs (VHPIDIRECT into libresolver, which
+      // reads the simulator's plusargs from the VHPI tool argv): 1 when a
+      // +plusarg starts with the given text.  Wrapped at the expression width
+      // like $rtoi so it composes with the logic3d arithmetic.
+      ivl_expr_t pe = ivl_expr_parms(e) >= 1 ? ivl_expr_parm(e, 0) : NULL;
+      if (!pe || ivl_expr_type(pe) != IVL_EX_STRING) {
+         error("$test$plusargs argument must be a string literal");
+         return NULL;
+      }
+      vhdl_fcall *f = new vhdl_fcall("sv_test_plusargs", vhdl_type::integer());
+      f->add_expr(new vhdl_const_string(ivl_string_unescape(ivl_expr_string(pe))));
+      const int w = ivl_expr_width(e);
+      if (w <= 1)
+         return f;
+      vhdl_fcall *ts = new vhdl_fcall("to_signed", vhdl_type::nsigned(w));
+      ts->add_expr(f);
+      ts->add_expr(new vhdl_const_int(w));
+      vhdl_fcall *tu = new vhdl_fcall("unsigned", vhdl_type::nunsigned(w));
+      tu->add_expr(ts);
+      vhdl_fcall *l3 = new vhdl_fcall("unsigned_to_l3d",
+                                      vhdl_type::logic3d_vector(w - 1, 0));
+      l3->add_expr(tu);
+      return l3;
+   }
+   else if (strcmp(name, "$value$plusargs") == 0) {
+      // $value$plusargs(fmt, var): the assignment to var is emitted ahead of
+      // the current statement (emit_value_plusargs_pre); the value of the
+      // call itself is "a matching +plusarg exists", from the same runtime
+      // helper.  fmt may be a literal or a runtime vector (l3d_to_string).
+      if (ivl_expr_parms(e) < 2) {
+         error("$value$plusargs requires two arguments");
+         return NULL;
+      }
+      ivl_expr_t fe = ivl_expr_parm(e, 0);
+      if (!emit_value_plusargs_pre(ivl_expr_parm(e, 1), plusargs_fmt_expr, fe))
+         return NULL;
+      vhdl_fcall *f = new vhdl_fcall("sv_value_plusargs", vhdl_type::integer());
+      f->add_expr(plusargs_fmt_expr(fe));
+      const int w = ivl_expr_width(e);
+      if (w <= 1)
+         return f;
+      vhdl_fcall *ts = new vhdl_fcall("to_signed", vhdl_type::nsigned(w));
+      ts->add_expr(f);
+      ts->add_expr(new vhdl_const_int(w));
+      vhdl_fcall *tu = new vhdl_fcall("unsigned", vhdl_type::nunsigned(w));
+      tu->add_expr(ts);
       vhdl_fcall *l3 = new vhdl_fcall("unsigned_to_l3d",
                                       vhdl_type::logic3d_vector(w - 1, 0));
       l3->add_expr(tu);
@@ -1480,6 +1777,15 @@ vhdl_expr *translate_expr(ivl_expr_t e)
       return translate_delay(e);
    case IVL_EX_REALNUM:
       return new vhdl_const_real(ivl_expr_dvalue(e));
+   case IVL_EX_NEW:
+   case IVL_EX_NULL:
+   case IVL_EX_PROPERTY:
+   case IVL_EX_SHALLOWCOPY:
+      // Class objects: handles, properties, new and copies
+      error("unsupported construct (class) at %s:%d: a SystemVerilog class "
+            "object has no VHDL translation", ivl_expr_file(e),
+            ivl_expr_lineno(e));
+      return NULL;
    default:
       error("No VHDL translation for expression at %s:%d (type = %d)",
             ivl_expr_file(e), ivl_expr_lineno(e), type);
