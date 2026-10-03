@@ -192,14 +192,20 @@ vhdl_const_time* scale_time(const vhdl_entity* ent, uint64_t t)
    return new vhdl_const_time(t * ent->time_mult_, ent->time_unit_);
 }
 
-// The VHDL unit that represents ONE simulation tick, given the design's time
-// precision. The VHDL time base is arbitrary -- only ratios between delays and
-// $time matter -- so a tick is represented as a single unit of the nearest
-// decade at or below the precision, which COMPRESSES the time base. That is
-// deliberate: using the true SI scale (a 1s tick as "1 sec") overflows VHDL's
-// 64-bit fs TIME, which tops out near 9223 seconds, for any long run with a
-// coarse timescale. $time/$simtime divide by this same base -- see
-// vhdl_scope_unit_literal() -- so the two stay consistent.
+// ONE simulation tick, given the design's time precision, is emitted as
+// vhdl_tick_mult() units of vhdl_tick_unit(): the largest VHDL unit at or below
+// the precision, times 10 or 100 for a precision of 10 or 100 of that unit (a
+// 10 ps tick is "10 ps", a 100 ns tick "100 ns"). So for every precision of
+// 1 ms or finer a tick is its TRUE SI size. That matters beyond ratios: nvc
+// reports and stops in SI time (+vcs+finish+N, the run footer), and in AMS
+// co-simulation the digital time is the analog engine's absolute time, so a
+// 10 ps tick emitted as "1 ps" ran the digital 10x fast against the analog.
+//
+// A precision COARSER than 1 ms is deliberately COMPRESSED: one tick is "1 ms".
+// The true SI scale (a 1 s tick as "1 sec") overflows VHDL's 64-bit fs TIME,
+// which tops out near 9223 seconds, for any long run with a coarse timescale.
+// $time/$simtime divide by the same base -- see tick_literal() and
+// scope_unit_literal() in expr.cc -- so they stay consistent either way.
 time_unit_t vhdl_tick_unit(int precision)
 {
    if (precision >= -3)  return TIME_UNIT_MS;
@@ -207,6 +213,19 @@ time_unit_t vhdl_tick_unit(int precision)
    if (precision >= -9)  return TIME_UNIT_NS;
    if (precision >= -12) return TIME_UNIT_PS;
    return TIME_UNIT_FS;
+}
+
+// The number of vhdl_tick_unit()s in one tick: 10^(precision - unit exponent)
+// for a precision finer than 1 ms (1, 10 or 100), else 1 (the compressed base).
+uint64_t vhdl_tick_mult(int precision)
+{
+   if (precision >= -3 || precision < -15)
+      return 1;
+   const int unit_exp = -3 * ((2 - precision) / 3);   // floor(precision/3)*3
+   uint64_t mult = 1;
+   for (int k = unit_exp; k < precision; k++)
+      mult *= 10;
+   return mult;
 }
 
 const char *time_unit_name(time_unit_t u)
@@ -224,8 +243,8 @@ const char *time_unit_name(time_unit_t u)
 
 // Work out the VHDL units for this entity's delays. `precision' is the DESIGN's
 // time precision -- the size of a simulation tick -- because delay values reach
-// us counted in ticks. One tick is emitted as one vhdl_tick_unit(), so a delay
-// of N ticks is simply "N <unit>".
+// us counted in ticks. One tick is emitted as vhdl_tick_mult() of
+// vhdl_tick_unit(), so a delay of N ticks is "N*mult <unit>".
 //
 // Keying this on the DESIGN precision (rather than the old per-scope
 // min(units, precision)) is what makes a mixed-timescale design consistent: all
@@ -237,7 +256,7 @@ const char *time_unit_name(time_unit_t u)
 void vhdl_entity::set_time_units(int, int precision)
 {
    time_unit_ = vhdl_tick_unit(precision);
-   time_mult_ = 1;
+   time_mult_ = vhdl_tick_mult(precision);
 }
 
 vhdl_arch::~vhdl_arch()
@@ -739,6 +758,15 @@ void vhdl_signal_decl::emit(std::ostream &of, int level) const
    emit_comment(of, level, true);
 }
 
+void vhdl_alias_decl::emit(std::ostream &of, int level) const
+{
+   of << "alias " << name_ << " is " << target_ << "(";
+   if (width_ > 1)
+      of << (offset_ + width_ - 1) << " downto ";
+   of << offset_ << ");";
+   emit_comment(of, level, true);
+}
+
 void vhdl_type_decl::emit(std::ostream &of, int level) const
 {
    of << "type " << name_ << " is ";
@@ -919,8 +947,25 @@ void vhdl_null_stmt::emit(std::ostream &of, int level) const
 
 void vhdl_exit_stmt::emit(std::ostream &of, int level) const
 {
-   of << "exit;";
+   if (label_.empty())
+      of << "exit;";
+   else
+      of << "exit " << label_ << ";";
    emit_comment(of, level, true);
+}
+
+void vhdl_return_stmt::emit(std::ostream &of, int level) const
+{
+   of << "return " << value_ << ";";
+   emit_comment(of, level, true);
+}
+
+void vhdl_labeled_loop_stmt::emit(std::ostream &of, int level) const
+{
+   of << label_ << ": loop";
+   emit_comment(of, level, true);
+   body().emit(of, level);
+   of << "end loop " << label_ << ";";
 }
 
 void vhdl_fcall::find_vars(vhdl_var_set_t& read)

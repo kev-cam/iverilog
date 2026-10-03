@@ -184,6 +184,11 @@ vhdl_entity* find_entity(ivl_scope_t scope)
    if (ivl_scope_type(scope) == IVL_SCT_PACKAGE)
       return NULL;
 
+   // Nor does a SystemVerilog class: its uses are reported, with their
+   // location, where they are translated (translate_ufunc, draw_utask)
+   if (ivl_scope_type(scope) == IVL_SCT_CLASS)
+      return NULL;
+
    assert(ivl_scope_type(scope) == IVL_SCT_MODULE);
 
    if (is_default_scope_instance(scope)) {
@@ -455,8 +460,21 @@ static bool same_scope_type_name(ivl_scope_t a, ivl_scope_t b)
                return false;
             break;
 
+         case IVL_EX_REALNUM: {
+            // The same value bit for bit: two instances whose real
+            // parameters differ in any way (even 0.0 and -0.0) get an
+            // entity each, never one shared body
+            const double da = ivl_expr_dvalue(value_a);
+            const double db = ivl_expr_dvalue(value_b);
+            if (memcmp(&da, &db, sizeof da) != 0)
+               return false;
+            break;
+         }
+
       default:
-         assert(false);
+         // A value of another kind: keep the scopes apart (an entity
+         // each is always correct, a shared one may not be)
+         return false;
       }
    }
 

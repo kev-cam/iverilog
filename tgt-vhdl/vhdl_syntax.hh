@@ -254,9 +254,12 @@ enum time_unit_t {
    TIME_UNIT_SEC
 };
 
-// The VHDL unit representing one simulation tick for a design of this time
-// precision, and its name. Delays and $time/$simtime must share this base.
+// One simulation tick for a design of this time precision is vhdl_tick_mult()
+// of the VHDL unit vhdl_tick_unit() (its true SI size for a precision of 1 ms
+// or finer; compressed to 1 ms above that). Delays and $time/$simtime must
+// share this base.
 time_unit_t vhdl_tick_unit(int precision);
+uint64_t vhdl_tick_mult(int precision);
 const char *time_unit_name(time_unit_t u);
 
 class vhdl_const_time : public vhdl_expr {
@@ -556,8 +559,23 @@ public:
 
 class vhdl_exit_stmt : public vhdl_seq_stmt {
 public:
+   // label: the loop to leave (`exit <label>;'); empty: the innermost one
+   explicit vhdl_exit_stmt(const std::string &label = "") : label_(label) {}
    void emit(std::ostream &of, int level) const;
    void find_vars(vhdl_var_set_t&, vhdl_var_set_t&) {}
+private:
+   std::string label_;
+};
+
+// `return <value>;' -- a Verilog function's early return (SV `return expr',
+// `disable f'): value names the function's result variable, <f>_Result
+class vhdl_return_stmt : public vhdl_seq_stmt {
+public:
+   explicit vhdl_return_stmt(const std::string &value) : value_(value) {}
+   void emit(std::ostream &of, int level) const;
+   void find_vars(vhdl_var_set_t&, vhdl_var_set_t&) {}
+private:
+   std::string value_;
 };
 
 
@@ -669,8 +687,23 @@ public:
    void get_sub_containers(std::vector<stmt_container*>& out) {
       out.push_back(&stmts_);
    }
+protected:
+   const stmt_container &body() const { return stmts_; }
 private:
    stmt_container stmts_;
+};
+
+
+// `<label>: loop ... end loop <label>;' -- the body of a Verilog named block
+// or task that a disable statement inside it leaves (`exit <label>;'); the
+// translator ends it with `exit <label>;', so it runs once.
+class vhdl_labeled_loop_stmt : public vhdl_loop_stmt {
+public:
+   explicit vhdl_labeled_loop_stmt(const std::string &label) : label_(label) {}
+   void emit(std::ostream &of, int level) const;
+   const std::string &get_label() const { return label_; }
+private:
+   std::string label_;
 };
 
 
@@ -825,6 +858,32 @@ public:
       : vhdl_decl(name, type) {}
    virtual void emit(std::ostream &of, int level) const;
    assign_type_t assignment_type() const { return ASSIGN_NONBLOCK; }
+};
+
+
+/*
+ * An object alias of one element or a slice of a signal:
+ *
+ *    alias <name> is <target>(<offset>);
+ *    alias <name> is <target>(<offset+width-1> downto <offset>);
+ *
+ * `type' is the alias's view inside tgt-vhdl (logic3d for one bit, a
+ * (width-1 downto 0) vector otherwise); it is not printed, so the alias
+ * keeps the target's own subtype and index range. The alias denotes the
+ * target signal itself, so it is assigned and read like a signal.
+ */
+class vhdl_alias_decl : public vhdl_decl {
+public:
+   vhdl_alias_decl(const std::string& name, const vhdl_type *type,
+                   const std::string& target, unsigned offset,
+                   unsigned width)
+      : vhdl_decl(name, type), target_(target), offset_(offset),
+        width_(width) {}
+   void emit(std::ostream &of, int level) const;
+   assign_type_t assignment_type() const { return ASSIGN_NONBLOCK; }
+private:
+   std::string target_;
+   unsigned offset_, width_;
 };
 
 
@@ -1059,6 +1118,7 @@ public:
    explicit vhdl_process(const char *name = "") : name_(name) {}
 
    void emit(std::ostream &of, int level) const;
+   const std::string &get_label() const { return name_; }
    void add_sensitivity(const std::string &name);
    // Postponed process: runs once per simulation cycle after the final delta,
    // reading settled values -- exactly $monitor/$strobe timing.

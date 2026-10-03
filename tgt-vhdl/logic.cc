@@ -688,11 +688,19 @@ static void default_logic(vhdl_arch *arch, ivl_net_logic_t log)
    vhdl_expr *rhs = translate_logic_inputs(arch->get_scope(), log);
 
    // BUFZ copy from a strength-bearing scalar net: normalize the weak
-   // alphabet codes to driven ones (the assign's strength is its own)
+   // alphabet codes to driven ones (the assign's strength is its own).
+   // A continuous assignment (the non-transparent BUFZ) drives its own
+   // strength whatever its input carries, and a net can turn weak after
+   // translation (the AMS cut's BIDIR A2D on an inout pad is weak while
+   // nothing else drives it; its marker bufif1 here is strong), so a
+   // scalar logic3d BUFZ always re-strengthens -- an identity on strong
+   // values.  The transparent BUFT (port buffers) keeps the old gate.
    const ivl_logic_t ltype = ivl_logic_type(log);
    if (is_sv2vhdl_mode() && (ltype == IVL_LO_BUFZ || ltype == IVL_LO_BUFT)
        && ivl_logic_width(log) == 1
-       && nexus_has_strength(ivl_logic_pin(log, 1))) {
+       && (nexus_has_strength(ivl_logic_pin(log, 1))
+           || (ltype == IVL_LO_BUFZ && rhs != NULL && rhs->get_type() != NULL
+               && rhs->get_type()->get_name() == VHDL_TYPE_LOGIC3D))) {
       vhdl_fcall *st =
          new vhdl_fcall("l3d_strengthen", vhdl_type::logic3d());
       st->add_expr(rhs);
@@ -782,6 +790,12 @@ void draw_logic(vhdl_arch *arch, ivl_net_logic_t log)
    // strength buffer to enter resolution at the specified level
    case IVL_LO_BUFT:
    case IVL_LO_BUFZ:
+      // An input port buffer belongs to each instance's port association;
+      // the parent draws it (scope.cc, map_signal); one of a shape the
+      // translation cannot draw is an error, not a lost connection
+      if (ivl_logic_type(log) == IVL_LO_BUFT
+          && (is_input_port_buffer(log) || untranslated_port_buffer(log)))
+         break;
       if (sv2vhdl && (ivl_logic_drive0(log) != IVL_DR_STRONG
                       || ivl_logic_drive1(log) != IVL_DR_STRONG)) {
          if (ivl_logic_width(log) == 1)
@@ -823,15 +837,32 @@ static void draw_one_switch(vhdl_arch *arch, ivl_switch_t sw)
       // Part-select tran: side a is the wide vector, side b the narrow part at
       // bit offset `off`, width `part`. iverilog inserts this for an inout port
       // (or tran) connected to a bit/part-select, e.g. `.bit0(value[0])`.
-      // Previously skipped -> the part net was left floating (read as 0). Join
-      // them: drive the part net from the vector slice. nvc treats the port as
-      // inout, so the external vector's value reaches the port (the common
-      // direction; a symmetric back-drive would need full strength resolution).
+      // In sv2vhdl mode side b is normally an alias of that element/slice of
+      // side a (tran_vp_alias in scope.cc), which joins the two both ways:
+      // nothing to emit. Otherwise drive the part net from the vector slice:
+      // nvc treats the port as inout, so the external vector's value reaches
+      // the port, but the port cannot drive the vector back.
+      // An inout port on a concatenation: its port map associates the
+      // parts with the operands (scope.cc, map_concat_parts)
+      if (get_sv2vhdl_mode() && tran_vp_drawn_by_port_map(sw))
+         return;
       unsigned off  = ivl_switch_offset(sw);
       unsigned part = ivl_switch_part(sw);
       vhdl_scope *sc = arch->get_scope();
-      vhdl_var_ref *a = nexus_to_var_ref(sc, ivl_switch_a(sw));
       vhdl_var_ref *b = nexus_to_var_ref(sc, ivl_switch_b(sw));
+      if (dynamic_cast<vhdl_alias_decl*>(sc->get_decl(b->get_name())))
+         return;
+      vhdl_var_ref *a = nexus_to_var_ref(sc, ivl_switch_a(sw));
+      // No one-way copy passes silently (unless nothing uses it: a core
+      // temporary whose parts tran_vp_alias aliased to the vector itself)
+      if (tran_vp_copy_needs_warning(sc, sw)) {
+         cerr << "Warning: " << a->get_name() << "(";
+         if (part > 1)
+            cerr << off + part - 1 << " downto ";
+         cerr << off << ") at " << ivl_switch_file(sw) << ":"
+              << ivl_switch_lineno(sw) << " is connected one way only: "
+                 "its part-select tran joins a translator temporary" << endl;
+      }
       if (part == 1)
          a->set_slice(new vhdl_const_int(off));         // single bit a(off)
       else

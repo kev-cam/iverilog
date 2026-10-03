@@ -80,6 +80,20 @@ static int draw_stask_finish(vhdl_procedural *, stmt_container *container,
    return 0;
 }
 
+/*
+ * $stop (sv2vhdl mode): end the run through std.env.stop, the way $finish
+ * ends it through std.env.finish. A batch run (vvp -n, a VCS simv without an
+ * interactive shell) has nowhere to suspend to, so the stop ends it; nvc exits
+ * 0 after "STOP called". The optional diagnostic level argument is ignored.
+ */
+static int draw_stask_stop(vhdl_procedural *, stmt_container *container,
+                           ivl_statement_t)
+{
+   container->add_stmt(new vhdl_pcall_stmt("sv_write_flush"));
+   container->add_stmt(new vhdl_pcall_stmt("std.env.stop"));
+   return 0;
+}
+
 static char parse_octal(const char *p)
 {
    assert(*p && *(p+1) && *(p+2));
@@ -88,6 +102,19 @@ static char parse_octal(const char *p)
    return (*p - '0') * 64
       + (*(p+1) - '0') * 8
       + (*(p+2) - '0') * 1;
+}
+
+// A comparison result (==, !=, ===, <, &&, ... translate to a VHDL boolean)
+// shown by $display is a 1-bit Verilog value: 1 or 0 under every format, as
+// vvp prints it -- never "true"/"false", which a boolean's 'image gave (%d,
+// %0d, %b, %h and a bare argument all fell back to it). sv2vhdl mode turns it
+// into a logic3d bit, which every format below handles.
+static vhdl_expr *display_bool_as_bit(vhdl_expr *base)
+{
+   if (base != NULL && get_sv2vhdl_mode() && base->get_type() != NULL
+       && base->get_type()->get_name() == VHDL_TYPE_BOOLEAN)
+      return base->cast(vhdl_type::logic3d());
+   return base;
 }
 
 // Build the concatenated display text for a $display-family statement's
@@ -162,12 +189,18 @@ static vhdl_expr *build_display_text(vhdl_procedural *proc,
                switch (*p) {
                case 'm':
                   // %m = the hierarchical name of the scope containing this
-                  // $display, from the scope-keyed store (set in draw_process).
+                  // $display, from the scope-keyed store (set in draw_process,
+                  // and for a function, task or named block in its drawing).
                   text->add_expr(new vhdl_const_string(active_hier_name()));
                   break;
                case 't': case 'T':
                   {
                      // %t: format a time value per the current $timeformat.
+                     // sv_tstr(v, vu, dflt) takes a time v in units of
+                     // 10^vu s (the scope's time units) and scales it to the
+                     // $timeformat units, or when $timeformat was never
+                     // called to dflt: the smallest precision of the whole
+                     // DESIGN (IEEE 1364 17.3.2, vvp), not this scope's.
                      assert(i < count);
                      ivl_expr_t netp = ivl_stmt_parm(stmt, i++);
                      assert(netp);
@@ -175,13 +208,55 @@ static vhdl_expr *build_display_text(vhdl_procedural *proc,
                      if (NULL == base)
                         return NULL;
                      emit_wait_for_0(proc, container, stmt, base);
+                     base = display_bool_as_bit(base);
+                     const bool real_arg = ivl_expr_value(netp) == IVL_VT_REAL
+                        || (base->get_type() != NULL
+                            && base->get_type()->get_name() == VHDL_TYPE_REAL);
+                     // A real argument ($realtime, a real variable) is a time
+                     // in scope units WITH a fraction (5.355 for 5.355 ns): it
+                     // goes to sv_tstr's REAL overload, which scales it in
+                     // double precision and prints it with "%.<p>f" as vvp's
+                     // get_time_real does -- every digit the $timeformat asks
+                     // for, and no INTEGER range limit (an integer() cast of
+                     // the count stopped the run past 2^31 precision ticks,
+                     // 2.147 ms at 1 ps). Any other argument is an integer
+                     // count: sv_tstr's integer overload scales its digit
+                     // string, so a 64-bit $time quotient is exact too.
+                     vhdl_type rtype(VHDL_TYPE_REAL);
                      vhdl_type itype(VHDL_TYPE_INTEGER);
                      vhdl_fcall *f = new vhdl_fcall("sv_tstr",
                                                     vhdl_type::string());
-                     f->add_expr(base->cast(&itype));
+                     f->add_expr(base->cast(real_arg ? &rtype : &itype));
                      f->add_expr(new vhdl_const_int(active_time_units()));
-                     f->add_expr(new vhdl_const_int(active_time_precision()));
-                     text->add_expr(f);
+                     f->add_expr(new vhdl_const_int(
+                        ivl_design_time_precision(get_vhdl_design())));
+                     if (prec_spec >= 0) {
+                        // sv_tstr always uses the $timeformat precision
+                        cerr << "Warning: " << ivl_stmt_file(stmt) << ":"
+                             << ivl_stmt_lineno(stmt) << ": the precision of %"
+                             << (ld_zero ? "0" : "");
+                        if (fw_spec >= 0)
+                           cerr << fw_spec;
+                        cerr << "." << prec_spec << *p << " is not translated:"
+                             << " the $timeformat precision is used" << endl;
+                     }
+                     if (ld_zero || fw_spec >= 0) {
+                        // A field width other than the $timeformat one
+                        // (vvp, VCS): %0t has none (no padding), %<N>t pads
+                        // to N blanks and %0<N>t to N zeros.
+                        require_support_function(SF_TIME_FIELD);
+                        vhdl_fcall *w = new vhdl_fcall(
+                           support_function::function_name(SF_TIME_FIELD),
+                           vhdl_type::string());
+                        w->add_expr(f);
+                        w->add_expr(new vhdl_const_int(
+                           fw_spec >= 0 ? (int)fw_spec : 0));
+                        w->add_expr(new vhdl_const_bool(ld_zero
+                                                        && fw_spec >= 0));
+                        text->add_expr(w);
+                     }
+                     else
+                        text->add_expr(f);
                   }
                   break;
                case 'f': case 'F': case 'g': case 'G': case 'e':
@@ -197,6 +272,7 @@ static vhdl_expr *build_display_text(vhdl_procedural *proc,
                      if (NULL == base)
                         return NULL;
                      emit_wait_for_0(proc, container, stmt, base);
+                     base = display_bool_as_bit(base);
                      ostringstream fs;
                      fs << '%';
                      if (ld_zero) fs << '0';
@@ -251,6 +327,7 @@ static vhdl_expr *build_display_text(vhdl_procedural *proc,
                      if (NULL == base)
                         return NULL;
                      emit_wait_for_0(proc, container, stmt, base);
+                     base = display_bool_as_bit(base);
                      const vhdl_type *bt = base->get_type();
                      const vhdl_type_name_t btn =
                         bt == NULL ? VHDL_TYPE_STD_LOGIC : bt->get_name();
@@ -297,6 +374,7 @@ static vhdl_expr *build_display_text(vhdl_procedural *proc,
                      if (NULL == base)
                         return NULL;
                      emit_wait_for_0(proc, container, stmt, base);
+                     base = display_bool_as_bit(base);
                      const vhdl_type *bt = base->get_type();
                      const vhdl_type_name_t btn = bt == NULL
                         ? VHDL_TYPE_INTEGER : bt->get_name();
@@ -354,6 +432,7 @@ static vhdl_expr *build_display_text(vhdl_procedural *proc,
                         return NULL;
 
                      emit_wait_for_0(proc, container, stmt, base);
+                     base = display_bool_as_bit(base);
 
                      // Pick the sv_display_pkg function for this format
                      const char *func;
@@ -466,6 +545,7 @@ static vhdl_expr *build_display_text(vhdl_procedural *proc,
                         return NULL;
 
                      emit_wait_for_0(proc, container, stmt, base);
+                     base = display_bool_as_bit(base);
 
                      // Verilog %d with a real argument rounds to the nearest
                      // integer first.
@@ -565,6 +645,7 @@ static vhdl_expr *build_display_text(vhdl_procedural *proc,
             return NULL;
 
          emit_wait_for_0(proc, container, stmt, base);
+         base = display_bool_as_bit(base);
 
          // A bare REAL $display arg formats as %g (Verilog default for reals).
          const vhdl_type *bt0 = base->get_type();
@@ -636,6 +717,85 @@ static int draw_stask_display(vhdl_procedural *proc,
       new vhdl_pcall_stmt(newline ? "sv_display_line" : "sv_write_buf");
    pc->add_expr(text);
    container->add_stmt(pc);
+   return 0;
+}
+
+vhdl_expr *translate_sfunc_simtime(ivl_expr_t);
+
+/*
+ * $fatal, $error, $warning and $info (sv2vhdl mode). The message is printed
+ * through the $display machinery in exactly the two lines vvp prints
+ *
+ *   ERROR: <file>:<line>: <message>
+ *          Time: <ticks>  Scope: <scope>
+ *
+ * (the second line indented by the severity word's width plus two; <ticks>
+ * is the time in simulation-precision ticks, <scope> the %m name), then a
+ * report statement carries the severity into the VHDL run:
+ *
+ *   $info    -> report "INFO" severity note       (the run continues)
+ *   $warning -> report "WARNING" severity warning (the run continues)
+ *   $error   -> report "ERROR" severity error     (the run continues; nvc
+ *               then exits non-zero at the end of the run)
+ *   $fatal   -> report "FATAL" severity failure   (nvc stops, exit non-zero)
+ *
+ * $fatal's first argument is the finish number (0, 1 or 2), which only sets
+ * the verbosity of vvp's $finish and is not printed; a first argument that is
+ * a string literal is taken as the message (VCS accepts `$fatal("...")').
+ */
+static int draw_stask_severity(vhdl_procedural *proc,
+                               stmt_container *container,
+                               ivl_statement_t stmt)
+{
+   const char *name = ivl_stmt_name(stmt);
+   const char *word;
+   vhdl_severity_t level;
+   if (strcmp(name, "$fatal") == 0) {
+      word = "FATAL"; level = SEVERITY_FAILURE;
+   } else if (strcmp(name, "$error") == 0) {
+      word = "ERROR"; level = SEVERITY_ERROR;
+   } else if (strcmp(name, "$warning") == 0) {
+      word = "WARNING"; level = SEVERITY_WARNING;
+   } else {
+      word = "INFO"; level = SEVERITY_NOTE;
+   }
+
+   const int count = ivl_stmt_parm_count(stmt);
+   int first = 0;
+   if (level == SEVERITY_FAILURE && count > 0) {
+      ivl_expr_t p0 = ivl_stmt_parm(stmt, 0);
+      if (p0 == NULL || ivl_expr_type(p0) != IVL_EX_STRING)
+         first = 1;   // the finish number
+   }
+
+   ostringstream head;
+   head << word << ": " << ivl_stmt_file(stmt) << ":"
+        << ivl_stmt_lineno(stmt) << ": ";
+   vhdl_binop_expr *line1 = new vhdl_binop_expr(VHDL_BINOP_CONCAT,
+                                                vhdl_type::string());
+   line1->add_expr(new vhdl_const_string(head.str()));
+   if (first < count) {
+      vhdl_expr *msg = build_display_text(proc, container, stmt, first);
+      if (NULL == msg)
+         return 1;
+      line1->add_expr(msg);
+   }
+   vhdl_pcall_stmt *pc1 = new vhdl_pcall_stmt("sv_display_line");
+   pc1->add_expr(line1);
+   container->add_stmt(pc1);
+
+   string pad(strlen(word) + 2, ' ');
+   vhdl_binop_expr *line2 = new vhdl_binop_expr(VHDL_BINOP_CONCAT,
+                                                vhdl_type::string());
+   line2->add_expr(new vhdl_const_string(pad + "Time: "));
+   line2->add_expr(translate_sfunc_simtime(NULL)->cast(vhdl_type::string()));
+   line2->add_expr(new vhdl_const_string("  Scope: " + active_hier_name()));
+   vhdl_pcall_stmt *pc2 = new vhdl_pcall_stmt("sv_display_line");
+   pc2->add_expr(line2);
+   container->add_stmt(pc2);
+
+   container->add_stmt(new vhdl_report_stmt(new vhdl_const_string(word),
+                                            level));
    return 0;
 }
 
@@ -1028,6 +1188,13 @@ static int draw_stask(vhdl_procedural *proc, stmt_container *container,
    }
    else if (strcmp(name, "$finish") == 0)
       return draw_stask_finish(proc, container, stmt);
+   else if (get_sv2vhdl_mode() && strcmp(name, "$stop") == 0)
+      return draw_stask_stop(proc, container, stmt);
+   else if (get_sv2vhdl_mode()
+            && (strcmp(name, "$fatal") == 0 || strcmp(name, "$error") == 0
+                || strcmp(name, "$warning") == 0
+                || strcmp(name, "$info") == 0))
+      return draw_stask_severity(proc, container, stmt);
    else if (strcmp(name, "$set_val") == 0)
       return draw_stask_set_val(proc, container, stmt);
    else if (strncmp(name, "$ivl_queue_method$", 18) == 0
@@ -1047,9 +1214,22 @@ static int draw_stask(vhdl_procedural *proc, stmt_container *container,
          } else if (a == 2) {
             // The suffix must be a VHDL string: translate_expr now packs
             // string literals into logic3d vectors (their Verilog VALUE
-            // form), so take the text directly.
-            if (ivl_expr_type(pe) == IVL_EX_STRING)
-               pc->add_expr(new vhdl_const_string(ivl_expr_string(pe)));
+            // form), so take the text directly. ivl_expr_string() writes a
+            // NUL (the empty string "" is one), a quote, a backslash and any
+            // other unprintable character as an octal escape: decode them as
+            // the $display path does; vhdl_const_string drops the NULs.
+            if (ivl_expr_type(pe) == IVL_EX_STRING) {
+               string suffix;
+               for (const char *s = ivl_expr_string(pe); *s; s++) {
+                  if (*s == '\\') {
+                     suffix += parse_octal(s + 1);
+                     s += 3;
+                  }
+                  else
+                     suffix += *s;
+               }
+               pc->add_expr(new vhdl_const_string(suffix));
+            }
             else
                pc->add_expr(ve);
          } else {
@@ -1070,6 +1250,169 @@ static int draw_stask(vhdl_procedural *proc, stmt_container *container,
       return 0;
    }
 }
+
+/*
+ * disable (Verilog `disable <scope>', SV `return'). A disable leaves the
+ * named block, task or function it names, wherever inside it it stands.
+ * Such a scope's body is drawn inside
+ *
+ *    sv_dis_<n>: loop
+ *       <body>
+ *       exit sv_dis_<n>;
+ *    end loop sv_dis_<n>;
+ *
+ * when a disable inside it (or inside a task it calls) names it, and the
+ * disable is `exit sv_dis_<n>;'; a function's is `return <f>_Result;'. A
+ * disable of a scope that does not enclose it in the same process (another
+ * process's block, a task from outside it, `disable fork') has no
+ * translation: a located error. (Every disable used to be drawn as `null',
+ * so `return x' in a function and `disable blk' were silently ignored.)
+ */
+namespace {
+struct disable_target_t {
+   ivl_scope_t scope;
+   std::string label;      // the loop to exit; empty: a function (return)
+   std::string result;     // a function's result variable
+};
+}
+static std::vector<disable_target_t> g_disable_targets;
+static std::vector<std::vector<disable_target_t> > g_disable_saved;
+static int g_disable_count = 0;
+
+void begin_function_disables(ivl_scope_t fscope, const std::string &result)
+{
+   g_disable_saved.push_back(g_disable_targets);
+   g_disable_targets.clear();
+   disable_target_t t;
+   t.scope = fscope;
+   t.result = result;
+   g_disable_targets.push_back(t);
+}
+
+void end_function_disables()
+{
+   assert(!g_disable_saved.empty());
+   g_disable_targets = g_disable_saved.back();
+   g_disable_saved.pop_back();
+}
+
+// Whether a disable of `target' stands anywhere in `s' (or in a task it calls)
+static bool stmt_disables(ivl_statement_t s, ivl_scope_t target,
+                          std::set<ivl_scope_t> &tasks_seen)
+{
+   if (s == NULL)
+      return false;
+   switch (ivl_statement_type(s)) {
+   case IVL_ST_DISABLE:
+      return ivl_stmt_call(s) == target;
+   case IVL_ST_BLOCK:
+   case IVL_ST_FORK:
+   case IVL_ST_FORK_JOIN_ANY:
+   case IVL_ST_FORK_JOIN_NONE:
+      for (unsigned i = 0; i < ivl_stmt_block_count(s); i++)
+         if (stmt_disables(ivl_stmt_block_stmt(s, i), target, tasks_seen))
+            return true;
+      return false;
+   case IVL_ST_CONDIT:
+      return stmt_disables(ivl_stmt_cond_true(s), target, tasks_seen)
+         || stmt_disables(ivl_stmt_cond_false(s), target, tasks_seen);
+   case IVL_ST_CASE:
+   case IVL_ST_CASER:
+   case IVL_ST_CASEX:
+   case IVL_ST_CASEZ:
+      for (unsigned i = 0; i < ivl_stmt_case_count(s); i++)
+         if (stmt_disables(ivl_stmt_case_stmt(s, i), target, tasks_seen))
+            return true;
+      return false;
+   case IVL_ST_FORLOOP:
+      return stmt_disables(ivl_stmt_init_stmt(s), target, tasks_seen)
+         || stmt_disables(ivl_stmt_sub_stmt(s), target, tasks_seen)
+         || stmt_disables(ivl_stmt_step_stmt(s), target, tasks_seen);
+   case IVL_ST_DELAY:
+   case IVL_ST_DELAYX:
+   case IVL_ST_WAIT:
+   case IVL_ST_WHILE:
+   case IVL_ST_DO_WHILE:
+   case IVL_ST_FOREVER:
+   case IVL_ST_REPEAT:
+      return stmt_disables(ivl_stmt_sub_stmt(s), target, tasks_seen);
+   case IVL_ST_UTASK:
+      {
+         ivl_scope_t t = ivl_stmt_call(s);
+         if (t == NULL || !tasks_seen.insert(t).second)
+            return false;
+         return stmt_disables(ivl_scope_def(t), target, tasks_seen);
+      }
+   default:
+      return false;
+   }
+}
+
+// When a disable inside `body' names `scope': a fresh `sv_dis_<n>: loop',
+// with `scope' pushed as a disable target (pop with end_disable_scope).
+static vhdl_labeled_loop_stmt *begin_disable_scope(ivl_scope_t scope,
+                                                   ivl_statement_t body)
+{
+   std::set<ivl_scope_t> seen;
+   if (scope == NULL || !stmt_disables(body, scope, seen))
+      return NULL;
+   std::ostringstream ss;
+   ss << "sv_dis_" << ++g_disable_count;
+   vhdl_labeled_loop_stmt *loop = new vhdl_labeled_loop_stmt(ss.str());
+   ostringstream cs;
+   cs << "Leaves " << ivl_scope_name(scope) << " on a disable";
+   loop->set_comment(cs.str());
+   disable_target_t t;
+   t.scope = scope;
+   t.label = ss.str();
+   g_disable_targets.push_back(t);
+   return loop;
+}
+
+// The loop gets its closing `exit <label>;' and joins the container
+static void end_disable_scope(stmt_container *container,
+                              vhdl_labeled_loop_stmt *loop)
+{
+   assert(!g_disable_targets.empty());
+   g_disable_targets.pop_back();
+   loop->get_container()->add_stmt(new vhdl_exit_stmt(loop->get_label()));
+   container->add_stmt(loop);
+}
+
+static int draw_disable(vhdl_procedural *, stmt_container *container,
+                        ivl_statement_t stmt)
+{
+   ivl_scope_t target = ivl_stmt_call(stmt);
+   for (std::vector<disable_target_t>::reverse_iterator it =
+           g_disable_targets.rbegin(); it != g_disable_targets.rend(); ++it) {
+      if (it->scope != target)
+         continue;
+      vhdl_seq_stmt *s;
+      if (it->label.empty())
+         s = new vhdl_return_stmt(it->result);
+      else
+         s = new vhdl_exit_stmt(it->label);
+      ostringstream cs;
+      cs << (ivl_stmt_flow_control(stmt) ? "return" : "disable") << " "
+         << ivl_scope_name(target) << " (" << ivl_stmt_file(stmt) << ":"
+         << ivl_stmt_lineno(stmt) << ")";
+      s->set_comment(cs.str());
+      container->add_stmt(s);
+      return 0;
+   }
+   if (target == NULL)
+      error("unsupported construct (fork) at %s:%d: disable fork has no VHDL "
+            "translation", ivl_stmt_file(stmt), ivl_stmt_lineno(stmt));
+   else
+      error("%s:%d: disable %s has no VHDL translation: only a block, task "
+            "or function that encloses the disable statement, in the same "
+            "process, can be disabled", ivl_stmt_file(stmt),
+            ivl_stmt_lineno(stmt), ivl_scope_name(target));
+   return 1;
+}
+
+static void reset_automatic_vars(vhdl_procedural *proc, stmt_container *container,
+                                 ivl_scope_t scope, bool task);
 
 /*
  * Generate VHDL for a block of Verilog statements. If this block
@@ -1093,10 +1436,23 @@ static int draw_block(vhdl_procedural *proc, stmt_container *container,
          // Guard against re-entry: when a parent module elaborates this same
          // block via different paths (e.g. in iterated/loop unrolling), the
          // signal may already be remembered. remember_signal asserts on dups.
-         if (!seen_signal_before(sig))
+         if (!seen_signal_before(sig)) {
             remember_signal(sig, proc->get_scope());
+            // A block local is a variable of its own.  When its name is
+            // already visible here -- a module signal or port of the same
+            // name, matched case-insensitively -- give it a fresh one, or
+            // its uses would read and write that signal instead.
+            std::string name = make_safe_name(sig);
+            if (proc->get_scope()->have_declared(name)) {
+               std::string fresh = name + "_blk";
+               for (int k = 2; proc->get_scope()->have_declared(fresh); k++)
+                  fresh = name + "_blk" + std::to_string(k);
+               name = fresh;
+            }
+            rename_signal(sig, name);
+         }
 
-         std::string safe_name = make_safe_name(sig);
+         std::string safe_name = get_renamed_signal(sig);
          if (!proc->get_scope()->have_declared(safe_name)) {
             proc->get_scope()->add_decl
                (new vhdl_var_decl(safe_name, vhdl_type_for_signal(sig)));
@@ -1104,13 +1460,35 @@ static int draw_block(vhdl_procedural *proc, stmt_container *container,
       }
    }
 
+   // A block with its own scope (a named block, or one with declarations) is
+   // the scope %m and the Scope line of $error & co. name inside it
+   // (top.blk, as vvp does).
+   ivl_scope_t prev_scope = get_active_scope();
+   if (block_scope)
+      set_active_scope(block_scope);
+
+   // A named block that a disable inside it leaves: its statements go in a
+   // loop the disable exits (begin_disable_scope)
+   vhdl_labeled_loop_stmt *dloop = begin_disable_scope(block_scope, stmt);
+   stmt_container *body = dloop ? dloop->get_container() : container;
+
+   // An automatic block (inside an automatic task, say) starts afresh each
+   // time it is entered: its variables are x again
+   if (block_scope && ivl_scope_is_auto(block_scope))
+      reset_automatic_vars(proc, body, block_scope, false);
+
+   int rc = 0;
    int count = ivl_stmt_block_count(stmt);
-   for (int i = 0; i < count; i++) {
+   for (int i = 0; i < count && rc == 0; i++) {
       ivl_statement_t stmt_i = ivl_stmt_block_stmt(stmt, i);
-      if (draw_stmt(proc, container, stmt_i, is_last && i == count - 1) != 0)
-         return 1;
+      if (draw_stmt(proc, body, stmt_i,
+                    dloop == NULL && is_last && i == count - 1) != 0)
+         rc = 1;
    }
-   return 0;
+   if (dloop)
+      end_disable_scope(container, dloop);
+   set_active_scope(prev_scope);
+   return rc;
 }
 
 /*
@@ -1228,6 +1606,115 @@ assign_for(vhdl_decl::assign_type_t atype, vhdl_var_ref *lhs, vhdl_expr *rhs)
 }
 
 /*
+ * An automatic scope's variables start every activation afresh: x, or 0 for
+ * a 2-state one (IEEE 1800 6.21), as vvp's %alloc gives them. The translation
+ * keeps one copy -- a task's variables are architecture signals, a block's
+ * process variables -- so without this an output the task does not assign
+ * in a call returned the last call's value, and a local read before it is
+ * written saw it. task: reset only the task's locals and outputs (the call
+ * assigns its inputs); else every variable of the block scope. A blocking
+ * assignment as draw_assign makes it: a deposit in an initial process, and a
+ * blocking target, so a read that follows waits for it.
+ */
+static void reset_automatic_vars(vhdl_procedural *proc, stmt_container *container,
+                                 ivl_scope_t scope, bool task)
+{
+   int nsigs = ivl_scope_sigs(scope);
+   for (int i = 0; i < nsigs; i++) {
+      ivl_signal_t sig = ivl_scope_sig(scope, i);
+      ivl_signal_port_t pt = ivl_signal_port(sig);
+      if (task && pt != IVL_SIP_NONE && pt != IVL_SIP_OUTPUT)
+         continue;
+      if (!seen_signal_before(sig))
+         continue;
+      vhdl_decl *decl = proc->get_scope()->get_decl(get_renamed_signal(sig));
+      if (decl == NULL || decl->get_type() == NULL)
+         continue;
+      const vhdl_type *t = decl->get_type();
+      const char *bit = ivl_signal_data_type(sig) == IVL_VT_BOOL
+         ? "L3D_0" : "L3D_X";
+      vhdl_expr *v = NULL;
+      switch (t->get_name()) {
+      case VHDL_TYPE_LOGIC3D:
+         v = new vhdl_var_ref(bit, vhdl_type::logic3d());
+         break;
+      case VHDL_TYPE_LOGIC3D_VECTOR:
+         v = new vhdl_var_ref((std::string("(others => ") + bit + ")").c_str(),
+                              new vhdl_type(*t));
+         break;
+      case VHDL_TYPE_REAL:
+         v = new vhdl_const_real(0.0);
+         break;
+      case VHDL_TYPE_INTEGER:
+         v = new vhdl_const_int(0);
+         break;
+      default:
+         break;      // an array (memory) local: not reset
+      }
+      if (v == NULL)
+         continue;
+      vhdl_var_ref *lhs = new vhdl_var_ref(decl->get_name(), new vhdl_type(*t));
+      vhdl_decl::assign_type_t atype = decl->assignment_type();
+      if (atype == vhdl_decl::ASSIGN_NONBLOCK) {
+         proc->add_blocking_target(lhs);
+         if (proc->get_scope()->initializing()
+             || proc->was_deposited(lhs->get_name())) {
+            atype = vhdl_decl::ASSIGN_BLOCK;
+            proc->mark_deposited(lhs->get_name());
+         }
+      }
+      vhdl_abstract_assign_stmt *a = assign_for(atype, lhs, v);
+      ostringstream ss;
+      ss << "automatic " << ivl_scope_name(scope) << ": a fresh activation";
+      a->set_comment(ss.str());
+      container->add_stmt(a);
+   }
+}
+
+/*
+ * IVL_ST_ALLOC / IVL_ST_FREE: the start and end of an automatic task's
+ * activation, around its call. Tasks are inlined (draw_utask) on one copy of
+ * their variables, so ALLOC starts a fresh activation (reset_automatic_vars)
+ * and FREE is nothing -- as long as no two activations can overlap: a task
+ * called from one process only, never recursively (draw_utask refuses
+ * recursion). Calls from two processes have no translation (they would share
+ * the one copy, and drive its signals from two processes): a located error.
+ */
+static std::map<ivl_scope_t, std::pair<ivl_process_t, std::string> > g_auto_task_site;
+
+static int draw_alloc_free(vhdl_procedural *proc, stmt_container *container,
+                           ivl_statement_t stmt)
+{
+   ivl_scope_t scope = ivl_stmt_call(stmt);
+   const bool alloc = ivl_statement_type(stmt) == IVL_ST_ALLOC;
+   if (scope == NULL || ivl_scope_type(scope) != IVL_SCT_TASK) {
+      error("%s:%d: no VHDL translation for the %s of automatic scope %s",
+            ivl_stmt_file(stmt), ivl_stmt_lineno(stmt),
+            alloc ? "allocation" : "release",
+            scope ? ivl_scope_name(scope) : "?");
+      return 1;
+   }
+   if (!alloc)
+      return 0;
+   ivl_process_t here = get_active_ivl_process();
+   ostringstream site;
+   site << ivl_stmt_file(stmt) << ":" << ivl_stmt_lineno(stmt);
+   std::map<ivl_scope_t, std::pair<ivl_process_t, std::string> >::iterator it =
+      g_auto_task_site.find(scope);
+   if (it == g_auto_task_site.end())
+      g_auto_task_site[scope] = std::make_pair(here, site.str());
+   else if (it->second.first != here) {
+      error("%s: automatic task %s is called from more than one process "
+            "(here, and at %s): its activations would share one copy of its "
+            "variables in VHDL, which has no translation", site.str().c_str(),
+            ivl_scope_name(scope), it->second.second.c_str());
+      return 1;
+   }
+   reset_automatic_vars(proc, container, scope, true);
+   return 0;
+}
+
+/*
  * Check that this assignment type is valid within the context of `proc'.
  * For example, a <= assignment is not valid within a function.
  */
@@ -1307,6 +1794,50 @@ static void emit_wait_for_0(vhdl_procedural *proc,
    }
 }
 
+// True if evaluating `e' reads a net (wire, tri, tri0/tri1, an input
+// port...): only a net value can carry a pull or weak strength.
+static bool expr_reads_net(ivl_expr_t e)
+{
+   if (e == NULL)
+      return false;
+   switch (ivl_expr_type(e)) {
+   case IVL_EX_SIGNAL:
+      return ivl_signal_type(ivl_expr_signal(e)) != IVL_SIT_REG;
+   case IVL_EX_SELECT:
+   case IVL_EX_BINARY:
+      return expr_reads_net(ivl_expr_oper1(e))
+         || expr_reads_net(ivl_expr_oper2(e));
+   case IVL_EX_UNARY:
+      return expr_reads_net(ivl_expr_oper1(e));
+   case IVL_EX_TERNARY:
+      return expr_reads_net(ivl_expr_oper2(e))
+         || expr_reads_net(ivl_expr_oper3(e));
+   case IVL_EX_CONCAT:
+      for (unsigned i = 0; i < ivl_expr_parms(e); i++)
+         if (expr_reads_net(ivl_expr_parm(e, i)))
+            return true;
+      return false;
+   default:
+      return false;
+   }
+}
+
+// A Verilog variable holds a 4-state value and no strength: a scalar read
+// of a net that a pull, a tri1/tri0 or an AMS BIDIR A2D drives weakly
+// (L3D_H/L/W) is stored strong, so the variable reads -- and drives,
+// through a continuous assignment -- like Verilog's (H -> 1, L -> 0, W ->
+// X; l3d_strengthen keeps Z, X and U).  Identity on strong values.
+static vhdl_expr *variable_value(vhdl_expr *rhs, ivl_expr_t src)
+{
+   if (!get_sv2vhdl_mode() || rhs == NULL || rhs->get_type() == NULL
+       || rhs->get_type()->get_name() != VHDL_TYPE_LOGIC3D
+       || !expr_reads_net(src))
+      return rhs;
+   vhdl_fcall *f = new vhdl_fcall("l3d_strengthen", vhdl_type::logic3d());
+   f->add_expr(rhs);
+   return f;
+}
+
 // Generate an assignment of type T for the Verilog statement stmt.
 // If a statement was generated then `assign_type' will contain the
 // type of assignment that was generated; this should be initialised
@@ -1350,6 +1881,7 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
       ? ivl_stmt_opcode(stmt) : 0;
    if (comp_op && lvals.size() == 1) {
       vhdl_binop_t binop;
+      bool shift = false;
       switch (comp_op) {
       case '+': binop = VHDL_BINOP_ADD; break;
       case '-': binop = VHDL_BINOP_SUB; break;
@@ -1359,32 +1891,92 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
       case '&': binop = VHDL_BINOP_AND; break;
       case '|': binop = VHDL_BINOP_OR; break;
       case '^': binop = VHDL_BINOP_XOR; break;
-      case 'l': binop = VHDL_BINOP_SL; break;
-      case 'r': binop = VHDL_BINOP_SR; break;
+      case 'l': binop = VHDL_BINOP_SL; shift = true; break;
+      case 'r': binop = VHDL_BINOP_SR; shift = true; break;
+      case 'R':    // >>>=: arithmetic on a signed target only, as for >>>
+         binop = ivl_signal_signed(ivl_lval_sig(ivl_stmt_lval(stmt, 0)))
+            ? VHDL_BINOP_SRA : VHDL_BINOP_SR;
+         shift = true;
+         break;
       default:
-         cerr << "Warning: unsupported compressed assignment op '"
-              << comp_op << "'" << endl;
-         binop = VHDL_BINOP_ADD;
+         // Never a silent stand-in operator
+         error("%s:%d: no VHDL translation for the compressed assignment "
+               "operator '%c='", ivl_stmt_file(stmt), ivl_stmt_lineno(stmt),
+               comp_op);
+         return;
       }
       // Build: lhs <op> rhs
       vhdl_var_ref *lhs_read =
          make_assign_lhs(ivl_stmt_lval(stmt, 0), proc->get_scope());
-      // The implicit read joins Verilog width propagation like any operand:
-      // a scalar meeting a wider RHS (e.g. `bit |= 5'h01 & ...`) computes at
-      // the wide width and the assignment cast truncates back to the LHS.
-      // Mirrors translate_binary's operand normalization, which this
-      // hand-built binop otherwise bypasses.
-      vhdl_expr *lhs_x = lhs_read;
-      if (get_sv2vhdl_mode() && lhs_x->get_type() && rhs->get_type()) {
-         vhdl_type_name_t lt = lhs_x->get_type()->get_name();
-         vhdl_type_name_t rt = rhs->get_type()->get_name();
-         if (lt == VHDL_TYPE_LOGIC3D && rt == VHDL_TYPE_LOGIC3D_VECTOR)
-            lhs_x = lhs_x->cast(rhs->get_type());
-         else if (rt == VHDL_TYPE_LOGIC3D && lt == VHDL_TYPE_LOGIC3D_VECTOR)
-            rhs = rhs->cast(lhs_x->get_type());
+      if (shift && lhs_read->get_type() != NULL) {
+         // The shift count is self-determined: an integer (l3d_shcount for
+         // a vector, as translate_shift does), never width-merged with the
+         // shifted operand
+         vhdl_expr *count;
+         if (rhs->get_type()
+             && rhs->get_type()->get_name() == VHDL_TYPE_LOGIC3D_VECTOR) {
+            vhdl_fcall *sc = new vhdl_fcall("l3d_shcount", vhdl_type::integer());
+            sc->add_expr(rhs);
+            count = sc;
+         }
+         else {
+            vhdl_type integer(VHDL_TYPE_INTEGER);
+            count = rhs->cast(&integer);
+         }
+         const vhdl_type *lt = new vhdl_type(*lhs_read->get_type());
+         if (binop == VHDL_BINOP_SRA) {
+            vhdl_fcall *sra = new vhdl_fcall(
+               lt->get_name() == VHDL_TYPE_LOGIC3D_VECTOR ? "l3d_sra"
+                                                          : "shift_right", lt);
+            sra->add_expr(lhs_read);
+            sra->add_expr(count);
+            rhs = sra;
+         }
+         else
+            rhs = new vhdl_binop_expr(lhs_read, binop, count, lt);
       }
-      rhs = new vhdl_binop_expr(lhs_x, binop, rhs,
-                                new vhdl_type(*lhs_x->get_type()));
+      else {
+         // The implicit read joins Verilog width propagation like any operand:
+         // a scalar meeting a wider RHS (e.g. `bit |= 5'h01 & ...`) computes at
+         // the wide width and the assignment cast truncates back to the LHS.
+         // Mirrors translate_binary's operand normalization, which this
+         // hand-built binop otherwise bypasses.
+         vhdl_expr *lhs_x = lhs_read;
+         if (get_sv2vhdl_mode() && lhs_x->get_type() && rhs->get_type()) {
+            vhdl_type_name_t lt = lhs_x->get_type()->get_name();
+            vhdl_type_name_t rt = rhs->get_type()->get_name();
+            if (lt == VHDL_TYPE_LOGIC3D && rt == VHDL_TYPE_LOGIC3D_VECTOR)
+               lhs_x = lhs_x->cast(rhs->get_type());
+            else if (rt == VHDL_TYPE_LOGIC3D && lt == VHDL_TYPE_LOGIC3D_VECTOR)
+               rhs = rhs->cast(lhs_x->get_type());
+         }
+         // A signed /= or %= (a whole signed target, a signed right-hand
+         // side) divides signed, as translate_binary's / and % do: the
+         // logic3d_vector "/" and "mod" are unsigned.
+         ivl_lval_t lv0 = ivl_stmt_lval(stmt, 0);
+         ivl_signal_t ls0 = ivl_lval_sig(lv0);
+         if (get_sv2vhdl_mode()
+             && (binop == VHDL_BINOP_DIV || binop == VHDL_BINOP_MOD)
+             && ls0 != NULL && ivl_signal_signed(ls0) && ivl_expr_signed(rval)
+             && ivl_lval_part_off(lv0) == NULL
+             && ivl_lval_width(lv0) == ivl_signal_width(ls0)
+             && lhs_x->get_type() && rhs->get_type()
+             && lhs_x->get_type()->get_name() == VHDL_TYPE_LOGIC3D_VECTOR
+             && rhs->get_type()->get_name() == VHDL_TYPE_LOGIC3D_VECTOR) {
+            const char *fn = "l3d_div_s";
+            if (binop == VHDL_BINOP_MOD) {
+               require_support_function(SF_REM_SIGNED);
+               fn = support_function::function_name(SF_REM_SIGNED);
+            }
+            vhdl_fcall *f = new vhdl_fcall(fn, new vhdl_type(*lhs_x->get_type()));
+            f->add_expr(lhs_x);
+            f->add_expr(rhs);
+            rhs = f;
+         }
+         else
+            rhs = new vhdl_binop_expr(lhs_x, binop, rhs,
+                                      new vhdl_type(*lhs_x->get_type()));
+      }
    }
 
    emit_wait_for_0(proc, container, stmt, rhs);
@@ -1595,6 +2187,7 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
          }
          else
             rhs = rhs->cast(lhs->get_type());
+         rhs = variable_value(rhs, rval);
       }
 
       ivl_expr_t i_delay;
@@ -1620,7 +2213,7 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
       // if statement (eliminates a function call and produces
       // more idiomatic code)
       if (ivl_expr_type(rval) == IVL_EX_TERNARY && rhs2 != NULL) {
-         rhs2 = rhs2->cast(lhs->get_type());
+         rhs2 = variable_value(rhs2->cast(lhs->get_type()), rval);
          vhdl_var_ref *lhs2 =
             make_assign_lhs(ivl_stmt_lval(stmt, 0), proc->get_scope());
 
@@ -1762,6 +2355,45 @@ static int draw_nbassign(vhdl_procedural *proc, stmt_container *container,
    return 0;
 }
 
+// The $random(seed) calls in an expression whose seed is a variable, one per
+// seed variable (draw_assign advances each seed after the assignment).
+static void find_seeded_random(ivl_expr_t e, std::vector<ivl_expr_t> &out)
+{
+   if (e == NULL)
+      return;
+   switch (ivl_expr_type(e)) {
+   case IVL_EX_SFUNC:
+      if (strcmp(ivl_expr_name(e), "$random") == 0 && ivl_expr_parms(e) >= 1
+          && ivl_expr_type(ivl_expr_parm(e, 0)) == IVL_EX_SIGNAL) {
+         ivl_signal_t s = ivl_expr_signal(ivl_expr_parm(e, 0));
+         for (size_t k = 0; k < out.size(); k++)
+            if (ivl_expr_signal(ivl_expr_parm(out[k], 0)) == s)
+               return;
+         out.push_back(e);
+      }
+      return;
+   case IVL_EX_SELECT:
+   case IVL_EX_BINARY:
+      find_seeded_random(ivl_expr_oper1(e), out);
+      find_seeded_random(ivl_expr_oper2(e), out);
+      return;
+   case IVL_EX_UNARY:
+      find_seeded_random(ivl_expr_oper1(e), out);
+      return;
+   case IVL_EX_TERNARY:
+      find_seeded_random(ivl_expr_oper1(e), out);
+      find_seeded_random(ivl_expr_oper2(e), out);
+      find_seeded_random(ivl_expr_oper3(e), out);
+      return;
+   case IVL_EX_CONCAT:
+      for (unsigned i = 0; i < ivl_expr_parms(e); i++)
+         find_seeded_random(ivl_expr_parm(e, i), out);
+      return;
+   default:
+      return;
+   }
+}
+
 static int draw_assign(vhdl_procedural *proc, stmt_container *container,
                        ivl_statement_t stmt)
 {
@@ -1791,12 +2423,14 @@ static int draw_assign(vhdl_procedural *proc, stmt_container *container,
    // to the seed so the next call sees the advanced state. Emitted as a normal
    // assignment, so it is `:=` for a variable seed and `<=` for a signal seed --
    // no inout param needed, and it composes with any target lvalue.
-   if (get_sv2vhdl_mode() && ivl_stmt_lvals(stmt) == 1) {
-      ivl_expr_t rval = ivl_stmt_rval(stmt);
-      if (rval && ivl_expr_type(rval) == IVL_EX_SFUNC
-          && strcmp(ivl_expr_name(rval), "$random") == 0
-          && ivl_expr_parms(rval) >= 1
-          && ivl_expr_type(ivl_expr_parm(rval, 0)) == IVL_EX_SIGNAL) {
+   // The call may sit inside the right-hand side (`x = $random(s) % 8'):
+   // its seed advances all the same.
+   std::vector<ivl_expr_t> seeded;
+   if (get_sv2vhdl_mode() && ivl_stmt_lvals(stmt) == 1)
+      find_seeded_random(ivl_stmt_rval(stmt), seeded);
+   for (size_t k = 0; k < seeded.size(); k++) {
+      ivl_expr_t rval = seeded[k];
+      {
          ivl_signal_t ssig = ivl_expr_signal(ivl_expr_parm(rval, 0));
          string sname = get_renamed_signal(ssig);
          vhdl_decl *sdecl = proc->get_scope()->get_decl(sname);
@@ -1891,6 +2525,66 @@ static void get_nexuses_from_expr(ivl_expr_t expr, set<ivl_nexus_t> &out)
    default:
       break;
    }
+}
+
+// The NBA wake-shadow close (draw_wait) is on unless SV2VHDL_NBA_SHADOW=0.
+static bool nba_shadow_enabled()
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *e = getenv("SV2VHDL_NBA_SHADOW");
+      on = (e == NULL || atoi(e) != 0);
+   }
+   return on != 0 && get_sv2vhdl_mode();
+}
+
+// One trigger of an edge-triggered process watched across the NBA shadow:
+// the scalar logic3d signal, its snapshot variable, and the edge kind (-1
+// fall, +1 rise).  Empty `sig' when the trigger is not eligible.
+struct shadow_arm_t {
+   std::string sig, snap;
+   int kind;
+};
+
+static shadow_arm_t shadow_arm_for(vhdl_process *proc, ivl_nexus_t nex,
+                                   int kind)
+{
+   shadow_arm_t arm = { "", "", kind };
+   vhdl_var_ref *ref = nexus_to_var_ref(proc->get_scope(), nex);
+   if (ref != NULL && ref->get_type() != NULL && ref->get_slice() == NULL
+       && ref->get_type()->get_name() == VHDL_TYPE_LOGIC3D) {
+      arm.sig = ref->get_name();
+      arm.snap = "v_icg2en_snap_" + arm.sig;
+      while (proc->get_scope()->have_declared(arm.snap))
+         arm.snap += "_";
+   }
+   return arm;
+}
+
+// The "missed edge" term of an arm: the trigger now sits on the edge's
+// far side while its snapshot (taken before the NBA wait) did not.
+static vhdl_expr *shadow_missed_edge(const shadow_arm_t &arm)
+{
+   const char *fn = (arm.kind < 0) ? "is_zero" : "is_one";
+   vhdl_fcall *now_f = new vhdl_fcall(fn, vhdl_type::boolean());
+   now_f->add_expr(new vhdl_var_ref(arm.sig.c_str(), vhdl_type::logic3d()));
+   vhdl_fcall *was_f = new vhdl_fcall(fn, vhdl_type::boolean());
+   was_f->add_expr(new vhdl_var_ref(arm.snap.c_str(), vhdl_type::logic3d()));
+   return new vhdl_binop_expr(
+      now_f, VHDL_BINOP_AND,
+      new vhdl_unaryop_expr(VHDL_UNARYOP_NOT, was_f, vhdl_type::boolean()),
+      vhdl_type::boolean());
+}
+
+// Declare an arm's snapshot and hand it to nba_defer_commits.  The initial
+// value keeps the missed-edge term false until the first snapshot.
+static void shadow_register(vhdl_process *proc, const shadow_arm_t &arm)
+{
+   vhdl_var_decl *sd = new vhdl_var_decl(arm.snap, vhdl_type::logic3d());
+   sd->set_initial(new vhdl_var_ref(arm.kind < 0 ? "L3D_0" : "L3D_1",
+                                    vhdl_type::logic3d()));
+   proc->get_scope()->add_decl(sd);
+   proc->add_icg2en_shadow(arm.sig, arm.snap, arm.kind);
 }
 
 /*
@@ -2034,6 +2728,41 @@ static bool draw_synthesisable_wait(vhdl_process *proc, stmt_container *containe
    else
       delete edge;
 
+   // NBA wake-shadow close for this template too (draw_wait has it for the
+   // generic shape): once nba_defer_commits gives the process its `wait
+   // for 0 ns' epilogue, it is on no pending list while it sits there, so
+   // a reset or clock edge settling later in the same instant (a derived
+   // reset; a testbench reset at a clock edge) would be lost for good.
+   // Snapshot both arms before that wait; when one moved, the process loops
+   // back instead of re-arming: the level reset test then sees an asserted
+   // reset, and the clock arm gets a missed-edge term.  An ICG2EN-rewritten
+   // clock term is left alone.
+   shadow_arm_t rst_arm = { "", "", 0 }, clk_arm = { "", "", 0 };
+   if (nba_shadow_enabled()) {
+      ivl_nexus_t rst_nex = *test_nexuses.begin();
+      int rst_kind = 0;
+      for (int i = 0; i < nevents; i++) {
+         ivl_event_t event = ivl_stmt_events(stmt, i);
+         for (unsigned j = 0; j < ivl_event_npos(event); j++)
+            if (ivl_event_pos(event, j) == rst_nex)
+               rst_kind = +1;
+         for (unsigned j = 0; j < ivl_event_nneg(event); j++)
+            if (ivl_event_neg(event, j) == rst_nex)
+               rst_kind = -1;
+      }
+      if (rst_kind != 0)
+         rst_arm = shadow_arm_for(proc, rst_nex, rst_kind);
+      if (!icg_rewrote) {
+         clk_arm = shadow_arm_for(proc, the_clock_net, clock_rising ? +1 : -1);
+         if (!clk_arm.sig.empty() && clk_arm.snap == rst_arm.snap)
+            clk_arm.snap += "_";
+         if (!clk_arm.sig.empty())
+            edge_test = new vhdl_binop_expr(edge_test, VHDL_BINOP_OR,
+                                            shadow_missed_edge(clk_arm),
+                                            vhdl_type::boolean());
+      }
+   }
+
    // Draw the clocked branch
    // For an asynchronous reset we just want this around the else branch,
    stmt_container *else_container = body->add_elsif(edge_test);
@@ -2049,6 +2778,11 @@ static bool draw_synthesisable_wait(vhdl_process *proc, stmt_container *containe
    }
    else
       container->add_stmt(body);
+
+   if (!rst_arm.sig.empty())
+      shadow_register(proc, rst_arm);
+   if (!clk_arm.sig.empty())
+      shadow_register(proc, clk_arm);
 
    // Add all the edge triggered signals to the sensitivity list (the
    // rewritten gated clock pends on the root instead)
@@ -2550,9 +3284,13 @@ static vhdl_expr *icg2en_pos_term(vhdl_process *proc, ivl_nexus_t gnex,
    const std::vector<ivl_nexus_t> &ens =
       en_const1 ? icg_no_ens : info.en_input_sets.back();
 
+   // (the active scope may be a named block, task or function inside it)
    ivl_scope_t module = get_active_scope();
    while (module != NULL && (ivl_scope_type(module) == IVL_SCT_GENERATE
-                             || ivl_scope_type(module) == IVL_SCT_BEGIN))
+                             || ivl_scope_type(module) == IVL_SCT_BEGIN
+                             || ivl_scope_type(module) == IVL_SCT_FORK
+                             || ivl_scope_type(module) == IVL_SCT_TASK
+                             || ivl_scope_type(module) == IVL_SCT_FUNCTION))
       module = ivl_scope_parent(module);
 
    // PORT MODE: the gated net arrives through this module\'s own clock
@@ -3345,7 +4083,13 @@ static int draw_wait(vhdl_procedural *_proc, stmt_container *container,
       // add all the events to the sensitivity list, otherwise
       // build a wait-on statement at the end of the process
 
-      draw_stmt(proc, container, ivl_stmt_sub_stmt(stmt), true);
+      // Inside a block (`@(a) stmt' after other statements, in an initial
+      // or a task) the event comes first: the statement runs once `a'
+      // changes, not before it (the end-of-process wait is only the
+      // top-level loop form).  Draw the body aside, place the wait first.
+      stmt_container body_aside;
+      draw_stmt(proc, is_top_level ? container : &body_aside,
+                ivl_stmt_sub_stmt(stmt), true);
 
       vhdl_wait_stmt *wait = NULL;
       if (proc->contains_wait_stmt() || !is_top_level)
@@ -3369,6 +4113,8 @@ static int draw_wait(vhdl_procedural *_proc, stmt_container *container,
 
       if (wait)
          container->add_stmt(wait);
+      if (!is_top_level)
+         container->move_stmts_from(&body_aside);
    }
    else {
       // Build a test expression to represent the edge event
@@ -3646,12 +4392,33 @@ static int draw_if(vhdl_procedural *proc, stmt_container *container,
    return 0;
 }
 
+/*
+ * Verilog case equality compares 4-state values, never strengths (IEEE
+ * 1364 9.5; a strength is not part of an expression's value): a pull or
+ * weak 1 -- a released pad's pull-up, a tri1 net, the weak drive an AMS
+ * BIDIR A2D puts on an inout -- matches 1'b1, a weak unknown matches
+ * 1'bx.  Map a scalar logic3d onto the strong codes the case items carry:
+ * l3d_strengthen(l3d_weaken(x)) is L,0 -> 0; H,1 -> 1; Z -> Z; W,X,U -> X.
+ */
+static vhdl_expr *case_value_l3d(vhdl_expr *e)
+{
+   vhdl_fcall *weak = new vhdl_fcall("l3d_weaken", vhdl_type::logic3d());
+   weak->add_expr(e);
+   vhdl_fcall *strong = new vhdl_fcall("l3d_strengthen", vhdl_type::logic3d());
+   strong->add_expr(weak);
+   return strong;
+}
+
 static vhdl_var_ref *draw_case_test(vhdl_procedural *proc, stmt_container *container,
                                     ivl_statement_t stmt)
 {
    vhdl_expr *test = translate_expr(ivl_stmt_cond_expr(stmt));
    if (NULL == test)
       return NULL;
+
+   // The selector may read the target of a blocking assignment just made
+   // (`r = pad; case (r)'): let it settle first, as draw_if does
+   emit_wait_for_0(proc, container, stmt, test);
 
    // In sv2vhdl mode, extract the unsigned value field for case matching
    if (get_sv2vhdl_mode() && test->get_type()
@@ -3662,19 +4429,28 @@ static vhdl_var_ref *draw_case_test(vhdl_procedural *proc, stmt_container *conta
       conv->add_expr(test);
       test = conv;
    }
+   // A scalar selector is compared without its strength (case_value_l3d);
+   // casez/casex take it from here too (draw_casezx_l3d)
+   else if (get_sv2vhdl_mode() && test->get_type()
+            && test->get_type()->get_name() == VHDL_TYPE_LOGIC3D)
+      test = case_value_l3d(test);
 
    // VHDL case expressions are required to be quite simple: variable
    // references or slices. So we may need to create a temporary
    // variable to hold the result of the expression evaluation
    if (typeid(*test) != typeid(vhdl_var_ref)) {
       // Find a unique name for the case expression variable.
-      // Nested cases may have different widths, so we need separate variables.
+      // Nested cases may have different widths or types (a scalar logic3d
+      // and a 1-bit unsigned are both one wide), so they need separate
+      // variables.
       const vhdl_type *test_type = new vhdl_type(*test->get_type());
       std::string tmp_name_str = "Verilog_Case_Ex";
       int suffix = 0;
       while (proc->get_scope()->have_declared(tmp_name_str)
-             && proc->get_scope()->get_decl(tmp_name_str)->get_type()->get_width()
-                != test_type->get_width()) {
+             && (proc->get_scope()->get_decl(tmp_name_str)->get_type()->get_width()
+                    != test_type->get_width()
+                 || proc->get_scope()->get_decl(tmp_name_str)->get_type()->get_name()
+                    != test_type->get_name())) {
          tmp_name_str = "Verilog_Case_Ex_" + std::to_string(++suffix);
       }
 
@@ -3729,8 +4505,14 @@ static int draw_case(vhdl_procedural *proc, stmt_container *container,
 
          vhdl_expr *when = translate_expr(net);
          if (!when) return 1;
+         emit_wait_for_0(proc, container, stmt, when);
          when = when->cast(test->get_type());
          if (!when) return 1;
+         // A scalar item is a value too (`case (1'b1) pad:'): drop its
+         // strength as the selector's was (draw_case_test)
+         if (get_sv2vhdl_mode() && test->get_type()
+             && test->get_type()->get_name() == VHDL_TYPE_LOGIC3D)
+            when = case_value_l3d(when);
 
          vhdl_expr *cmp = new vhdl_binop_expr(
             new vhdl_var_ref(test->get_name().c_str(), test->get_type()),
@@ -4153,6 +4935,110 @@ static bool process_expr_bits(vhdl_binop_expr *all, vhdl_var_ref *test,
 }
 
 
+// L3D_<bit> (0, 1, X or Z) in sv2vhdl mode
+static vhdl_expr *l3d_const(char bit)
+{
+   return new vhdl_const_bit(bit);
+}
+
+static vhdl_expr *l3d_eq(vhdl_expr *a, vhdl_expr *b)
+{
+   return new vhdl_binop_expr(a, VHDL_BINOP_EQ, b, vhdl_type::boolean());
+}
+
+/*
+ * casez/casex on a scalar selector (sv2vhdl mode).  The selector arrives
+ * canonical from draw_case_test (0, 1, X or Z, strength dropped); each
+ * 1-bit item matches when it equals the selector or either side is a
+ * don't-care: Z (and ?) for casez, X and Z for casex (IEEE 1364 9.5.1).
+ * Returns -1 when the statement is not of that shape (an item wider than
+ * the selector): the caller reports it.
+ */
+static int draw_casezx_l3d(vhdl_procedural *proc, stmt_container *container,
+                           ivl_statement_t stmt, bool is_last,
+                           vhdl_var_ref *test)
+{
+   const bool is_casez = ivl_statement_type(stmt) == IVL_ST_CASEZ;
+   const int nbranches = ivl_stmt_case_count(stmt);
+   for (int i = 0; i < nbranches; i++) {
+      ivl_expr_t net = ivl_stmt_case_expr(stmt, i);
+      if (net && ivl_expr_width(net) != 1)
+         return -1;
+   }
+
+   const string tname = test->get_name();
+   vhdl_if_stmt *result = NULL;
+   ivl_statement_t default_stmt = NULL;
+   for (int i = 0; i < nbranches; i++) {
+      ivl_expr_t net = ivl_stmt_case_expr(stmt, i);
+      if (net == NULL) {
+         default_stmt = ivl_stmt_case_stmt(stmt, i);
+         continue;
+      }
+      vhdl_binop_expr *any =
+         new vhdl_binop_expr(VHDL_BINOP_OR, vhdl_type::boolean());
+      // the selector's own don't-cares
+      any->add_expr(l3d_eq(new vhdl_var_ref(tname.c_str(), vhdl_type::logic3d()),
+                           l3d_const('z')));
+      if (!is_casez)
+         any->add_expr(l3d_eq(new vhdl_var_ref(tname.c_str(), vhdl_type::logic3d()),
+                              l3d_const('x')));
+      if (ivl_expr_type(net) == IVL_EX_NUMBER) {
+         const char bit = ivl_expr_bits(net)[0];
+         if (bit == 'z' || bit == '?' || (!is_casez && bit == 'x'))
+            any->add_expr(new vhdl_const_bool(true));
+         else
+            any->add_expr(l3d_eq(new vhdl_var_ref(tname.c_str(),
+                                                  vhdl_type::logic3d()),
+                                 l3d_const(bit)));
+      }
+      else {
+         // A non-constant item: its value, strength dropped, may itself be
+         // a don't-care.  (Translated once per use: trees are not shared.)
+         vhdl_type l3(VHDL_TYPE_LOGIC3D);
+         vhdl_expr *item[3];
+         for (int k = 0; k < 3; k++) {
+            item[k] = translate_expr(net);
+            if (item[k] == NULL)
+               return 1;
+            emit_wait_for_0(proc, container, stmt, item[k]);
+            item[k] = case_value_l3d(item[k]->cast(&l3));
+         }
+         any->add_expr(l3d_eq(item[0], l3d_const('z')));
+         if (!is_casez)
+            any->add_expr(l3d_eq(item[1], l3d_const('x')));
+         any->add_expr(l3d_eq(new vhdl_var_ref(tname.c_str(),
+                                               vhdl_type::logic3d()),
+                              item[2]));
+      }
+
+      stmt_container *where;
+      if (result == NULL) {
+         result = new vhdl_if_stmt(any);
+         where = result->get_then_container();
+      }
+      else
+         where = result->add_elsif(any);
+      draw_stmt(proc, where, ivl_stmt_case_stmt(stmt, i), is_last);
+   }
+
+   if (result == NULL) {
+      // Only a default
+      if (default_stmt)
+         draw_stmt(proc, container, default_stmt, is_last);
+      return 0;
+   }
+   if (default_stmt)
+      draw_stmt(proc, result->get_else_container(), default_stmt, is_last);
+
+   ostringstream ss;
+   ss << "Generated from case" << (is_casez ? 'z' : 'x')
+      << " statement at " << ivl_stmt_file(stmt) << ":" << ivl_stmt_lineno(stmt);
+   result->set_comment(ss.str());
+   container->add_stmt(result);
+   return 0;
+}
+
 /*
  * A casex/z statement cannot be directly translated to a VHDL case
  * statement as VHDL does not treat the don't-care bit as special.
@@ -4165,6 +5051,18 @@ int draw_casezx(vhdl_procedural *proc, stmt_container *container,
    vhdl_var_ref *test = draw_case_test(proc, container, stmt);
    if (NULL == test)
       return 1;
+
+   if (get_sv2vhdl_mode() && test->get_type()
+       && test->get_type()->get_name() == VHDL_TYPE_LOGIC3D) {
+      int rc = draw_casezx_l3d(proc, container, stmt, is_last, test);
+      if (rc >= 0)
+         return rc;
+      error("%s:%d: Sorry, a case%s statement with a 1-bit selector and "
+            "wider labels cannot be translated to VHDL", ivl_stmt_file(stmt),
+            ivl_stmt_lineno(stmt),
+            ivl_statement_type(stmt) == IVL_ST_CASEZ ? "z" : "x");
+      return 1;
+   }
 
    vhdl_if_stmt *result = NULL;
 
@@ -4335,11 +5233,48 @@ int draw_utask(vhdl_procedural *proc, stmt_container *container,
 {
    ivl_scope_t tscope = ivl_stmt_call(stmt);
 
+   // A SystemVerilog class task (a method) has no translation
+   ivl_scope_t towner = ivl_scope_parent(tscope);
+   if (towner != NULL && ivl_scope_type(towner) == IVL_SCT_CLASS) {
+      error("unsupported construct (class) at %s:%d: %s() of SystemVerilog "
+            "class %s has no VHDL translation", ivl_stmt_file(stmt),
+            ivl_stmt_lineno(stmt), ivl_scope_basename(tscope),
+            ivl_scope_tname(towner));
+      return 1;
+   }
+
    // TODO: adding some comments to the output would be helpful
 
-   // TODO: this completely ignores parameters!
-   draw_stmt(proc, container, ivl_scope_def(tscope), false);
+   // A task is inlined into its caller: a task that calls itself, directly
+   // or through another, would be inlined for ever (and an automatic one's
+   // activations would share one copy of its variables)
+   static std::set<ivl_scope_t> inlining;
+   if (inlining.count(tscope)) {
+      error("%s:%d: task %s calls itself (recursion): tasks are inlined in "
+            "VHDL, so a recursive task call has no translation",
+            ivl_stmt_file(stmt), ivl_stmt_lineno(stmt), ivl_scope_name(tscope));
+      return 1;
+   }
+   inlining.insert(tscope);
 
+   // The inlined body runs in the task's scope: %m and the Scope line of
+   // $error & co. name it (top.tk, as vvp does).
+   ivl_scope_t prev_scope = get_active_scope();
+   set_active_scope(tscope);
+
+   // A `disable <task>' (or SV `return') inside the task leaves the inlined
+   // body: it goes in a loop the disable exits (begin_disable_scope)
+   vhdl_labeled_loop_stmt *dloop =
+      begin_disable_scope(tscope, ivl_scope_def(tscope));
+
+   // TODO: this completely ignores parameters!
+   draw_stmt(proc, dloop ? dloop->get_container() : container,
+             ivl_scope_def(tscope), false);
+
+   if (dloop)
+      end_disable_scope(container, dloop);
+   set_active_scope(prev_scope);
+   inlining.erase(tscope);
    return 0;
 }
 
@@ -4651,6 +5586,21 @@ int draw_stmt(vhdl_procedural *proc, stmt_container *container,
 }
 
 /*
+ * A comment line ahead of the statement being drawn: a `null;' carrying
+ * it, for a note an expression makes (a system function replaced by a
+ * constant, expr.cc).  False outside a procedural statement.
+ */
+bool emit_pre_comment(const std::string &text)
+{
+   if (g_pre_container == NULL)
+      return false;
+   vhdl_null_stmt *note = new vhdl_null_stmt();
+   note->set_comment(text);
+   g_pre_container->add_stmt(note);
+   return true;
+}
+
+/*
  * $value$plusargs(fmt, var): emit, ahead of the current statement,
  *    if sv_value_plusargs(fmt) /= 0 then var := <converted plusarg>; end if;
  * (':=' or '<=' per the target's declaration, as for $random's seed).
@@ -4752,21 +5702,22 @@ static int draw_stmt_inner(vhdl_procedural *proc, stmt_container *container,
    case IVL_ST_RELEASE:
       return draw_release(proc, container, stmt);
    case IVL_ST_DISABLE:
-      {
-         // Verilog 'disable' exits a named scope block.
-         // In VHDL: inside a loop this would be 'exit', but iverilog also
-         // generates disable for function returns and block exits which
-         // are not inside loops. Since the for-loop step is now properly
-         // translated via compressed assignment expansion, the while
-         // condition handles termination — so null is safe here.
-         container->add_stmt(new vhdl_null_stmt());
-         return 0;
-      }
+      // Verilog `disable <scope>' and SV `return': leave the enclosing named
+      // block, task or function (draw_disable; it was drawn as `null', so
+      // the statements after it ran)
+      return draw_disable(proc, container, stmt);
+   case IVL_ST_ALLOC:
+   case IVL_ST_FREE:
+      // an automatic task's activation (draw_alloc_free)
+      return draw_alloc_free(proc, container, stmt);
    case IVL_ST_CASEX:
    case IVL_ST_CASEZ:
       return draw_casezx(proc, container, stmt, is_last);
    case IVL_ST_FORK:
-      error("fork statement cannot be translated to VHDL");
+   case IVL_ST_FORK_JOIN_ANY:
+   case IVL_ST_FORK_JOIN_NONE:
+      error("unsupported construct (fork) at %s:%d: a fork statement has no "
+            "VHDL translation", ivl_stmt_file(stmt), ivl_stmt_lineno(stmt));
       return 1;
    case IVL_ST_CASSIGN:
       // Procedural continuous assign: approximate with force (see draw_force)

@@ -14,6 +14,7 @@ void error(const char *fmt, ...);
 void debug_msg(const char *fmt, ...);
 
 int draw_scope(ivl_scope_t scope, void *_parent);
+void report_unplaced_pulls();
 extern "C" int draw_process(ivl_process_t net, void *cd);
 int draw_stmt(vhdl_procedural *proc, stmt_container *container,
               ivl_statement_t stmt, bool is_last = false);
@@ -60,7 +61,30 @@ void icg2en_note_label(ivl_scope_t scope, const std::string &label);
 vhdl_expr *index_to_integer(ivl_expr_t e, vhdl_expr *v);
 vhdl_var_ref* readable_ref(vhdl_scope* scope, ivl_nexus_t nex);
 std::string make_safe_name(ivl_signal_t sig);
+// The core's transparent buffer between an input port and a variable or
+// expression actual: drawn in the parent, per instance (scope.cc)
+bool is_input_port_buffer(ivl_net_logic_t log);
+// A core node between such a buffer and the port: the pad, prune or
+// instance-array split of the actual, drawn in the parent too (scope.cc)
+bool is_input_port_network_lpm(ivl_lpm_t lpm);
+// A buffer of that kind the translation cannot draw: reports the error
+bool untranslated_port_buffer(ivl_net_logic_t log);
+// Whether the one-way copy drawn for part-select tran `sw' needs the
+// "connected one way only" warning (scope.cc, T2)
+bool tran_vp_copy_needs_warning(vhdl_scope *sc, ivl_switch_t sw);
+// A part-select tran the port map draws (an inout port on a concatenation)
+bool tran_vp_drawn_by_port_map(ivl_switch_t sw);
+// A real signal or constant on the nexus: real temporaries, real arithmetic
+bool nexus_is_real(ivl_nexus_t nex);
 void require_support_function(support_function_t f);
+// disable / SV return (stmt.cc): a function body is drawn between these two,
+// so a disable of the function inside it is `return <result>;' and the
+// disable targets of the caller (a process drawing a package function on
+// demand) are out of its reach
+void begin_function_disables(ivl_scope_t fscope, const std::string &result);
+void end_function_disables();
+// The Verilog process draw_process is drawing (process.cc); NULL outside one
+ivl_process_t get_active_ivl_process();
 
 bool is_hoisted_signal(ivl_signal_t sig);
 void clear_hoisted_signal(ivl_signal_t sig);
