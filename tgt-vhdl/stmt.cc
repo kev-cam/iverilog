@@ -32,17 +32,32 @@
 #include <vector>
 #include <algorithm>
 #include <iomanip>
+#include <functional>
 
 using namespace std;
 
 static void emit_wait_for_0(vhdl_procedural *proc, stmt_container *container,
                             ivl_statement_t stmt, vhdl_expr *expr);
+static bool deposits_signal(vhdl_procedural *proc, const std::string &name,
+                            bool blocking, ivl_signal_t sig = NULL);
 static bool number_is_long(ivl_expr_t expr);
 static long get_number_as_long(ivl_expr_t expr);
 static vhdl_expr *icg2en_pos_term(vhdl_process *proc, ivl_nexus_t gnex,
                                   std::string *sens_name);
 bool icg2en_port_mode(ivl_scope_t scope, ivl_nexus_t gnex,
                       std::vector<std::string> *paths, bool use_labels);
+// Defined with the pre-statement hook (end of file): a loop test translated
+// with the hook's statements going to `pre' (draw_while), and $random /
+// $urandom called as a task
+static vhdl_expr *translate_loop_test(ivl_expr_t cond, stmt_container *pre);
+static int draw_stask_random(vhdl_procedural *proc, stmt_container *container,
+                             ivl_statement_t stmt);
+static int draw_while_drawn_test(vhdl_procedural *proc,
+                                 stmt_container *container,
+                                 ivl_statement_t stmt, ivl_statement_t step,
+                                 vhdl_expr *test, stmt_container *pre,
+                                 vhdl_labeled_loop_stmt *brk,
+                                 vhdl_labeled_loop_stmt *cont);
 
 /*
  * VHDL has no real equivalent of Verilog's $finish task. The
@@ -56,12 +71,34 @@ bool icg2en_port_mode(ivl_scope_t scope, ivl_nexus_t gnex,
  * in C. This function can be enabled with the flag
  * -puse-vhpi-finish=1.
  */
+/*
+ * $finish(0) and $stop(0) print nothing (IEEE 1364 17.4.1; vvp and VCS print
+ * their end message for 1 and 2, the default 1), where nvc's std.env.finish
+ * and std.env.stop always note "FINISH called" / "STOP called". A note
+ * "sv2vhdl: quiet end" just before the call tells the output filters
+ * (bin/vvp-sv2ghdl, vamos's OutputFilter) to drop the next one.
+ */
+static void quiet_end_marker(stmt_container *container, ivl_statement_t stmt)
+{
+   if (!get_sv2vhdl_mode() || ivl_stmt_parm_count(stmt) < 1)
+      return;
+   ivl_expr_t level = ivl_stmt_parm(stmt, 0);
+   if (level == NULL
+       || (ivl_expr_type(level) != IVL_EX_NUMBER
+           && ivl_expr_type(level) != IVL_EX_ULONG)
+       || !number_is_long(level) || get_number_as_long(level) != 0)
+      return;
+   container->add_stmt(new vhdl_report_stmt(
+      new vhdl_const_string("sv2vhdl: quiet end"), SEVERITY_NOTE));
+}
+
 static int draw_stask_finish(vhdl_procedural *, stmt_container *container,
-                             ivl_statement_t)
+                             ivl_statement_t stmt)
 {
    // Emit any $write text still waiting for a newline before ending
    if (get_sv2vhdl_mode())
       container->add_stmt(new vhdl_pcall_stmt("sv_write_flush"));
+   quiet_end_marker(container, stmt);
 
    const char *use_vhpi = ivl_design_flag(get_vhdl_design(), "use-vhpi-finish");
    if (strcmp(use_vhpi, "1") == 0) {
@@ -87,9 +124,10 @@ static int draw_stask_finish(vhdl_procedural *, stmt_container *container,
  * 0 after "STOP called". The optional diagnostic level argument is ignored.
  */
 static int draw_stask_stop(vhdl_procedural *, stmt_container *container,
-                           ivl_statement_t)
+                           ivl_statement_t stmt)
 {
    container->add_stmt(new vhdl_pcall_stmt("sv_write_flush"));
+   quiet_end_marker(container, stmt);
    container->add_stmt(new vhdl_pcall_stmt("std.env.stop"));
    return 0;
 }
@@ -117,14 +155,181 @@ static vhdl_expr *display_bool_as_bit(vhdl_expr *base)
    return base;
 }
 
+// A bare argument of a $fdisplayh/b/o-style task (dflt 'h', 'b' or 'o'):
+// every bit of it in that radix, as vvp prints it (get_numeric with
+// vpiHexStrVal / vpiBinStrVal / vpiOctStrVal).
+static vhdl_expr *display_radix_text(vhdl_expr *base, ivl_expr_t e, char dflt)
+{
+   const vhdl_type *t = base->get_type();
+   int w = ivl_expr_width(e);
+   if (w < 1)
+      w = 1;
+   vhdl_expr *v = base;
+   if (t != NULL && t->get_name() == VHDL_TYPE_INTEGER) {
+      vhdl_type l3(VHDL_TYPE_LOGIC3D_VECTOR, w - 1, 0);
+      v = base->cast(&l3);
+      t = v->get_type();
+   }
+   if (t == NULL || (t->get_name() != VHDL_TYPE_LOGIC3D
+                     && t->get_name() != VHDL_TYPE_LOGIC3D_VECTOR))
+      return base->cast(vhdl_type::string());
+   int hi = 0, lo = 0;
+   if (t->get_name() == VHDL_TYPE_LOGIC3D_VECTOR) {
+      hi = t->get_msb();
+      lo = t->get_lsb();
+   }
+   vhdl_fcall *slv = new vhdl_fcall("to_std_logic_vector",
+                                    vhdl_type::std_logic_vector(hi, lo));
+   slv->add_expr(v);
+   vhdl_fcall *f = new vhdl_fcall(dflt == 'h' ? "sv_hstr"
+                                  : dflt == 'b' ? "sv_bstr" : "sv_ostr",
+                                  vhdl_type::string());
+   f->add_expr(slv);
+   return f;
+}
+
+/*
+ * %m and the "Scope:" line of $error / $fatal / ...: the Verilog name of the
+ * scope the statement is in. In a module instantiated once that is a
+ * constant. A module instantiated more than once is one VHDL entity, drawn
+ * once, so a constant named the first instance in every instance (`sub u1(),
+ * u2();' printed tb.u1 twice, where vvp prints tb.u1 and tb.u2): there the
+ * name is the architecture's constant SV_Hier_Name, the instance's own name,
+ * which SV_Hier_Lookup finds from the entity's 'PATH_NAME at elaboration
+ * (declare_hier_names), followed by the scope's path inside the module (a
+ * named block, a task).
+ */
+static std::map<vhdl_entity*, ivl_scope_t> g_hier_name_entities;
+
+vhdl_expr *hier_name_expr()
+{
+   const std::string name = active_hier_name();
+   ivl_scope_t m = get_active_scope();
+   while (m != NULL && ivl_scope_type(m) != IVL_SCT_MODULE)
+      m = ivl_scope_parent(m);
+   if (!get_sv2vhdl_mode() || m == NULL)
+      return new vhdl_const_string(name);
+   std::vector<ivl_scope_t> insts;
+   same_type_instances(m, insts);
+   vhdl_entity *ent = find_entity(m);
+   const std::string mname = ivl_scope_name(m);
+   if (insts.size() < 2 || ent == NULL || ent->get_arch() == NULL
+       || name.compare(0, mname.size(), mname) != 0)
+      return new vhdl_const_string(name);
+   if (!g_hier_name_entities.count(ent))
+      g_hier_name_entities[ent] = m;
+   vhdl_var_ref *inst = new vhdl_var_ref("SV_Hier_Name", vhdl_type::string());
+   const std::string inside = name.substr(mname.size());
+   if (inside.empty())
+      return inst;
+   vhdl_binop_expr *cat = new vhdl_binop_expr(VHDL_BINOP_CONCAT,
+                                              vhdl_type::string());
+   cat->add_expr(inst);
+   cat->add_expr(new vhdl_const_string(inside));
+   return cat;
+}
+
+// A VHDL string literal of `s'
+static std::string vhdl_string_literal(const std::string &s)
+{
+   std::string out = "\"";
+   for (size_t i = 0; i < s.size(); i++) {
+      if (s[i] == '"')
+         out += "\"\"";
+      else if ((unsigned char)s[i] < ' ' || (unsigned char)s[i] > '~')
+         out += "?";
+      else
+         out += s[i];
+   }
+   return out + "\"";
+}
+
+/*
+ * In each architecture hier_name_expr used: (ahead of its other
+ * declarations, as a Verilog function drawn there may use it)
+ *
+ *    -- %m: this instance's Verilog name (sub has 2 instances)
+ *    function SV_Hier_Lookup(P : string) return string is
+ *    begin
+ *       if P'length >= 18 and P(P'high - 17 to P'high) = ":a:u2:sv_hier_mark" then
+ *          return "tb.a.u2";
+ *       end if;
+ *       ...
+ *       return "tb.u1";
+ *    end function;
+ *    constant SV_Hier_Mark : boolean := true;
+ *    constant SV_Hier_Name : string := SV_Hier_Lookup(SV_Hier_Mark'path_name);
+ *
+ * P is the path of the architecture's own constant SV_Hier_Mark
+ * (":tb:a:u2:sv_hier_mark"; the entity's name is not used: sv-rename-variants
+ * renames an entity with variants); each instance is known by the labels
+ * from its design root down to it (instance_vhdl_path), tried longest first,
+ * so a wrapper above the root (vamos's vamos_tops) changes nothing.
+ */
+void declare_hier_names()
+{
+   for (std::map<vhdl_entity*, ivl_scope_t>::iterator it =
+           g_hier_name_entities.begin();
+        it != g_hier_name_entities.end(); ++it) {
+      vhdl_entity *ent = it->first;
+      std::vector<ivl_scope_t> insts;
+      same_type_instances(it->second, insts);
+      std::vector<std::pair<std::string, std::string> > table;
+      for (size_t k = 0; k < insts.size(); k++) {
+         std::string path;
+         if (instance_vhdl_path(insts[k], path) && path != ":")
+            table.push_back(std::make_pair(path + "sv_hier_mark",
+                                           ivl_scope_name(insts[k])));
+      }
+      std::stable_sort(table.begin(), table.end(),
+                       [](const std::pair<std::string, std::string> &a,
+                          const std::pair<std::string, std::string> &b) {
+                          return a.first.size() > b.first.size();
+                       });
+      std::vector<std::string> fn;
+      ostringstream hd;
+      hd << "-- %m: this instance's Verilog name (" << ivl_scope_tname(it->second)
+         << " has " << insts.size() << " instances)";
+      fn.push_back(hd.str());
+      fn.push_back("function SV_Hier_Lookup(P : string) return string is");
+      fn.push_back("begin");
+      for (size_t k = 0; k < table.size(); k++) {
+         const size_t n = table[k].first.size();
+         ostringstream ln;
+         ln << "  if P'length >= " << n << " and P(P'high - " << n - 1
+            << " to P'high) = " << vhdl_string_literal(table[k].first)
+            << " then return " << vhdl_string_literal(table[k].second)
+            << "; end if;";
+         fn.push_back(ln.str());
+      }
+      fn.push_back("  return " + vhdl_string_literal(ivl_scope_name(it->second))
+                   + ";");
+      fn.push_back("end function;");
+      vhdl_scope *as = ent->get_arch()->get_scope();
+      std::vector<std::string> mk, cn;
+      mk.push_back("constant SV_Hier_Mark : boolean := true;");
+      cn.push_back("constant SV_Hier_Name : string := "
+                   "SV_Hier_Lookup(SV_Hier_Mark'path_name);");
+      // (in front of the other declarations, in this order: the lookup, the
+      // mark, the name)
+      as->add_forward_decl(new vhdl_verbatim_decl("SV_Hier_Name", cn));
+      as->add_forward_decl(new vhdl_verbatim_decl("SV_Hier_Mark", mk));
+      as->add_forward_decl(new vhdl_verbatim_decl("SV_Hier_Lookup", fn));
+   }
+   g_hier_name_entities.clear();
+}
+
 // Build the concatenated display text for a $display-family statement's
 // parameters. `proc' may be NULL when building the body of a companion
 // (postponed) $monitor/$strobe process -- no wait-for-0 statements are needed
 // there, and none can be emitted. Returns NULL on translation failure.
-static vhdl_expr *build_display_text(vhdl_procedural *proc,
-                                     stmt_container *container,
-                                     ivl_statement_t stmt,
-                                     int first_parm = 0)
+// dflt: the format of an argument with no format of its own -- 'd' (the
+// $display default), or 'h', 'b', 'o' for the radix forms of the file tasks
+// ($fdisplayh, $fwriteb, ... in fileio.cc).
+vhdl_expr *build_display_text(vhdl_procedural *proc,
+                              stmt_container *container,
+                              ivl_statement_t stmt,
+                              int first_parm = 0, char dflt = 'd')
 {
    vhdl_binop_expr *text = new vhdl_binop_expr(VHDL_BINOP_CONCAT,
                                                vhdl_type::string());
@@ -191,7 +396,7 @@ static vhdl_expr *build_display_text(vhdl_procedural *proc,
                   // %m = the hierarchical name of the scope containing this
                   // $display, from the scope-keyed store (set in draw_process,
                   // and for a function, task or named block in its drawing).
-                  text->add_expr(new vhdl_const_string(active_hier_name()));
+                  text->add_expr(hier_name_expr());
                   break;
                case 't': case 'T':
                   {
@@ -647,13 +852,56 @@ static vhdl_expr *build_display_text(vhdl_procedural *proc,
          emit_wait_for_0(proc, container, stmt, base);
          base = display_bool_as_bit(base);
 
-         // A bare REAL $display arg formats as %g (Verilog default for reals).
+         // A bare time function prints as vvp's get_display prints it
+         // (vpi/sys_display.c): $time and $simtime right-aligned in 20
+         // columns, $stime in 10 (`$monitor($time, ...)' printed "0", vvp
+         // "                   0"), $realtime with the digits of its scope's
+         // precision (%.<units - precision>f: 3.250 at 1ns/1ps)
+         const char *sfname = ivl_expr_type(net) == IVL_EX_SFUNC
+            ? ivl_expr_name(net) : "";
+         const int time_cols = strcmp(sfname, "$time") == 0
+            || strcmp(sfname, "$simtime") == 0 ? 20
+            : strcmp(sfname, "$stime") == 0 ? 10 : 0;
+         if (time_cols > 0 && base->get_type()
+             && base->get_type()->get_name() == VHDL_TYPE_INTEGER) {
+            require_support_function(SF_TIME_FIELD);
+            vhdl_fcall *w = new vhdl_fcall(
+               support_function::function_name(SF_TIME_FIELD),
+               vhdl_type::string());
+            w->add_expr(base->cast(text->get_type()));
+            w->add_expr(new vhdl_const_int(time_cols));
+            w->add_expr(new vhdl_const_bool(false));
+            text->add_expr(w);
+            continue;
+         }
+
+         // A bare REAL $display arg formats as vvp formats it: %#g (5.00000,
+         // 1.00000e+20; %g only under vvp -compatible), and $realtime as
+         // above
          const vhdl_type *bt0 = base->get_type();
          if (bt0 && bt0->get_name() == VHDL_TYPE_REAL) {
-            vhdl_fcall *f = new vhdl_fcall("to_string", vhdl_type::string());
-            f->add_expr(base);
-            f->add_expr(new vhdl_const_string("%g"));
-            text->add_expr(f);
+            if (strcmp(sfname, "$realtime") == 0) {
+               vhdl_fcall *f = new vhdl_fcall("to_string", vhdl_type::string());
+               f->add_expr(base);
+               const int digits = active_time_units()
+                  - active_time_precision();
+               ostringstream rs;
+               rs << "%." << (digits > 0 ? digits : 0) << "f";
+               f->add_expr(new vhdl_const_string(rs.str()));
+               text->add_expr(f);
+            }
+            else {
+               require_support_function(SF_REAL_G);
+               vhdl_fcall *f = new vhdl_fcall(
+                  support_function::function_name(SF_REAL_G),
+                  vhdl_type::string());
+               f->add_expr(base);
+               text->add_expr(f);
+            }
+            continue;
+         }
+         if (dflt != 'd') {
+            text->add_expr(display_radix_text(base, net, dflt));
             continue;
          }
 
@@ -789,7 +1037,8 @@ static int draw_stask_severity(vhdl_procedural *proc,
                                                 vhdl_type::string());
    line2->add_expr(new vhdl_const_string(pad + "Time: "));
    line2->add_expr(translate_sfunc_simtime(NULL)->cast(vhdl_type::string()));
-   line2->add_expr(new vhdl_const_string("  Scope: " + active_hier_name()));
+   line2->add_expr(new vhdl_const_string("  Scope: "));
+   line2->add_expr(hier_name_expr());
    vhdl_pcall_stmt *pc2 = new vhdl_pcall_stmt("sv_display_line");
    pc2->add_expr(line2);
    container->add_stmt(pc2);
@@ -803,14 +1052,29 @@ static int draw_stask_severity(vhdl_procedural *proc,
 // dest as packed 8-bit ASCII, right-justified and zero-filled (the
 // Verilog string-in-reg convention, what %s/%0s of the reg expects).
 // The formatter is the $display machinery starting at parameter 1.
+// $sformat(dest, fmt, args...) is the same with a format string always in
+// parameter 1 (it was not translated: dest kept its old value). Only a
+// literal format translates (the $display machinery parses it at translation
+// time); a variable one is a located error.
 static int draw_stask_swrite(vhdl_procedural *proc,
                              stmt_container *container,
                              ivl_statement_t stmt)
 {
+   const char *task = ivl_stmt_name(stmt);
    ivl_expr_t dst = ivl_stmt_parm(stmt, 0);
    if (dst == NULL || ivl_expr_type(dst) != IVL_EX_SIGNAL) {
-      error("$swrite destination must be a simple register");
+      error("%s:%d: %s destination must be a simple register",
+            ivl_stmt_file(stmt), ivl_stmt_lineno(stmt), task);
       return 1;
+   }
+   if (strcmp(task, "$sformat") == 0) {
+      ivl_expr_t fmt = ivl_stmt_parm_count(stmt) > 1
+         ? ivl_stmt_parm(stmt, 1) : NULL;
+      if (fmt == NULL || ivl_expr_type(fmt) != IVL_EX_STRING) {
+         error("%s:%d: no VHDL translation for a $sformat format that is not "
+               "a string literal", ivl_stmt_file(stmt), ivl_stmt_lineno(stmt));
+         return 1;
+      }
    }
 
    vhdl_expr *text = build_display_text(proc, container, stmt, 1);
@@ -825,19 +1089,69 @@ static int draw_stask_swrite(vhdl_procedural *proc,
    conv->add_expr(text);
    conv->add_expr(new vhdl_const_int(ivl_signal_width(sig)));
 
-   // Same blocking-emulation shape as make_assignment: signal targets
-   // register as blocking so later same-step reads insert wait-for-0
+   // Same blocking-emulation shape as make_assignment: a signal target is
+   // deposited (deposits_signal), or else registers as blocking so later
+   // same-step reads insert wait-for-0
    vhdl_decl *decl = proc->get_scope()->get_decl(lhs->get_name());
    if (decl != NULL
        && decl->assignment_type() == vhdl_decl::ASSIGN_NONBLOCK
-       && !proc->get_scope()->initializing()) {
+       && !deposits_signal(proc, lhs->get_name(), true)) {
       if (proc->get_scope()->allow_signal_assignment())
          proc->add_blocking_target(lhs);
       container->add_stmt(new vhdl_nbassign_stmt(lhs, conv));
    }
-   else
+   else {
+      if (decl != NULL
+          && decl->assignment_type() == vhdl_decl::ASSIGN_NONBLOCK)
+         proc->mark_deposited(lhs->get_name());
       container->add_stmt(new vhdl_assign_stmt(lhs, conv));
+   }
    return 0;
+}
+
+/*
+ * The signals a $monitor / $fmonitor companion process watches: every
+ * architecture signal or port its text reads, added to mon's sensitivity
+ * (skip: a name already there) and returned.  A word, bit or part select
+ * with constant bounds is watched by itself, as vvp watches just that
+ * (sys_monitor_calltf: a memory word, a part select), so a write to another
+ * word of a memory prints nothing; any other read watches the whole signal.
+ */
+std::vector<std::string> monitor_watch(vhdl_process *mon, vhdl_scope *ascope,
+                                       vhdl_expr *text, const std::string &skip)
+{
+   vhdl_var_set_t rd;
+   text->find_vars(rd);
+   set<string> seen;
+   seen.insert(skip);
+   std::vector<std::string> out;
+   for (vhdl_var_set_t::const_iterator it = rd.begin(); it != rd.end(); ++it) {
+      const string &nm = (*it)->get_name();
+      // Only architecture-visible signals (a signal, a port, an alias of
+      // one) can be in a sensitivity list.
+      vhdl_decl *d = ascope->get_decl(nm);
+      if (d == NULL || dynamic_cast<vhdl_var_decl*>(d) != NULL
+          || dynamic_cast<vhdl_type_decl*>(d) != NULL
+          || dynamic_cast<vhdl_component_decl*>(d) != NULL
+          || dynamic_cast<vhdl_param_decl*>(d) != NULL)
+         continue;
+      string name = nm;
+      // (a bit or part of a constant memory word too: `array[0][1]' is
+      // watched as array(0)(1), as vvp watches that bit; a write to another
+      // bit of the word printed a line again, ivtest pr2785294)
+      if ((*it)->get_slice() != NULL
+          && dynamic_cast<vhdl_const_int*>((*it)->get_slice()) != NULL
+          && (*it)->extra_slices_constant()) {
+         ostringstream ss;
+         (*it)->emit(ss, 0);
+         name = ss.str();
+      }
+      if (seen.insert(name).second) {
+         mon->add_sensitivity(name);
+         out.push_back(name);
+      }
+   }
+   return out;
 }
 
 // $monitor / $strobe: both print at the END of a time step, reading settled
@@ -937,154 +1251,289 @@ static int draw_stask_monitor(vhdl_procedural *proc,
    }
 
    // Sensitivity: every signal the printed text reads (monitor re-prints on
-   // any operand change). find_vars over the built body collects them.
-   if (is_monitor) {
-      vhdl_var_set_t rd, wr;
-      mon->get_container()->find_vars(rd, wr);
-      set<string> seen;
-      seen.insert("sv_monitor_arm");
-      for (vhdl_var_set_t::const_iterator it = rd.begin();
-           it != rd.end(); ++it) {
-         const string &nm = (*it)->get_name();
-         // Only architecture-visible signals can be in a sensitivity list.
-         vhdl_decl *d = ascope->get_decl(nm);
-         if (d && seen.insert(nm).second)
-            mon->add_sensitivity(nm);
-      }
-   }
+   // any operand change), a constant word or part select by itself.
+   if (is_monitor)
+      monitor_watch(mon, ascope, text, "sv_monitor_arm");
 
    arch->add_stmt(mon);
    return 0;
 }
 
 /*
- * `$set_val(arr, idx0, idx1, …, idxN, val)` emits `arr(idx0)(idx1)…(idxN) := val;`
- * (or `<= val;` for signals). Workaround for iverilog's restriction on chained
- * procedural part-selects on the LHS — sv-normalize rewrites
- * `arr[i][j] = X;` as `$set_val(arr, i, j, X);`.
+ * `$set_val(arr, idx0, idx1, ..., idxN, val)': sv-normalize's rewrite of a
+ * one-line blocking `arr[idx0][idx1]...[idxN] = val;' (iverilog once
+ * rejected a chained select there). `arr' is a vector, whose packed
+ * dimensions the indices select in, or an unpacked array (a memory): idx0
+ * selects the word and the others select in the word's packed dimensions
+ * (Hazard3's `req_stratified[i][j] = ...'; a memory was refused, and the
+ * process lost the rest of its body without an error). As in Verilog, an
+ * index counts from its dimension's declared bounds ([8:1], [0:7], a memory
+ * [4:7]) and a store with an index outside its dimension is dropped:
+ *
+ *    SetVal_Idx_<n> := <idx0 from 0>;  ...      -- an index read once
+ *    if SetVal_Idx_<n> >= 0 and SetVal_Idx_<n> <= <size-1> and ... then
+ *       arr(<word>)(<bit offset> [+ w-1 downto <bit offset>]) <= val;
+ *    end if;
+ *
+ * (constant indices are checked here instead). The select takes the
+ * value's low bits (a wider select extends it), and the store is a blocking
+ * assignment as make_assignment draws one.
  */
+static vhdl_expr *variable_value(vhdl_expr *rhs, ivl_expr_t src);
+static vhdl_abstract_assign_stmt *
+assign_for(vhdl_decl::assign_type_t atype, vhdl_var_ref *lhs, vhdl_expr *rhs);
+bool check_valid_assignment(vhdl_decl::assign_type_t atype,
+                            vhdl_procedural *proc, ivl_statement_t stmt);
+
 static int draw_stask_set_val(vhdl_procedural *proc,
                                stmt_container *container,
                                ivl_statement_t stmt)
 {
+   const char *file = ivl_stmt_file(stmt);
+   const unsigned line = ivl_stmt_lineno(stmt);
    const int count = ivl_stmt_parm_count(stmt);
    if (count < 3) {
-      cerr << "Error: $set_val requires at least 3 args (arr, idx, val)" << endl;
+      error("%s:%d: $set_val takes a variable, one index or more and a value",
+            file, line);
       return 1;
    }
 
-   // First parameter is the array signal; extract the underlying signal.
    ivl_expr_t arr_expr = ivl_stmt_parm(stmt, 0);
-   if (!arr_expr || ivl_expr_type(arr_expr) != IVL_EX_SIGNAL) {
-      cerr << "Error: first arg to $set_val must be a signal" << endl;
+   const bool memory = arr_expr != NULL
+      && ivl_expr_type(arr_expr) == IVL_EX_ARRAY;
+   if (arr_expr == NULL
+       || (!memory && (ivl_expr_type(arr_expr) != IVL_EX_SIGNAL
+                       || ivl_expr_oper1(arr_expr) != NULL
+                       || ivl_signal_dimensions(ivl_expr_signal(arr_expr)) != 0))) {
+      error("%s:%d: the first argument of $set_val must be a vector or a "
+            "memory", file, line);
       return 1;
    }
    ivl_signal_t sig = ivl_expr_signal(arr_expr);
-   string signame(get_renamed_signal(sig));
+   ensure_signal_declared(sig);   // package/$unit-scope orphans
+   const string signame(get_renamed_signal(sig));
    vhdl_decl *decl = proc->get_scope()->get_decl(signame);
-   if (!decl) {
-      cerr << "Error: $set_val could not resolve signal " << signame << endl;
+   if (decl == NULL || decl->get_type() == NULL) {
+      error("%s:%d: $set_val of %s, which has no VHDL declaration visible "
+            "here", file, line, ivl_signal_name(sig));
+      return 1;
+   }
+   if (ivl_signal_data_type(sig) == IVL_VT_REAL
+       || (memory && (ivl_signal_dimensions(sig) != 1
+                      || decl->get_type()->get_name() != VHDL_TYPE_ARRAY))) {
+      error("%s:%d: no VHDL translation for $set_val of %s (a real, or a "
+            "memory of more than one dimension)", file, line,
+            ivl_signal_name(sig));
       return 1;
    }
 
-   const vhdl_type *ltype = new vhdl_type(*decl->get_type());
-   vhdl_var_ref *lhs = new vhdl_var_ref(signame, ltype);
-
-   // Indices are parms 1 .. count-2; value is parm count-1.
-   // Iverilog flattens packed N-D arrays to a single dimension in VHDL, so
-   // we compute a flat offset: idx0*W1*W2*…*Wn + idx1*W2*…*Wn + … + idxn.
-   // Each Wk is the bit-width of the k-th packed dimension below the outer.
-   vhdl_type integer(VHDL_TYPE_INTEGER);
-   const int nidx = count - 2;
-   const unsigned packed_dims = ivl_signal_packed_dimensions(sig);
-   int lhs_slice_width = 1;   // width of the LHS slice (>1 if inner dims unindexed)
-   if (nidx >= 1 && (unsigned)nidx <= packed_dims) {
-      // Build per-index dimension widths: dim 0 is innermost, dim packed_dims-1
-      // is outermost. For an outer index `i`, its weight is the product of
-      // the inner-dimension sizes.
-      std::vector<int> dim_size(packed_dims, 1);
-      for (unsigned d = 0; d < packed_dims; d++) {
-         int msb = ivl_signal_packed_msb(sig, d);
-         int lsb = ivl_signal_packed_lsb(sig, d);
-         dim_size[d] = (msb >= lsb ? msb - lsb : lsb - msb) + 1;
-      }
-
-      // iverilog: dim 0 is the OUTER (first-declared) packed dim, dim
-      // packed_dims-1 is the innermost. For an outer index p (0=outermost),
-      // its weight is the product of dim sizes for dims (p+1 .. packed_dims-1).
-      vhdl_expr *flat = NULL;
-      for (int p = 0; p < nidx; p++) {
-         ivl_expr_t idx_e = ivl_stmt_parm(stmt, p + 1);
-         vhdl_expr *idx = translate_expr(idx_e);
-         if (!idx) return 1;
-         idx = idx->cast(&integer);
-         int weight = 1;
-         for (int d = p + 1; d < (int)packed_dims; d++)
-            weight *= dim_size[d];
-         vhdl_expr *term = idx;
-         if (weight != 1) {
-            vhdl_expr *w = new vhdl_const_int(weight);
-            term = new vhdl_binop_expr(idx, VHDL_BINOP_MULT, w,
-                                        new vhdl_type(VHDL_TYPE_INTEGER));
-         }
-         if (flat == NULL)
-            flat = term;
-         else
-            flat = new vhdl_binop_expr(flat, VHDL_BINOP_ADD, term,
-                                       new vhdl_type(VHDL_TYPE_INTEGER));
-      }
-      // If only the outer dims were indexed (nidx < packed_dims), the LHS is
-      // not a single bit but a slice spanning the un-indexed inner dims:
-      // arr[i][j] on [..][..][W] -> arr(flat + W-1 downto flat). Width = the
-      // product of the inner (un-indexed) dimension sizes; 1 when fully indexed.
-      int inner_w = 1;
-      for (int d = nidx; d < (int)packed_dims; d++)
-         inner_w *= dim_size[d];
-      lhs->set_slice(flat, inner_w - 1);
-      lhs_slice_width = inner_w;
+   // The packed dimensions the indices after the word index select in, from
+   // the outermost (dimension 0); a scalar is one dimension [0:0]
+   std::vector<int> left, right, size;
+   const unsigned pd = ivl_signal_packed_dimensions(sig);
+   for (unsigned d = 0; d < pd; d++) {
+      left.push_back(ivl_signal_packed_msb(sig, d));
+      right.push_back(ivl_signal_packed_lsb(sig, d));
    }
-   else {
-      // Fallback: chained slice (works when iverilog kept the array shape).
-      for (int p = 1; p < count - 1; p++) {
-         ivl_expr_t idx_e = ivl_stmt_parm(stmt, p);
-         vhdl_expr *idx = translate_expr(idx_e);
-         if (!idx) return 1;
-         idx = idx->cast(&integer);
-         if (p == 1)
-            lhs->set_slice(idx, 0);
-         else
-            lhs->add_extra_slice(idx);
+   if (pd == 0) {
+      left.push_back(0);
+      right.push_back(0);
+   }
+   for (size_t d = 0; d < left.size(); d++)
+      size.push_back((left[d] >= right[d] ? left[d] - right[d]
+                                          : right[d] - left[d]) + 1);
+   const int first = memory ? 2 : 1;            // the first packed index
+   const int nbit = count - 1 - first;          // packed indices
+   if (nbit < 0 || nbit > (int)size.size()) {
+      error("%s:%d: $set_val of %s has %d indices for %u dimensions", file,
+            line, ivl_signal_name(sig), count - 2,
+            (unsigned)size.size() + (memory ? 1 : 0));
+      return 1;
+   }
+   int inner_w = 1;                              // the select's width
+   for (size_t d = nbit; d < size.size(); d++)
+      inner_w *= size[d];
+
+   // Each index from 0 at its dimension's least significant end (a word
+   // index from the array's lowest address, the canonical word), with the
+   // range it must lie in. A constant index is folded here.
+   struct index_t {
+      vhdl_expr *expr;     // NULL: constant `value'
+      long value;
+      int hi;              // in range: 0 .. hi
+   };
+   std::vector<index_t> idx;
+   vhdl_type integer(VHDL_TYPE_INTEGER);
+   for (int p = 1; p < count - 1; p++) {
+      ivl_expr_t ie = ivl_stmt_parm(stmt, p);
+      const bool word = memory && p == 1;
+      const int d = p - first;                   // packed dimension
+      long bias;           // canonical = sign * (index - bias)
+      int sign = 1, hi;
+      if (word) {
+         bias = ivl_signal_array_base(sig);
+         hi = (int)ivl_signal_array_count(sig) - 1;
       }
+      else {
+         bias = right[d];
+         if (left[d] < right[d])
+            sign = -1;
+         hi = size[d] - 1;
+      }
+      index_t ix = { NULL, 0, hi };
+      if (ivl_expr_type(ie) == IVL_EX_NUMBER && number_is_long(ie)) {
+         ix.value = sign * (get_number_as_long(ie) - bias);
+      }
+      else {
+         vhdl_expr *v = translate_expr(ie);
+         if (v == NULL)
+            return 1;
+         emit_wait_for_0(proc, container, stmt, v);
+         v = index_to_integer(ie, v);
+         // (no negative literal: VHDL has no `x - -1')
+         if (sign > 0 && bias > 0)
+            v = new vhdl_binop_expr(v, VHDL_BINOP_SUB,
+                                    new vhdl_const_int(bias),
+                                    vhdl_type::integer());
+         else if (sign > 0 && bias < 0)
+            v = new vhdl_binop_expr(v, VHDL_BINOP_ADD,
+                                    new vhdl_const_int(-bias),
+                                    vhdl_type::integer());
+         else if (sign < 0 && bias >= 0)
+            v = new vhdl_binop_expr(new vhdl_const_int(bias), VHDL_BINOP_SUB,
+                                    v, vhdl_type::integer());
+         else if (sign < 0)
+            v = new vhdl_binop_expr(
+               new vhdl_binop_expr(new vhdl_const_int(0), VHDL_BINOP_SUB, v,
+                                   vhdl_type::integer()),
+               VHDL_BINOP_SUB, new vhdl_const_int(-bias), vhdl_type::integer());
+         ix.expr = v;
+      }
+      idx.push_back(ix);
    }
 
    ivl_expr_t val_e = ivl_stmt_parm(stmt, count - 1);
    vhdl_expr *val = translate_expr(val_e);
-   if (!val) return 1;
+   if (val == NULL)
+      return 1;
+   emit_wait_for_0(proc, container, stmt, val);
 
-   // When the LHS is a multi-bit slice (inner dims left unindexed) but the
-   // value is narrower (e.g. arr[i][j] = '0 -> a scalar L3D_0), widen the
-   // value to the slice width — Verilog pads the MSBs with 0.
-   if (lhs_slice_width > 1 && val->get_type() != NULL
-       && val->get_type()->get_width() != lhs_slice_width)
-      val = val->cast(vhdl_type::logic3d_vector(lhs_slice_width - 1, 0));
+   // A constant index outside its dimension: Verilog drops the store
+   for (size_t k = 0; k < idx.size(); k++)
+      if (idx[k].expr == NULL && (idx[k].value < 0 || idx[k].value > idx[k].hi))
+         return 0;
 
-   // Mirror make_assignment's discipline. $set_val is a rewritten BLOCKING
-   // assign, so a SIGNAL target inside a process must emit `<=` and be
-   // registered as a blocking target (the shadow pass then supplies
-   // read-after-write semantics where it can clone the slice). A bare `:=`
-   // on a signal is an in-place update that fires no event, so downstream
-   // `wait on` processes never wake. `:=` stays for variables and for
-   // initial-process deposits.
+   // The other indices are read once, into integers, and guard the store
+   static int set_val_count = 0;
+   vhdl_binop_expr *guard = NULL;
+   std::vector<vhdl_expr*> at;                   // each index, as used
+   for (size_t k = 0; k < idx.size(); k++) {
+      if (idx[k].expr == NULL) {
+         at.push_back(new vhdl_const_int(idx[k].value));
+         continue;
+      }
+      ostringstream nm;
+      nm << "SetVal_Idx_" << set_val_count++;
+      proc->get_scope()->add_decl(new vhdl_var_decl(nm.str(),
+                                                    vhdl_type::integer()));
+      vhdl_assign_stmt *cap = new vhdl_assign_stmt(
+         new vhdl_var_ref(nm.str(), vhdl_type::integer()), idx[k].expr);
+      if (k == 0) {
+         ostringstream cs;
+         cs << "$set_val (" << file << ":" << line << "): a store outside "
+            << ivl_signal_basename(sig) << " is dropped";
+         cap->set_comment(cs.str());
+      }
+      container->add_stmt(cap);
+      if (guard == NULL)
+         guard = new vhdl_binop_expr(VHDL_BINOP_AND, vhdl_type::boolean());
+      guard->add_expr(new vhdl_binop_expr(
+         new vhdl_var_ref(nm.str(), vhdl_type::integer()), VHDL_BINOP_GEQ,
+         new vhdl_const_int(0), vhdl_type::boolean()));
+      guard->add_expr(new vhdl_binop_expr(
+         new vhdl_var_ref(nm.str(), vhdl_type::integer()), VHDL_BINOP_LEQ,
+         new vhdl_const_int(idx[k].hi), vhdl_type::boolean()));
+      at.push_back(new vhdl_var_ref(nm.str(), vhdl_type::integer()));
+   }
+
+   // The bit offset of the select in the vector or word: the packed
+   // indices weighted by the sizes of the dimensions inside theirs
+   vhdl_expr *flat = NULL;
+   for (int p = 0; p < nbit; p++) {
+      int weight = 1;
+      for (size_t d = p + 1; d < size.size(); d++)
+         weight *= size[d];
+      vhdl_expr *term = at[(memory ? 1 : 0) + p];
+      if (weight != 1)
+         term = new vhdl_binop_expr(term, VHDL_BINOP_MULT,
+                                    new vhdl_const_int(weight),
+                                    vhdl_type::integer());
+      flat = flat == NULL ? term
+         : new vhdl_binop_expr(flat, VHDL_BINOP_ADD, term, vhdl_type::integer());
+   }
+
+   vhdl_var_ref *lhs = new vhdl_var_ref(signame,
+                                        new vhdl_type(*decl->get_type()));
+   if (memory)
+      lhs->set_slice(at[0], 0);                 // the word
+   const vhdl_type *t = lhs->get_type();         // a vector, or a scalar
+   if (flat != NULL) {
+      if (t->get_name() == VHDL_TYPE_LOGIC3D_VECTOR
+          || t->get_name() == VHDL_TYPE_UNSIGNED
+          || t->get_name() == VHDL_TYPE_SIGNED) {
+         if (memory)
+            lhs->slice_element(flat, inner_w - 1);
+         else
+            lhs->set_slice(flat, inner_w - 1);
+      }
+      else
+         delete flat;   // a scalar's only bit (the guard checked the index)
+   }
+
+   // The value at the select's width: its low bits, or extended
+   const vhdl_type *lt = lhs->get_type();
+   if (lt->get_name() == VHDL_TYPE_LOGIC3D && val->get_type() != NULL
+       && val->get_type()->get_name() == VHDL_TYPE_LOGIC3D_VECTOR) {
+      // One bit of a vector value, by way of a variable of its type: bit 0
+      // keeps an x or z (a cast would read its value plane)
+      ostringstream vn;
+      vn << "SetVal_Val_" << set_val_count++;
+      const int vw = val->get_type()->get_width();
+      proc->get_scope()->add_decl(new vhdl_var_decl(
+         vn.str(), vhdl_type::logic3d_vector(vw - 1, 0)));
+      container->add_stmt(new vhdl_assign_stmt(
+         new vhdl_var_ref(vn.str(), vhdl_type::logic3d_vector(vw - 1, 0)),
+         val));
+      vhdl_var_ref *b0 = new vhdl_var_ref(vn.str(),
+                                          vhdl_type::logic3d_vector(vw - 1, 0));
+      b0->set_slice(new vhdl_const_int(0), 0);
+      val = b0;
+   }
+   else
+      val = val->cast(lt);
+   val = variable_value(val, val_e);
+
+   // A blocking assignment, as make_assignment draws one: a deposit where
+   // deposits_signal says so, else a signal assignment that the process's
+   // later reads see through its blocking-target machinery
    vhdl_decl::assign_type_t atype = decl->assignment_type();
    if (atype == vhdl_decl::ASSIGN_NONBLOCK
-       && !proc->get_scope()->initializing()) {
-      if (proc->get_scope()->allow_signal_assignment())
-         proc->add_blocking_target(lhs);
-      container->add_stmt(new vhdl_nbassign_stmt(lhs, val));
+       && deposits_signal(proc, lhs->get_name(), true)) {
+      atype = vhdl_decl::ASSIGN_BLOCK;
+      proc->mark_deposited(lhs->get_name());
    }
-   else {
-      container->add_stmt(new vhdl_assign_stmt(lhs, val));
+   if (!check_valid_assignment(atype, proc, stmt))
+      return 1;
+   if (atype == vhdl_decl::ASSIGN_NONBLOCK)
+      proc->add_blocking_target(lhs);
+
+   stmt_container *where = container;
+   if (guard != NULL) {
+      vhdl_if_stmt *in_range = new vhdl_if_stmt(guard);
+      container->add_stmt(in_range);
+      where = in_range->get_then_container();
    }
+   where->add_stmt(assign_for(atype, lhs, val));
    return 0;
 }
 
@@ -1155,105 +1604,238 @@ static int draw_queue_method(vhdl_procedural *proc, stmt_container *container,
    return 1;
 }
 
+// fileio.cc: the arguments of the file tasks, as vvp reads them
+vhdl_expr *fileio_int32(vhdl_procedural *proc, stmt_container *container,
+                        ivl_statement_t stmt, ivl_expr_t e);
+vhdl_expr *fileio_string(vhdl_procedural *proc, stmt_container *container,
+                         ivl_statement_t stmt, ivl_expr_t e);
+const char *fileio_vpi_kind(ivl_expr_t e);
+bool fileio_real_arg(ivl_expr_t e);
+int fileio_unsupported(stmt_container *container, ivl_statement_t stmt,
+                       const char *why);
+std::string fileio_loc(ivl_statement_t stmt);
+
+// emit_wait_for_0 for the file tasks (fileio.cc): the wait-for-0 a read of a
+// blocking target needs first
+void fileio_wait_for_0(vhdl_procedural *proc, stmt_container *container,
+                       ivl_statement_t stmt, vhdl_expr *expr)
+{
+   emit_wait_for_0(proc, container, stmt, expr);
+}
+
 /*
- * $readmemh / $readmemb (file, mem [, start [, finish]]):
+ * $readmemh / $readmemb / $writememh / $writememb (file, mem [, start
+ * [, finish]]), on the runtime of nvc's logic3d_types_pkg, with vvp's rules
+ * and messages (vpi/sys_readmem.c):
  *
- *   sv_readmem_load("file", hex, start);
+ *   sv_readmem_load(<file>, <hex>, "$readmemh", "<file>:<line>",
+ *                   "<scope>.<mem>", <left>, <right>, <W>, "<vpi kind>",
+ *                   <has start>, <start>, <real>, <has finish>, <finish>, <real>);
+ *   sv_write_buf(sv_memfile_msgs);
  *   for sv_rm_i in 0 to sv_readmem_count - 1 loop
- *     if sv_readmem_addr(sv_rm_i) >= LO and sv_readmem_addr(sv_rm_i) <= HI then
- *       mem(sv_readmem_addr(sv_rm_i)) <= sv_readmem_word(sv_rm_i, W);   -- := in an initializing process
- *     end if;
+ *     mem(sv_readmem_addr(sv_rm_i) - <lowest address>) := sv_readmem_word(sv_rm_i, W);
  *   end loop;
  *
- * The file is parsed by the support package (logic3d_types_pkg); start
- * defaults to the lowest address of the memory and [start, finish] narrows
- * the accepted address window. Previously the task was dropped with a
- * warning, leaving the memory all X.
+ *   sv_writemem_open(<file>, <hex>, "$writememh", <the rest, less W>);
+ *   sv_write_buf(sv_memfile_msgs);
+ *   for sv_wm_i in 0 to sv_writemem_count - 1 loop
+ *     sv_writemem_word(sv_hstr(to_std_logic_vector(
+ *        mem(sv_writemem_addr(sv_wm_i) - <lowest address>))));
+ *   end loop;
+ *   sv_writemem_close;
+ *
+ * The runtime checks the arguments and reads the file, and yields only the
+ * words that go into the memory, with their Verilog addresses; its messages
+ * print through the $display line buffer.  The VHDL array is (count-1 downto
+ * 0), 0 the word at the lowest Verilog address (declare_one_signal).  A word
+ * is written the way make_assignment writes a blocking target: a signal is
+ * deposited (:=) in an initializing process and, once deposited there, ever
+ * after; else it is assigned (<=) and registered as a blocking target, so a
+ * read that follows in the process waits for it.  A 1-bit word takes
+ * sv_readmem_bit.  A memory this has no translation for -- one in another
+ * module, a real one -- gets the located "Unsupported system task" comment
+ * every untranslated task gets (vamos reports it), never a silent drop.
  */
 static int draw_stask_readmem(vhdl_procedural *proc, stmt_container *container,
-                              ivl_statement_t stmt, bool hex)
+                              ivl_statement_t stmt, bool hex, bool writing)
 {
    const char *name = ivl_stmt_name(stmt);
    const unsigned nparms = ivl_stmt_parm_count(stmt);
    ivl_expr_t fe = nparms > 0 ? ivl_stmt_parm(stmt, 0) : NULL;
    ivl_expr_t me = nparms > 1 ? ivl_stmt_parm(stmt, 1) : NULL;
-   // A whole memory passed to a system task is an IVL_EX_ARRAY expression.
-   if (!fe || ivl_expr_type(fe) != IVL_EX_STRING
-       || !me || (ivl_expr_type(me) != IVL_EX_ARRAY
-                  && ivl_expr_type(me) != IVL_EX_SIGNAL)) {
-      error("%s: expected a constant file name and a memory (%s:%d)", name,
-            ivl_stmt_file(stmt), ivl_stmt_lineno(stmt));
+   ivl_expr_t se = nparms > 2 ? ivl_stmt_parm(stmt, 2) : NULL;
+   ivl_expr_t ee = nparms > 3 ? ivl_stmt_parm(stmt, 3) : NULL;
+   // vvp's sys_mem_compiletf: these stop the compile (an ivtest CE)
+   if (fe == NULL || me == NULL) {
+      error("%s:%d: %s requires two arguments (a file name and a memory)",
+            ivl_stmt_file(stmt), ivl_stmt_lineno(stmt), name);
       return 1;
    }
+   // A whole memory passed to a system task is an IVL_EX_ARRAY expression
+   if (!(ivl_expr_type(me) == IVL_EX_ARRAY
+         || (ivl_expr_type(me) == IVL_EX_SIGNAL && ivl_expr_oper1(me) == NULL))
+       || ivl_signal_dimensions(ivl_expr_signal(me)) == 0) {
+      error("%s:%d: %s's second argument must be a memory.", ivl_stmt_file(stmt),
+            ivl_stmt_lineno(stmt), name);
+      return 1;
+   }
+   if (ivl_signal_dimensions(ivl_expr_signal(me)) != 1)
+      return fileio_unsupported(container, stmt, "a memory of more than one "
+                                "dimension");
    ivl_signal_t sig = ivl_expr_signal(me);
+   if (ivl_signal_data_type(sig) == IVL_VT_REAL)
+      return fileio_unsupported(container, stmt, "a memory of reals has no "
+                                "word format");
    const string mname(get_renamed_signal(sig));
    vhdl_decl *decl = proc->get_scope()->get_decl(mname);
-   if (!decl) {
-      error("%s: memory %s not declared", name, mname.c_str());
-      return 1;
-   }
-   const int lo = ivl_signal_array_base(sig);
-   const int hi = lo + (int)ivl_signal_array_count(sig) - 1;
+   if (decl == NULL || decl->get_type() == NULL
+       || decl->get_type()->get_name() != VHDL_TYPE_ARRAY
+       || decl->get_type()->get_base() == NULL)
+      return fileio_unsupported(container, stmt, "the memory is not visible "
+                                "here (it is in another module)");
+   const vhdl_type *etype = decl->get_type()->get_base();
    const int width = ivl_signal_width(sig);
+   if (!((width == 1 && etype->get_name() == VHDL_TYPE_LOGIC3D)
+         || (width > 1 && etype->get_name() == VHDL_TYPE_LOGIC3D_VECTOR
+             && etype->get_width() == width)))
+      return fileio_unsupported(container, stmt, "the memory's words are not "
+                                "logic vectors");
 
+   // The declared range [left:right]; t-dll.cc: the base is the lower
+   // address, "swapped" a [high:low] declaration
+   const int lo = ivl_signal_array_base(sig);
+   const int cnt = (int)ivl_signal_array_count(sig);
+   const bool swapped = ivl_signal_array_addr_swapped(sig) != 0;
+   const int left = swapped ? lo + cnt - 1 : lo;
+   const int right = swapped ? lo : lo + cnt - 1;
+   const string full = string(ivl_scope_name(ivl_signal_scope(sig))) + "."
+      + ivl_signal_basename(sig);
+
+   vhdl_expr *fname = fileio_string(proc, container, stmt, fe);
+   if (fname == NULL)
+      return 1;
    vhdl_expr *start = NULL, *finish = NULL;
-   if (nparms > 2 && ivl_stmt_parm(stmt, 2))
-      start = translate_expr(ivl_stmt_parm(stmt, 2))->cast(vhdl_type::integer());
-   if (nparms > 3 && ivl_stmt_parm(stmt, 3))
-      finish = translate_expr(ivl_stmt_parm(stmt, 3))->cast(vhdl_type::integer());
+   if (se != NULL && (start = fileio_int32(proc, container, stmt, se)) == NULL)
+      return 1;
+   if (ee != NULL && (finish = fileio_int32(proc, container, stmt, ee)) == NULL)
+      return 1;
 
-   vhdl_pcall_stmt *load = new vhdl_pcall_stmt("sv_readmem_load");
-   load->add_expr(new vhdl_const_string(ivl_expr_string(fe)));
-   load->add_expr(new vhdl_var_ref(hex ? "true" : "false", vhdl_type::boolean()));
-   load->add_expr(start ? start : new vhdl_const_int(lo));
-   container->add_stmt(load);
+   vhdl_pcall_stmt *begin = new vhdl_pcall_stmt(writing ? "sv_writemem_open"
+                                                        : "sv_readmem_load");
+   begin->add_expr(fname);
+   begin->add_expr(new vhdl_var_ref(hex ? "true" : "false", vhdl_type::boolean()));
+   begin->add_expr(new vhdl_const_string(name));
+   begin->add_expr(new vhdl_const_string(fileio_loc(stmt)));
+   begin->add_expr(new vhdl_const_string(full));
+   begin->add_expr(new vhdl_const_int(left));
+   begin->add_expr(new vhdl_const_int(right));
+   if (!writing)
+      begin->add_expr(new vhdl_const_int(width));
+   begin->add_expr(new vhdl_const_string(fileio_vpi_kind(fe)));
+   begin->add_expr(new vhdl_var_ref(start ? "true" : "false",
+                                    vhdl_type::boolean()));
+   begin->add_expr(start ? start : new vhdl_const_int(0));
+   begin->add_expr(new vhdl_var_ref(fileio_real_arg(se) ? "true" : "false",
+                                    vhdl_type::boolean()));
+   begin->add_expr(new vhdl_var_ref(finish ? "true" : "false",
+                                    vhdl_type::boolean()));
+   begin->add_expr(finish ? finish : new vhdl_const_int(0));
+   begin->add_expr(new vhdl_var_ref(fileio_real_arg(ee) ? "true" : "false",
+                                    vhdl_type::boolean()));
 
-   const char *iv = "sv_rm_i";
-   vhdl_fcall *count = new vhdl_fcall("sv_readmem_count", vhdl_type::integer());
+   // The word's VHDL index: its Verilog address less the lowest one
+   const char *iv = writing ? "sv_wm_i" : "sv_rm_i";
+   vhdl_fcall *addr = new vhdl_fcall(writing ? "sv_writemem_addr"
+                                             : "sv_readmem_addr",
+                                     vhdl_type::integer());
+   addr->add_expr(new vhdl_var_ref(iv, vhdl_type::integer()));
+   vhdl_expr *index = addr;
+   if (lo != 0)
+      index = new vhdl_binop_expr(addr, lo > 0 ? VHDL_BINOP_SUB : VHDL_BINOP_ADD,
+                                  new vhdl_const_int(lo > 0 ? lo : -lo),
+                                  vhdl_type::integer());
+   vhdl_var_ref *word = new vhdl_var_ref(mname.c_str(),
+                                         new vhdl_type(*decl->get_type()));
+   word->set_slice(index);
+
+   // $writemem reads the memory: a blocking write to it earlier in this
+   // process lands first (the wait-for-0 of any read)
+   if (writing)
+      fileio_wait_for_0(proc, container, stmt, word);
+   container->add_stmt(begin);
+   vhdl_pcall_stmt *msgs = new vhdl_pcall_stmt("sv_write_buf");
+   msgs->add_expr(new vhdl_fcall("sv_memfile_msgs", vhdl_type::string()));
+   container->add_stmt(msgs);
+
+   vhdl_fcall *count = new vhdl_fcall(writing ? "sv_writemem_count"
+                                              : "sv_readmem_count",
+                                      vhdl_type::integer());
    vhdl_for_stmt *loop = new vhdl_for_stmt(
       iv, new vhdl_const_int(0),
       new vhdl_binop_expr(count, VHDL_BINOP_SUB, new vhdl_const_int(1),
                           vhdl_type::integer()));
 
-   auto addr = [&]() {
-      vhdl_fcall *a = new vhdl_fcall("sv_readmem_addr", vhdl_type::integer());
-      a->add_expr(new vhdl_var_ref(iv, vhdl_type::integer()));
-      return a;
-   };
-   // Accepted window: the memory's address range, narrowed by start/finish
-   // (a finish below start reads downward in Verilog; the window test is
-   // the same either way).
-   vhdl_expr *win_lo = new vhdl_const_int(lo), *win_hi = new vhdl_const_int(hi);
-   vhdl_binop_expr *test = new vhdl_binop_expr(VHDL_BINOP_AND, vhdl_type::boolean());
-   test->add_expr(new vhdl_binop_expr(addr(), VHDL_BINOP_GEQ, win_lo, vhdl_type::boolean()));
-   test->add_expr(new vhdl_binop_expr(addr(), VHDL_BINOP_LEQ, win_hi, vhdl_type::boolean()));
-   if (finish) {
-      vhdl_binop_expr *in_fin = new vhdl_binop_expr(addr(), VHDL_BINOP_LEQ, finish,
-                                                    vhdl_type::boolean());
-      test->add_expr(in_fin);
+   if (writing) {
+      vhdl_fcall *slv = new vhdl_fcall("to_std_logic_vector",
+                                       vhdl_type::std_logic_vector(width - 1, 0));
+      slv->add_expr(word);
+      vhdl_fcall *txt = new vhdl_fcall(hex ? "sv_hstr" : "sv_bstr",
+                                       vhdl_type::string());
+      txt->add_expr(slv);
+      vhdl_pcall_stmt *put = new vhdl_pcall_stmt("sv_writemem_word");
+      put->add_expr(txt);
+      loop->get_container()->add_stmt(put);
+      container->add_stmt(loop);
+      container->add_stmt(new vhdl_pcall_stmt("sv_writemem_close"));
+      return 0;
    }
-   vhdl_if_stmt *inrange = new vhdl_if_stmt(test);
 
-   vhdl_var_ref *lhs = new vhdl_var_ref(mname.c_str(), new vhdl_type(*decl->get_type()));
-   lhs->set_slice(addr());
-   vhdl_fcall *word = new vhdl_fcall("sv_readmem_word",
+   vhdl_expr *value;
+   if (width == 1) {
+      vhdl_fcall *f = new vhdl_fcall("sv_readmem_bit", vhdl_type::logic3d());
+      f->add_expr(new vhdl_var_ref(iv, vhdl_type::integer()));
+      value = f;
+   }
+   else {
+      vhdl_fcall *f = new vhdl_fcall("sv_readmem_word",
                                      vhdl_type::logic3d_vector(width - 1, 0));
-   word->add_expr(new vhdl_var_ref(iv, vhdl_type::integer()));
-   word->add_expr(new vhdl_const_int(width));
+      f->add_expr(new vhdl_var_ref(iv, vhdl_type::integer()));
+      f->add_expr(new vhdl_const_int(width));
+      value = f;
+   }
 
-   // Same discipline as $set_val: a signal in a running process gets `<=`
-   // (fires events for its readers); an initializing process deposits `:=`
-   // so a read right after the load already sees the data.
-   if (decl->assignment_type() == vhdl_decl::ASSIGN_NONBLOCK
-       && !proc->get_scope()->initializing())
-      inrange->get_then_container()->add_stmt(new vhdl_nbassign_stmt(lhs, word));
+   // A blocking write, make_assignment's way: deposited (:=) where
+   // deposits_signal says so, and then read back at once; else assigned (<=)
+   // and registered as a blocking target, which a later read waits for
+   vhdl_decl::assign_type_t atype = decl->assignment_type();
+   if (atype == vhdl_decl::ASSIGN_NONBLOCK) {
+      if (deposits_signal(proc, mname, true)) {
+         atype = vhdl_decl::ASSIGN_BLOCK;
+         proc->mark_deposited(mname);
+      }
+      else {
+         if (!proc->get_scope()->allow_signal_assignment()) {
+            error("%s:%d: %s writes memory %s, a signal, where VHDL cannot "
+                  "assign one (a function)", ivl_stmt_file(stmt),
+                  ivl_stmt_lineno(stmt), name, ivl_signal_basename(sig));
+            return 1;
+         }
+         proc->add_blocking_target(word);
+      }
+   }
+   if (atype == vhdl_decl::ASSIGN_NONBLOCK)
+      loop->get_container()->add_stmt(new vhdl_nbassign_stmt(word, value));
    else
-      inrange->get_then_container()->add_stmt(new vhdl_assign_stmt(lhs, word));
-
-   loop->get_container()->add_stmt(inrange);
+      loop->get_container()->add_stmt(new vhdl_assign_stmt(word, value));
    container->add_stmt(loop);
    return 0;
 }
+
+// fileio.cc: $fdisplay, $fwrite, $fstrobe, $fmonitor (and their b/h/o
+// forms), $fclose, $fflush
+bool fileio_task(const char *name);
+int draw_stask_fileio(vhdl_procedural *proc, stmt_container *container,
+                      ivl_statement_t stmt);
 
 /*
  * Generate VHDL for system tasks (like $display). Not all of
@@ -1264,11 +1846,18 @@ static int draw_stask(vhdl_procedural *proc, stmt_container *container,
 {
    const char *name = ivl_stmt_name(stmt);
 
+   // `$random(seed);' -- a system function called as a task: its value is
+   // dropped, its draw (a seed's advance) stands
+   if (get_sv2vhdl_mode()
+       && (strcmp(name, "$random") == 0 || strcmp(name, "$urandom") == 0))
+      return draw_stask_random(proc, container, stmt);
+
    if (strcmp(name, "$display") == 0)
       return draw_stask_display(proc, container, stmt, true);
    else if (strcmp(name, "$write") == 0)
       return draw_stask_display(proc, container, stmt, false);
-   else if (strcmp(name, "$swrite") == 0)
+   else if (strcmp(name, "$swrite") == 0
+            || (get_sv2vhdl_mode() && strcmp(name, "$sformat") == 0))
       return draw_stask_swrite(proc, container, stmt);
    else if (strcmp(name, "$monitor") == 0)
       return draw_stask_monitor(proc, container, stmt, true);
@@ -1298,9 +1887,15 @@ static int draw_stask(vhdl_procedural *proc, stmt_container *container,
    else if (strcmp(name, "$set_val") == 0)
       return draw_stask_set_val(proc, container, stmt);
    else if (strcmp(name, "$readmemh") == 0)
-      return draw_stask_readmem(proc, container, stmt, true);
+      return draw_stask_readmem(proc, container, stmt, true, false);
    else if (strcmp(name, "$readmemb") == 0)
-      return draw_stask_readmem(proc, container, stmt, false);
+      return draw_stask_readmem(proc, container, stmt, false, false);
+   else if (get_sv2vhdl_mode() && strcmp(name, "$writememh") == 0)
+      return draw_stask_readmem(proc, container, stmt, true, true);
+   else if (get_sv2vhdl_mode() && strcmp(name, "$writememb") == 0)
+      return draw_stask_readmem(proc, container, stmt, false, true);
+   else if (get_sv2vhdl_mode() && fileio_task(name))
+      return draw_stask_fileio(proc, container, stmt);
    else if (strncmp(name, "$ivl_queue_method$", 18) == 0
             || strncmp(name, "$ivl_darray_method$", 19) == 0)
       return draw_queue_method(proc, container, stmt);
@@ -1383,6 +1978,9 @@ static std::vector<disable_target_t> g_disable_targets;
 static std::vector<std::vector<disable_target_t> > g_disable_saved;
 static int g_disable_count = 0;
 
+static void save_loop_targets();
+static void restore_loop_targets();
+
 void begin_function_disables(ivl_scope_t fscope, const std::string &result)
 {
    g_disable_saved.push_back(g_disable_targets);
@@ -1391,6 +1989,7 @@ void begin_function_disables(ivl_scope_t fscope, const std::string &result)
    t.scope = fscope;
    t.result = result;
    g_disable_targets.push_back(t);
+   save_loop_targets();      // and break/continue: the function's own loops
 }
 
 void end_function_disables()
@@ -1398,6 +1997,7 @@ void end_function_disables()
    assert(!g_disable_saved.empty());
    g_disable_targets = g_disable_saved.back();
    g_disable_saved.pop_back();
+   restore_loop_targets();
 }
 
 // Whether a disable of `target' stands anywhere in `s' (or in a task it calls)
@@ -1513,6 +2113,173 @@ static int draw_disable(vhdl_procedural *, stmt_container *container,
             "process, can be disabled", ivl_stmt_file(stmt),
             ivl_stmt_lineno(stmt), ivl_scope_name(target));
    return 1;
+}
+
+/*
+ * SystemVerilog break and continue (IVL_ST_BREAK, IVL_ST_CONTINUE) leave the
+ * innermost loop, or the rest of its current pass. A loop whose body holds
+ * one is drawn as
+ *
+ *    sv_brk_<n>: loop                 -- only with a break
+ *       <the loop>                    -- while/for/repeat/forever/do-while
+ *          sv_cont_<n>: loop          -- only with a continue
+ *             <body>
+ *             exit sv_cont_<n>;
+ *          end loop sv_cont_<n>;
+ *          <a for loop's step, the do-while test>
+ *       ...
+ *       exit sv_brk_<n>;
+ *    end loop sv_brk_<n>;
+ *
+ * break is `exit sv_brk_<n>;', continue `exit sv_cont_<n>;' -- so a for
+ * loop's step and a do-while's test still run after a continue, as in C,
+ * and a labeled exit cannot be caught by a disable loop in between.
+ */
+namespace {
+struct loop_target_t {
+   std::string brk, cont;   // the labels; empty when the body has none
+};
+}
+static std::vector<loop_target_t> g_loop_targets;
+static std::vector<std::vector<loop_target_t> > g_loop_saved;
+static int g_loop_jump_count = 0;
+
+// A function body is drawn apart from its caller (translate_ufunc): its
+// loops are its own.
+static void save_loop_targets()
+{
+   g_loop_saved.push_back(g_loop_targets);
+   g_loop_targets.clear();
+}
+
+static void restore_loop_targets()
+{
+   assert(!g_loop_saved.empty());
+   g_loop_targets = g_loop_saved.back();
+   g_loop_saved.pop_back();
+}
+
+// Whether a statement of type `kind' (IVL_ST_BREAK or IVL_ST_CONTINUE) in
+// `s', a loop's body, belongs to that loop: not one inside a nested loop
+// (or in a task it calls, which cannot leave the caller's loop)
+static bool loop_body_jumps(ivl_statement_t s, ivl_statement_type_t kind)
+{
+   if (s == NULL)
+      return false;
+   switch (ivl_statement_type(s)) {
+   case IVL_ST_BREAK:
+   case IVL_ST_CONTINUE:
+      return ivl_statement_type(s) == kind;
+   case IVL_ST_BLOCK:
+      for (unsigned i = 0; i < ivl_stmt_block_count(s); i++)
+         if (loop_body_jumps(ivl_stmt_block_stmt(s, i), kind))
+            return true;
+      return false;
+   case IVL_ST_CONDIT:
+      return loop_body_jumps(ivl_stmt_cond_true(s), kind)
+         || loop_body_jumps(ivl_stmt_cond_false(s), kind);
+   case IVL_ST_CASE:
+   case IVL_ST_CASER:
+   case IVL_ST_CASEX:
+   case IVL_ST_CASEZ:
+      for (unsigned i = 0; i < ivl_stmt_case_count(s); i++)
+         if (loop_body_jumps(ivl_stmt_case_stmt(s, i), kind))
+            return true;
+      return false;
+   case IVL_ST_DELAY:
+   case IVL_ST_DELAYX:
+   case IVL_ST_WAIT:
+      return loop_body_jumps(ivl_stmt_sub_stmt(s), kind);
+   default:
+      return false;
+   }
+}
+
+// Open the break/continue targets of a loop whose body is `body': returns
+// the break wrapper (NULL without a break), and sets `cont' to the
+// continue wrapper (NULL without a continue). Close with end_loop_jumps.
+static vhdl_labeled_loop_stmt *begin_loop_jumps(ivl_statement_t body,
+                                                vhdl_labeled_loop_stmt *&cont)
+{
+   loop_target_t t;
+   vhdl_labeled_loop_stmt *brk = NULL;
+   cont = NULL;
+   const bool has_brk = loop_body_jumps(body, IVL_ST_BREAK);
+   const bool has_cont = loop_body_jumps(body, IVL_ST_CONTINUE);
+   if (has_brk || has_cont) {
+      const int n = ++g_loop_jump_count;
+      if (has_brk) {
+         ostringstream ss;
+         ss << "sv_brk_" << n;
+         t.brk = ss.str();
+         brk = new vhdl_labeled_loop_stmt(t.brk);
+         brk->set_comment("A break leaves the loop in it");
+      }
+      if (has_cont) {
+         ostringstream ss;
+         ss << "sv_cont_" << n;
+         t.cont = ss.str();
+         cont = new vhdl_labeled_loop_stmt(t.cont);
+         cont->set_comment("One pass of the loop body: a continue ends it");
+      }
+   }
+   g_loop_targets.push_back(t);   // even an empty one: it hides outer loops
+   return brk;
+}
+
+// Close the targets begin_loop_jumps opened
+static void end_loop_jumps()
+{
+   assert(!g_loop_targets.empty());
+   g_loop_targets.pop_back();
+}
+
+// The statement the loop's container receives: `loop' wrapped in its break
+// loop when it has one
+static vhdl_seq_stmt *wrap_break(vhdl_labeled_loop_stmt *brk, vhdl_seq_stmt *loop)
+{
+   if (brk == NULL)
+      return loop;
+   brk->get_container()->add_stmt(loop);
+   brk->get_container()->add_stmt(new vhdl_exit_stmt(brk->get_label()));
+   return brk;
+}
+
+// The container a loop's body is drawn into: the continue wrapper's (which
+// close_continue then closes into `loop_c') or the loop's own
+static stmt_container *continue_body(vhdl_labeled_loop_stmt *cont,
+                                     stmt_container *loop_c)
+{
+   return cont ? cont->get_container() : loop_c;
+}
+
+static void close_continue(vhdl_labeled_loop_stmt *cont, stmt_container *loop_c)
+{
+   if (cont == NULL)
+      return;
+   cont->get_container()->add_stmt(new vhdl_exit_stmt(cont->get_label()));
+   loop_c->add_stmt(cont);
+}
+
+static int draw_break_continue(vhdl_procedural *, stmt_container *container,
+                               ivl_statement_t stmt)
+{
+   const bool is_break = ivl_statement_type(stmt) == IVL_ST_BREAK;
+   const std::string label = g_loop_targets.empty() ? std::string()
+      : (is_break ? g_loop_targets.back().brk : g_loop_targets.back().cont);
+   if (label.empty()) {
+      error("%s:%d: %s outside a loop has no VHDL translation",
+            ivl_stmt_file(stmt), ivl_stmt_lineno(stmt),
+            is_break ? "break" : "continue");
+      return 1;
+   }
+   vhdl_exit_stmt *s = new vhdl_exit_stmt(label);
+   ostringstream cs;
+   cs << (is_break ? "break" : "continue") << " (" << ivl_stmt_file(stmt)
+      << ":" << ivl_stmt_lineno(stmt) << ")";
+   s->set_comment(cs.str());
+   container->add_stmt(s);
+   return 0;
 }
 
 static void reset_automatic_vars(vhdl_procedural *proc, stmt_container *container,
@@ -1676,14 +2443,43 @@ static vhdl_var_ref *make_assign_lhs(ivl_lval_t lval, vhdl_scope *scope)
          lval_ref->set_slice(word, 0);
       else if (base)
          lval_ref->set_slice(base, 0);
-      // A part-select within the selected word composes after it
+      // A bit or part-select within the selected word composes after it,
+      // and the target is that select: one bit is a scalar, a part a
+      // vector of its own width, so the right-hand side is sized to it (it
+      // was sized to the whole word: `mem[i][j] = <1-bit expr>' put a
+      // vector into one logic3d element, which nvc rejects)
       if (word && base)
-         lval_ref->add_extra_slice(base, lval_width - 1);
+         lval_ref->slice_element(base, lval_width - 1);
    }
    else if ((base || word) && ivl_signal_width(sig) > 1)
       lval_ref->set_slice(base ? base : word, lval_width - 1);
 
    return lval_ref;
+}
+
+/*
+ * A constant word index or bit offset with an x or z bit: ivl's mark for a
+ * constant select it ignores (elab_lval.cc: a word outside the array or an
+ * undefined index, "ignoring out of bounds l-value array access" / "ignoring
+ * undefined l-value array access"). vvp drops such a store; its translation
+ * stored into word 0 (the x constant read as its value bits), so
+ * `array1[0] = 1' on `reg array1[2:1]' overwrote array1[1].
+ */
+static bool const_index_undefined(ivl_expr_t e)
+{
+   if (e == NULL || ivl_expr_type(e) != IVL_EX_NUMBER)
+      return false;
+   const char *bits = ivl_expr_bits(e);
+   for (unsigned i = 0; i < ivl_expr_width(e); i++)
+      if (bits[i] == 'x' || bits[i] == 'z')
+         return true;
+   return false;
+}
+
+static bool lval_store_ignored(ivl_lval_t lval)
+{
+   return const_index_undefined(ivl_lval_idx(lval))
+      || const_index_undefined(ivl_lval_part_off(lval));
 }
 
 static bool assignment_lvals(ivl_statement_t stmt, vhdl_procedural *proc,
@@ -1771,12 +2567,12 @@ static void reset_automatic_vars(vhdl_procedural *proc, stmt_container *containe
       vhdl_var_ref *lhs = new vhdl_var_ref(decl->get_name(), new vhdl_type(*t));
       vhdl_decl::assign_type_t atype = decl->assignment_type();
       if (atype == vhdl_decl::ASSIGN_NONBLOCK) {
-         proc->add_blocking_target(lhs);
-         if (proc->get_scope()->initializing()
-             || proc->was_deposited(lhs->get_name())) {
+         if (deposits_signal(proc, lhs->get_name(), true)) {
             atype = vhdl_decl::ASSIGN_BLOCK;
             proc->mark_deposited(lhs->get_name());
          }
+         else
+            proc->add_blocking_target(lhs);
       }
       vhdl_abstract_assign_stmt *a = assign_for(atype, lhs, v);
       ostringstream ss;
@@ -1797,6 +2593,51 @@ static void reset_automatic_vars(vhdl_procedural *proc, stmt_container *containe
  */
 static std::map<ivl_scope_t, std::pair<ivl_process_t, std::string> > g_auto_task_site;
 
+// A process other than the task's first caller works on its own copy of the
+// task's variables: process variables, between the call's ALLOC and FREE
+// (the task's variables there are its, as an automatic activation's are).
+// The task: the copies its current activation uses
+static std::map<ivl_scope_t, std::vector<ivl_signal_t> > g_auto_task_copies;
+// (process, variable) -> the name of that process's copy
+static std::map<std::pair<vhdl_procedural*, ivl_signal_t>, std::string>
+   g_auto_task_copy_names;
+
+static void use_own_task_copies(vhdl_procedural *proc, ivl_scope_t task)
+{
+   std::vector<ivl_signal_t> &copies = g_auto_task_copies[task];
+   for (unsigned i = 0; i < ivl_scope_sigs(task); i++) {
+      ivl_signal_t sig = ivl_scope_sig(task, i);
+      if (!seen_signal_before(sig))
+         continue;
+      vhdl_scope *home = find_scope_for_signal(sig);
+      vhdl_decl *decl =
+         home ? home->get_decl(get_renamed_signal(sig)) : NULL;
+      if (decl == NULL || decl->get_type() == NULL)
+         continue;
+      std::pair<vhdl_procedural*, ivl_signal_t> key(proc, sig);
+      std::map<std::pair<vhdl_procedural*, ivl_signal_t>,
+               std::string>::iterator nit = g_auto_task_copy_names.find(key);
+      std::string name;
+      if (nit != g_auto_task_copy_names.end())
+         name = nit->second;
+      else {
+         name = get_renamed_signal(sig) + "_own";
+         while (proc->get_scope()->have_declared(name))
+            name += "_";
+         vhdl_var_decl *v = new vhdl_var_decl(name,
+                                              new vhdl_type(*decl->get_type()));
+         ostringstream cs;
+         cs << "This process's copy of " << ivl_scope_name(task) << "."
+            << ivl_signal_basename(sig) << " (automatic)";
+         v->set_comment(cs.str());
+         proc->get_scope()->add_decl(v);
+         g_auto_task_copy_names[key] = name;
+      }
+      push_signal_home(sig, name, proc->get_scope());
+      copies.push_back(sig);
+   }
+}
+
 static int draw_alloc_free(vhdl_procedural *proc, stmt_container *container,
                            ivl_statement_t stmt)
 {
@@ -1809,8 +2650,17 @@ static int draw_alloc_free(vhdl_procedural *proc, stmt_container *container,
             scope ? ivl_scope_name(scope) : "?");
       return 1;
    }
-   if (!alloc)
+   if (!alloc) {
+      // The activation ends: the variables get their homes back
+      std::map<ivl_scope_t, std::vector<ivl_signal_t> >::iterator cit =
+         g_auto_task_copies.find(scope);
+      if (cit != g_auto_task_copies.end()) {
+         for (size_t k = 0; k < cit->second.size(); k++)
+            pop_signal_home(cit->second[k]);
+         g_auto_task_copies.erase(cit);
+      }
       return 0;
+   }
    ivl_process_t here = get_active_ivl_process();
    ostringstream site;
    site << ivl_stmt_file(stmt) << ":" << ivl_stmt_lineno(stmt);
@@ -1819,14 +2669,219 @@ static int draw_alloc_free(vhdl_procedural *proc, stmt_container *container,
    if (it == g_auto_task_site.end())
       g_auto_task_site[scope] = std::make_pair(here, site.str());
    else if (it->second.first != here) {
-      error("%s: automatic task %s is called from more than one process "
-            "(here, and at %s): its activations would share one copy of its "
-            "variables in VHDL, which has no translation", site.str().c_str(),
-            ivl_scope_name(scope), it->second.second.c_str());
-      return 1;
+      // Called from another process too: this activation (and every one of
+      // this process) works on its own copy, as Verilog gives each
+      // activation its own variables
+      if (g_auto_task_copies.count(scope)) {
+         error("%s: automatic task %s is entered again before its activation "
+               "ends: that has no VHDL translation", site.str().c_str(),
+               ivl_scope_name(scope));
+         return 1;
+      }
+      use_own_task_copies(proc, scope);
    }
    reset_automatic_vars(proc, container, scope, true);
    return 0;
+}
+
+/*
+ * Whether an assignment to signal `name' in `proc' is a deposit (`name := v'
+ * -- nvc's --std=2040 deposit on a signal: the new value lands at once, so
+ * the process's own later reads see it, and the processes it wakes run in
+ * the next delta, after this one suspends) rather than a signal assignment
+ * (`name <= v'):
+ *  - a time-zero assignment of an initial process: it makes no driver to
+ *    conflict with an always block that assigns the signal too;
+ *  - any assignment to a signal the process deposited before: nvc drops a
+ *    `<=' that follows a `:=' on the same signal;
+ *  - a blocking assignment (`blocking') in a process that deposits them all
+ *    (vhdl_procedural::deposit_blocking). A `<=' there needed a `wait for
+ *    0 ns' before each later read of the signal, and that wait let every
+ *    other process run in the middle of this one, where Verilog runs a
+ *    process from one suspension to the next without yielding (ivtest
+ *    vhdl_test2: the dut, sensitive to `in', ran between `in = in+1' and
+ *    `mask = ...' and saw the new `in' with the old `mask').
+ */
+/*
+ * The processes that write each variable (census_writers, a pre-pass over
+ * every process before any is drawn): assignment, force and procedural
+ * assign targets, the memory of $readmemh/$readmemb, the destination of
+ * $swrite* and $sformat, the seed of $random/$urandom/$dist_* and
+ * $value$plusargs's variable, in a process's statements and in the tasks it
+ * calls.
+ */
+static std::map<ivl_signal_t, std::set<ivl_process_t> > g_writers;
+
+static void census_write(ivl_expr_t e, ivl_process_t p)
+{
+   if (e != NULL && ivl_expr_type(e) == IVL_EX_SIGNAL)
+      g_writers[ivl_expr_signal(e)].insert(p);
+}
+
+static void census_expr(ivl_expr_t e, ivl_process_t p)
+{
+   if (e == NULL)
+      return;
+   switch (ivl_expr_type(e)) {
+   case IVL_EX_SFUNC:
+      {
+         const char *n = ivl_expr_name(e);
+         if (ivl_expr_parms(e) >= 1
+             && (strcmp(n, "$random") == 0 || strcmp(n, "$urandom") == 0
+                 || strncmp(n, "$dist_", 6) == 0))
+            census_write(ivl_expr_parm(e, 0), p);
+         if (ivl_expr_parms(e) >= 2 && strcmp(n, "$value$plusargs") == 0)
+            census_write(ivl_expr_parm(e, 1), p);
+      }
+      // fallthrough
+   case IVL_EX_UFUNC:
+   case IVL_EX_CONCAT:
+      for (unsigned i = 0; i < ivl_expr_parms(e); i++)
+         census_expr(ivl_expr_parm(e, i), p);
+      break;
+   case IVL_EX_BINARY:
+   case IVL_EX_SELECT:
+      census_expr(ivl_expr_oper1(e), p);
+      census_expr(ivl_expr_oper2(e), p);
+      break;
+   case IVL_EX_UNARY:
+      census_expr(ivl_expr_oper1(e), p);
+      break;
+   case IVL_EX_TERNARY:
+      census_expr(ivl_expr_oper1(e), p);
+      census_expr(ivl_expr_oper2(e), p);
+      census_expr(ivl_expr_oper3(e), p);
+      break;
+   default:
+      break;
+   }
+}
+
+static void census_stmt(ivl_statement_t s, ivl_process_t p,
+                        std::set<ivl_scope_t> &tasks)
+{
+   if (s == NULL)
+      return;
+   switch (ivl_statement_type(s)) {
+   case IVL_ST_ASSIGN:
+   case IVL_ST_ASSIGN_NB:
+   case IVL_ST_CASSIGN:
+   case IVL_ST_DEASSIGN:
+   case IVL_ST_FORCE:
+   case IVL_ST_RELEASE:
+      for (unsigned i = 0; i < ivl_stmt_lvals(s); i++)
+         if (ivl_signal_t sig = ivl_lval_sig(ivl_stmt_lval(s, i)))
+            g_writers[sig].insert(p);
+      if (ivl_statement_type(s) != IVL_ST_DEASSIGN
+          && ivl_statement_type(s) != IVL_ST_RELEASE)
+         census_expr(ivl_stmt_rval(s), p);
+      break;
+   case IVL_ST_BLOCK:
+   case IVL_ST_FORK:
+   case IVL_ST_FORK_JOIN_ANY:
+   case IVL_ST_FORK_JOIN_NONE:
+      for (unsigned i = 0; i < ivl_stmt_block_count(s); i++)
+         census_stmt(ivl_stmt_block_stmt(s, i), p, tasks);
+      break;
+   case IVL_ST_CONDIT:
+      census_expr(ivl_stmt_cond_expr(s), p);
+      census_stmt(ivl_stmt_cond_true(s), p, tasks);
+      census_stmt(ivl_stmt_cond_false(s), p, tasks);
+      break;
+   case IVL_ST_CASE:
+   case IVL_ST_CASER:
+   case IVL_ST_CASEX:
+   case IVL_ST_CASEZ:
+      census_expr(ivl_stmt_cond_expr(s), p);
+      for (unsigned i = 0; i < ivl_stmt_case_count(s); i++)
+         census_stmt(ivl_stmt_case_stmt(s, i), p, tasks);
+      break;
+   case IVL_ST_FORLOOP:
+      census_stmt(ivl_stmt_init_stmt(s), p, tasks);
+      census_expr(ivl_stmt_cond_expr(s), p);
+      census_stmt(ivl_stmt_step_stmt(s), p, tasks);
+      census_stmt(ivl_stmt_sub_stmt(s), p, tasks);
+      break;
+   case IVL_ST_WHILE:
+   case IVL_ST_DO_WHILE:
+   case IVL_ST_REPEAT:
+      census_expr(ivl_stmt_cond_expr(s), p);
+      census_stmt(ivl_stmt_sub_stmt(s), p, tasks);
+      break;
+   case IVL_ST_FOREVER:
+   case IVL_ST_DELAY:
+   case IVL_ST_DELAYX:
+   case IVL_ST_WAIT:
+      census_stmt(ivl_stmt_sub_stmt(s), p, tasks);
+      break;
+   case IVL_ST_UTASK:
+      {
+         ivl_scope_t t = ivl_stmt_call(s);
+         if (t != NULL && tasks.insert(t).second)
+            census_stmt(ivl_scope_def(t), p, tasks);
+      }
+      break;
+   case IVL_ST_STASK:
+      {
+         const char *n = ivl_stmt_name(s);
+         const unsigned np = ivl_stmt_parm_count(s);
+         if ((strcmp(n, "$readmemh") == 0 || strcmp(n, "$readmemb") == 0)
+             && np >= 2)
+            census_write(ivl_stmt_parm(s, 1), p);
+         if ((strncmp(n, "$swrite", 7) == 0 || strcmp(n, "$sformat") == 0)
+             && np >= 1)
+            census_write(ivl_stmt_parm(s, 0), p);
+         if ((strcmp(n, "$random") == 0 || strcmp(n, "$urandom") == 0)
+             && np >= 1)
+            census_write(ivl_stmt_parm(s, 0), p);
+         for (unsigned i = 0; i < np; i++)
+            census_expr(ivl_stmt_parm(s, i), p);
+      }
+      break;
+   default:
+      break;
+   }
+}
+
+extern "C" int census_writers(ivl_process_t p, void *)
+{
+   std::set<ivl_scope_t> tasks;
+   census_stmt(ivl_process_stmt(p), p, tasks);
+   return 0;
+}
+
+// The process being drawn is the only one that writes `sig' (census_writers)
+static bool sole_writer(ivl_signal_t sig)
+{
+   ivl_process_t here = get_active_ivl_process();
+   std::map<ivl_signal_t, std::set<ivl_process_t> >::const_iterator it =
+      g_writers.find(sig);
+   return here != NULL && it != g_writers.end() && it->second.size() == 1
+      && *it->second.begin() == here;
+}
+
+static bool deposits_signal(vhdl_procedural *proc, const std::string &name,
+                            bool blocking, ivl_signal_t sig)
+{
+   // A nonblocking assignment of the variable's only writer is a `<=' (one
+   // VHDL driver, no conflict), landing in the next delta as any NBA does.
+   // It was a deposit in an initial block (before the end of its first
+   // delay's statement, after an event control, or once the block had
+   // deposited the variable), which lands at once: the block's own later
+   // reads in the time step (`w <= 7; $display(w)' printed 7, vvp the old
+   // value) and what ran after it in the same delta saw the new value. nvc
+   // applies the `<=' although an earlier deposit made the signal differ
+   // from the driver (rt/model.c sched_driver). With other writers it stays
+   // a deposit (two drivers of an unresolved signal: the first one's value
+   // wins). (A block that a deposited clock wakes at the same time also
+   // runs in that next delta; the round-6 repair's probes of a stimulus
+   // `<=' at a clock edge, in every order of clock, stimulus and flop,
+   // sample what vvp samples. nvc's Verilog NBA region, its nonblocking
+   // sched_deposit, has no VHDL form.)
+   if (!blocking && sig != NULL && proc->deposit_blocking() && sole_writer(sig))
+      return false;
+   return proc->get_scope()->initializing() || proc->was_deposited(name)
+      || (blocking && proc->deposit_blocking());
 }
 
 /*
@@ -1881,6 +2936,12 @@ static void emit_wait_for_0(vhdl_procedural *proc,
    vhdl_var_set_t read;
    expr->find_vars(read);
 
+   // A read of a blocking target this process assigns with `<='. (A deposit
+   // is read back at once and registers no target, so no wait is made for
+   // it: a process waiting on the deposited variable -- a VHDL dut's
+   // process(input) -- no longer runs in the middle of this one, and a net
+   // fed by it is not updated before the process suspends, as in Verilog:
+   // ivtest sched2.)
    bool need_wait_for_0 = false;
    for (vhdl_var_set_t::const_iterator it = read.begin();
         it != read.end(); ++it) {
@@ -1937,20 +2998,167 @@ static bool expr_reads_net(ivl_expr_t e)
    }
 }
 
-// A Verilog variable holds a 4-state value and no strength: a scalar read
-// of a net that a pull, a tri1/tri0 or an AMS BIDIR A2D drives weakly
+// A Verilog variable holds a 4-state value and no strength: a read of a
+// net that a pull, a tri1/tri0 or an AMS BIDIR A2D drives weakly
 // (L3D_H/L/W) is stored strong, so the variable reads -- and drives,
 // through a continuous assignment -- like Verilog's (H -> 1, L -> 0, W ->
-// X; l3d_strengthen keeps Z, X and U).  Identity on strong values.
+// X; l3d_strengthen keeps Z, X and U).  Identity on strong values.  A
+// vector bit by bit (`data = pads' with BIDIR pads kept L3D_H/L bits,
+// which lost to a strong driver of a net the variable drives).
 static vhdl_expr *variable_value(vhdl_expr *rhs, ivl_expr_t src)
 {
    if (!get_sv2vhdl_mode() || rhs == NULL || rhs->get_type() == NULL
-       || rhs->get_type()->get_name() != VHDL_TYPE_LOGIC3D
+       || (rhs->get_type()->get_name() != VHDL_TYPE_LOGIC3D
+           && rhs->get_type()->get_name() != VHDL_TYPE_LOGIC3D_VECTOR)
        || !expr_reads_net(src))
       return rhs;
-   vhdl_fcall *f = new vhdl_fcall("l3d_strengthen", vhdl_type::logic3d());
+   vhdl_fcall *f = new vhdl_fcall("l3d_strengthen", new vhdl_type(*rhs->get_type()));
    f->add_expr(rhs);
    return f;
+}
+
+/*
+ * Read a run-time index once, at the statement, into a fresh process
+ * variable <prefix><n>, and open `if <n> >= lo and <n> <= hi then': what is
+ * drawn into the returned container stores only for an index inside lo..hi
+ * (a store outside is dropped, as vvp drops it; a VHDL index stops the run
+ * there). *ref: a reference to the variable, for the store's select.
+ */
+static stmt_container *guard_index(vhdl_procedural *proc,
+                                   stmt_container *container,
+                                   vhdl_expr *index, int lo, int hi,
+                                   const char *prefix, const char *comment,
+                                   vhdl_var_ref **ref)
+{
+   static int guard_count = 0;
+   ostringstream ix;
+   ix << prefix << guard_count++;
+   proc->get_scope()->add_decl(new vhdl_var_decl(ix.str(), vhdl_type::integer()));
+   vhdl_assign_stmt *capture = new vhdl_assign_stmt(
+      new vhdl_var_ref(ix.str(), vhdl_type::integer()), index);
+   capture->set_comment(comment);
+   container->add_stmt(capture);
+   vhdl_binop_expr *in_range =
+      new vhdl_binop_expr(VHDL_BINOP_AND, vhdl_type::boolean());
+   in_range->add_expr(new vhdl_binop_expr(
+      new vhdl_var_ref(ix.str(), vhdl_type::integer()),
+      VHDL_BINOP_GEQ, new vhdl_const_int(lo), vhdl_type::boolean()));
+   in_range->add_expr(new vhdl_binop_expr(
+      new vhdl_var_ref(ix.str(), vhdl_type::integer()),
+      VHDL_BINOP_LEQ, new vhdl_const_int(hi), vhdl_type::boolean()));
+   vhdl_if_stmt *guard = new vhdl_if_stmt(in_range);
+   container->add_stmt(guard);
+   *ref = new vhdl_var_ref(ix.str(), vhdl_type::integer());
+   return guard->get_then_container();
+}
+
+/*
+ * The store of the w-bit value `rhs' (w > 1) at the run-time bit offset
+ * `offset' of a vector whose bits run lo..hi (a vector signal, or a memory
+ * word): each bit lands only inside the vector, as Verilog stores it (a VHDL
+ * slice stopped the run), with the assignment's intra-assignment delay:
+ *    OOB_WriteV_Tmp_<n> := <rhs>;   OOB_WriteV_Idx_<n> := <offset>;
+ *    if OOB_WriteV_Idx_<n> >= lo - (w-1) and OOB_WriteV_Idx_<n> <= hi then
+ *       for OOB_P in 0 to w-1 loop
+ *          if <idx> + OOB_P >= lo and <idx> + OOB_P <= hi then
+ *             <bit(idx + OOB_P)> := | <= OOB_WriteV_Tmp_<n>(OOB_P) [after d];
+ *          end if;
+ *       end loop;
+ *    end if;
+ * (the outer test keeps idx + OOB_P from overflowing INTEGER for an extreme
+ * index). make_bit(pos): a fresh reference to the target bit at offset pos;
+ * whole: a reference to the whole target signal. Deposit or assign as
+ * make_assignment does for a whole target; a delayed store keeps its delay
+ * (it was deposited at once: `v[k +: 2] <= #3 v2' landed 3 time units early).
+ * Returns false when the store cannot be drawn here.
+ */
+static bool draw_runtime_part_store(vhdl_procedural *proc,
+                                    stmt_container *container,
+                                    ivl_statement_t stmt, bool emul_blocking,
+                                    vhdl_decl *decl, vhdl_var_ref *whole,
+                                    vhdl_expr *rhs, vhdl_expr *offset,
+                                    int w, int lo, int hi,
+                                    std::function<vhdl_var_ref *(vhdl_expr *)>
+                                       make_bit)
+{
+   vhdl_expr *after = NULL;
+   if (ivl_expr_t i_delay = ivl_stmt_delay_expr(stmt)) {
+      if ((after = translate_time_expr(i_delay)) == NULL)
+         return false;
+      emit_wait_for_0(proc, container, stmt, after);
+   }
+
+   vhdl_decl::assign_type_t at = decl->assignment_type();
+   if (at == vhdl_decl::ASSIGN_NONBLOCK && after == NULL
+       && deposits_signal(proc, whole->get_name(), emul_blocking,
+                          ivl_lval_sig(ivl_stmt_lval(stmt, 0)))) {
+      at = vhdl_decl::ASSIGN_BLOCK;
+      proc->mark_deposited(whole->get_name());
+   }
+   if (!check_valid_assignment(at, proc, stmt))
+      return false;
+   if (at == vhdl_decl::ASSIGN_NONBLOCK && emul_blocking)
+      proc->add_blocking_target(whole);
+
+   static int oobv_count = 0;
+   ostringstream tn, ix;
+   tn << "OOB_WriteV_Tmp_" << oobv_count;
+   ix << "OOB_WriteV_Idx_" << oobv_count++;
+   vhdl_type lvw(VHDL_TYPE_LOGIC3D_VECTOR, w - 1, 0);
+   vhdl_var_decl *td = new vhdl_var_decl(
+      tn.str(), vhdl_type::logic3d_vector(w - 1, 0));
+   proc->get_scope()->add_decl(td);
+   vhdl_var_decl *xd = new vhdl_var_decl(ix.str(), vhdl_type::integer());
+   proc->get_scope()->add_decl(xd);
+   container->add_stmt(new vhdl_assign_stmt(
+      td->make_ref(), variable_value(rhs->cast(&lvw), ivl_stmt_rval(stmt))));
+   container->add_stmt(new vhdl_assign_stmt(xd->make_ref(), offset));
+
+   vhdl_binop_expr *outer = new vhdl_binop_expr(
+      new vhdl_binop_expr(
+         new vhdl_var_ref(ix.str().c_str(), vhdl_type::integer()),
+         VHDL_BINOP_GEQ, new vhdl_const_int(lo - (w - 1)),
+         vhdl_type::boolean()),
+      VHDL_BINOP_AND,
+      new vhdl_binop_expr(
+         new vhdl_var_ref(ix.str().c_str(), vhdl_type::integer()),
+         VHDL_BINOP_LEQ, new vhdl_const_int(hi), vhdl_type::boolean()),
+      vhdl_type::boolean());
+   vhdl_if_stmt *outer_if = new vhdl_if_stmt(outer);
+
+   vhdl_for_stmt *loop = new vhdl_for_stmt("OOB_P",
+      new vhdl_const_int(0), new vhdl_const_int(w - 1));
+   vhdl_expr *pos = new vhdl_binop_expr(
+      new vhdl_var_ref(ix.str().c_str(), vhdl_type::integer()),
+      VHDL_BINOP_ADD, new vhdl_var_ref("OOB_P", vhdl_type::integer()),
+      vhdl_type::integer());
+   vhdl_binop_expr *guard = new vhdl_binop_expr(
+      new vhdl_binop_expr(pos, VHDL_BINOP_GEQ, new vhdl_const_int(lo),
+                          vhdl_type::boolean()),
+      VHDL_BINOP_AND,
+      new vhdl_binop_expr(
+         new vhdl_binop_expr(
+            new vhdl_var_ref(ix.str().c_str(), vhdl_type::integer()),
+            VHDL_BINOP_ADD, new vhdl_var_ref("OOB_P", vhdl_type::integer()),
+            vhdl_type::integer()),
+         VHDL_BINOP_LEQ, new vhdl_const_int(hi), vhdl_type::boolean()),
+      vhdl_type::boolean());
+   vhdl_if_stmt *iff = new vhdl_if_stmt(guard);
+   vhdl_var_ref *bit_lhs = make_bit(new vhdl_binop_expr(
+      new vhdl_var_ref(ix.str().c_str(), vhdl_type::integer()),
+      VHDL_BINOP_ADD, new vhdl_var_ref("OOB_P", vhdl_type::integer()),
+      vhdl_type::integer()));
+   vhdl_var_ref *bit_rhs = new vhdl_var_ref(
+      tn.str(), vhdl_type::logic3d_vector(w - 1, 0));
+   bit_rhs->set_slice(new vhdl_var_ref("OOB_P", vhdl_type::integer()));
+   vhdl_abstract_assign_stmt *a = assign_for(at, bit_lhs, bit_rhs);
+   if (after)
+      a->set_after(after);
+   iff->get_then_container()->add_stmt(a);
+   loop->get_container()->add_stmt(iff);
+   outer_if->get_then_container()->add_stmt(loop);
+   container->add_stmt(outer_if);
+   return true;
 }
 
 // Generate an assignment of type T for the Verilog statement stmt.
@@ -1979,8 +3187,10 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
       && lvals.front()->get_slice() == NULL
       && lvals.front()->extra_range_width() <= 0;
    if (ivl_expr_type(rval) == IVL_EX_TERNARY && plain_lval) {
+      begin_conditional_eval();   // one branch runs (translate_ternary)
       rhs = translate_expr(ivl_expr_oper2(rval));
       rhs2 = translate_expr(ivl_expr_oper3(rval));
+      end_conditional_eval();
       if (rhs2 == NULL)
          return;
    }
@@ -2099,6 +3309,12 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
       emit_wait_for_0(proc, container, stmt, rhs2);
 
    if (lvals.size() == 1) {
+      // A constant select ivl ignores (const_index_undefined): the store is
+      // dropped, as vvp drops it; the right-hand side was evaluated above,
+      // as vvp evaluates it
+      if (lval_store_ignored(ivl_stmt_lval(stmt, 0)))
+         return;
+
       vhdl_var_ref *lhs = lvals.front();
       bool clamped = false;
 
@@ -2119,11 +3335,11 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
                                   lhs_decl->get_type()->get_msb());
          const int whi = std::max(lhs_decl->get_type()->get_lsb(),
                                   lhs_decl->get_type()->get_msb());
-         if (lhs->get_slice() != NULL && lhs->extra_range_width() < 0) {
+         if (lhs->get_slice() != NULL) {
             vhdl_const_int *wb =
                dynamic_cast<vhdl_const_int*>(lhs->get_slice());
             if (wb && (wb->get_value() < wlo || wb->get_value() > whi))
-               return;      // whole-word write out of range: lost
+               return;      // a word (or part of one) out of range: lost
          }
          else if (lhs->get_slice() == NULL && wlo == whi
                   && rhs->get_type()
@@ -2131,6 +3347,39 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
                         == VHDL_TYPE_LOGIC3D_VECTOR) {
             // Single-element array assigned a vector: target the element
             lhs->set_slice(new vhdl_const_int(wlo), 0);
+         }
+
+         // A store at a run-time word index outside the array is dropped,
+         // as vvp drops it, where a VHDL index stops the run. The index is
+         // read once, at the statement, as Verilog does:
+         //    OOB_WIdx_<n> := <index>;
+         //    if OOB_WIdx_<n> >= lo and OOB_WIdx_<n> <= hi then
+         //       <the store, at word OOB_WIdx_<n>>
+         //    end if;
+         if (lhs->get_slice() != NULL
+             && dynamic_cast<vhdl_const_int*>(lhs->get_slice()) == NULL) {
+            static int oob_widx_count = 0;
+            ostringstream ix;
+            ix << "OOB_WIdx_" << oob_widx_count++;
+            proc->get_scope()->add_decl(
+               new vhdl_var_decl(ix.str(), vhdl_type::integer()));
+            vhdl_assign_stmt *capture = new vhdl_assign_stmt(
+               new vhdl_var_ref(ix.str(), vhdl_type::integer()),
+               lhs->get_slice());
+            capture->set_comment("A store outside the array is dropped");
+            container->add_stmt(capture);
+            lhs->replace_slice(new vhdl_var_ref(ix.str(), vhdl_type::integer()));
+            vhdl_binop_expr *in_range =
+               new vhdl_binop_expr(VHDL_BINOP_AND, vhdl_type::boolean());
+            in_range->add_expr(new vhdl_binop_expr(
+               new vhdl_var_ref(ix.str(), vhdl_type::integer()),
+               VHDL_BINOP_GEQ, new vhdl_const_int(wlo), vhdl_type::boolean()));
+            in_range->add_expr(new vhdl_binop_expr(
+               new vhdl_var_ref(ix.str(), vhdl_type::integer()),
+               VHDL_BINOP_LEQ, new vhdl_const_int(whi), vhdl_type::boolean()));
+            vhdl_if_stmt *guard = new vhdl_if_stmt(in_range);
+            container->add_stmt(guard);
+            container = guard->get_then_container();
          }
       }
 
@@ -2174,95 +3423,100 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
             }
          }
       }
+
+      // A bit or a part of a memory word at a run-time offset (`m[i][k] = b',
+      // `m[i][k +: 4] = v'): the bits outside the word are dropped, as vvp
+      // drops them (`m(OOB_WIdx_0)(l3d_index(k, True)) := ...' stopped the
+      // run). A bit: under guard_index; a part: bit by bit
+      // (draw_runtime_part_store).
+      if (get_sv2vhdl_mode() && lhs_decl && lhs_decl->get_type()
+          && lhs_decl->get_type()->get_name() == VHDL_TYPE_ARRAY
+          && lhs->get_slice() != NULL
+          && lhs->extra_range_width() >= 0
+          && dynamic_cast<vhdl_const_int*>(lhs->last_extra_base()) == NULL
+          && lhs_decl->get_type()->get_base()
+          && lhs_decl->get_type()->get_base()->get_name()
+                == VHDL_TYPE_LOGIC3D_VECTOR) {
+         const vhdl_type *et = lhs_decl->get_type()->get_base();
+         const int lo_e = std::min(et->get_lsb(), et->get_msb());
+         const int hi_e = std::max(et->get_lsb(), et->get_msb());
+         if (lhs->extra_range_width() == 0) {
+            vhdl_var_ref *ixr = NULL;
+            container = guard_index(proc, container, lhs->last_extra_base(),
+                                    lo_e, hi_e, "OOB_EIdx_",
+                                    "A bit outside the word is dropped", &ixr);
+            lhs->set_last_extra(ixr, 0);
+         }
+         else {
+            // The word's index: a constant, or guard_index's variable
+            vhdl_expr *word = lhs->get_slice();
+            vhdl_const_int *cw = dynamic_cast<vhdl_const_int*>(word);
+            vhdl_var_ref *vw = dynamic_cast<vhdl_var_ref*>(word);
+            if (cw == NULL && vw == NULL) {
+               error("%s:%d: no VHDL translation for this store into a part "
+                     "of a memory word", ivl_stmt_file(stmt),
+                     ivl_stmt_lineno(stmt));
+               return;
+            }
+            const int cwv = cw ? cw->get_value() : 0;
+            const std::string vwn = vw ? vw->get_name() : std::string();
+            const std::string name = lhs->get_name();
+            const vhdl_type *atype = lhs_decl->get_type();
+            vhdl_var_ref *whole = new vhdl_var_ref(name, new vhdl_type(*atype));
+            if (!draw_runtime_part_store(
+                   proc, container, stmt, emul_blocking, lhs_decl, whole, rhs,
+                   lhs->last_extra_base(), lhs->extra_range_width() + 1,
+                   lo_e, hi_e,
+                   [&](vhdl_expr *pos) {
+                      vhdl_var_ref *r = new vhdl_var_ref(name,
+                                                         new vhdl_type(*atype));
+                      if (cw)
+                         r->set_slice(new vhdl_const_int(cwv), 0);
+                      else
+                         r->set_slice(new vhdl_var_ref(vwn,
+                                                       vhdl_type::integer()), 0);
+                      r->slice_element(pos, 0);
+                      return r;
+                   }))
+               return;
+            return;
+         }
+      }
+
       if (get_sv2vhdl_mode() && lhs->get_slice() && lhs_decl
           && lhs_decl->get_type()
           && lhs_decl->get_type()->get_name() == VHDL_TYPE_LOGIC3D_VECTOR) {
          vhdl_const_int *cb = dynamic_cast<vhdl_const_int*>(lhs->get_slice());
          const int lo_t = lhs_decl->get_type()->get_lsb();
          const int hi_t = lhs_decl->get_type()->get_msb();
+         if (cb == NULL && lhs->get_slice_width() == 0) {
+            // A bit-select store at a run-time offset outside the vector is
+            // dropped, as vvp drops it (`v(l3d_index(k, True)) := L3D_1'
+            // stopped the run: "index 6 outside of INTEGER range 3 downto
+            // 0"); the rest of the store is drawn as usual, under the guard
+            vhdl_var_ref *ixr = NULL;
+            container = guard_index(proc, container, lhs->get_slice(),
+                                    std::min(lo_t, hi_t), std::max(lo_t, hi_t),
+                                    "OOB_BIdx_",
+                                    "A bit outside the vector is dropped", &ixr);
+            lhs->replace_slice(ixr);
+         }
          if (cb == NULL && lhs->get_slice_width() > 0) {
             // Runtime-variable part-select write: any bit can be out of
-            // range, and Verilog silently drops those. Capture base and RHS,
-            // then write per-bit under a bounds guard.
-            const int w = lhs->get_slice_width() + 1;
-            static int oobv_count = 0;
-            ostringstream tn, ix;
-            tn << "OOB_WriteV_Tmp_" << oobv_count;
-            ix << "OOB_WriteV_Idx_" << oobv_count++;
-            vhdl_type lvw(VHDL_TYPE_LOGIC3D_VECTOR, w - 1, 0);
-            vhdl_var_decl *td = new vhdl_var_decl(
-               tn.str(), vhdl_type::logic3d_vector(w - 1, 0));
-            proc->get_scope()->add_decl(td);
-            vhdl_var_decl *xd = new vhdl_var_decl(ix.str(),
-                                                  vhdl_type::integer());
-            proc->get_scope()->add_decl(xd);
-            container->add_stmt(
-               new vhdl_assign_stmt(td->make_ref(), rhs->cast(&lvw)));
-            container->add_stmt(
-               new vhdl_assign_stmt(xd->make_ref(), lhs->get_slice()));
-
-            vhdl_decl::assign_type_t at = lhs_decl->assignment_type();
-            if (at == vhdl_decl::ASSIGN_NONBLOCK
-                && (proc->get_scope()->initializing()
-                    || proc->was_deposited(lhs->get_name()))) {
-               at = vhdl_decl::ASSIGN_BLOCK;
-               proc->mark_deposited(lhs->get_name());
-            }
-
-            // Outer gate keeps Idx + P from overflowing INTEGER when the
-            // captured index is extreme (e.g. int'high): constant-side
-            // comparisons only, computed at codegen.
-            vhdl_binop_expr *outer = new vhdl_binop_expr(
-               new vhdl_binop_expr(
-                  new vhdl_var_ref(ix.str().c_str(), vhdl_type::integer()),
-                  VHDL_BINOP_GEQ, new vhdl_const_int(lo_t - (w - 1)),
-                  vhdl_type::boolean()),
-               VHDL_BINOP_AND,
-               new vhdl_binop_expr(
-                  new vhdl_var_ref(ix.str().c_str(), vhdl_type::integer()),
-                  VHDL_BINOP_LEQ, new vhdl_const_int(hi_t),
-                  vhdl_type::boolean()),
-               vhdl_type::boolean());
-            vhdl_if_stmt *outer_if = new vhdl_if_stmt(outer);
-
-            vhdl_for_stmt *loop = new vhdl_for_stmt("OOB_P",
-               new vhdl_const_int(0), new vhdl_const_int(w - 1));
-            vhdl_expr *pos = new vhdl_binop_expr(
-               new vhdl_var_ref(ix.str().c_str(), vhdl_type::integer()),
-               VHDL_BINOP_ADD,
-               new vhdl_var_ref("OOB_P", vhdl_type::integer()),
-               vhdl_type::integer());
-            vhdl_binop_expr *guard = new vhdl_binop_expr(
-               new vhdl_binop_expr(pos, VHDL_BINOP_GEQ,
-                                   new vhdl_const_int(lo_t),
-                                   vhdl_type::boolean()),
-               VHDL_BINOP_AND,
-               new vhdl_binop_expr(
-                  new vhdl_binop_expr(
-                     new vhdl_var_ref(ix.str().c_str(), vhdl_type::integer()),
-                     VHDL_BINOP_ADD,
-                     new vhdl_var_ref("OOB_P", vhdl_type::integer()),
-                     vhdl_type::integer()),
-                  VHDL_BINOP_LEQ, new vhdl_const_int(hi_t),
-                  vhdl_type::boolean()),
-               vhdl_type::boolean());
-            vhdl_if_stmt *iff = new vhdl_if_stmt(guard);
-            vhdl_var_ref *bit_lhs = new vhdl_var_ref(
-               lhs->get_name(), new vhdl_type(*lhs_decl->get_type()));
-            bit_lhs->set_slice(new vhdl_binop_expr(
-               new vhdl_var_ref(ix.str().c_str(), vhdl_type::integer()),
-               VHDL_BINOP_ADD,
-               new vhdl_var_ref("OOB_P", vhdl_type::integer()),
-               vhdl_type::integer()));
-            vhdl_var_ref *bit_rhs = new vhdl_var_ref(
-               tn.str(), vhdl_type::logic3d_vector(w - 1, 0));
-            bit_rhs->set_slice(
-               new vhdl_var_ref("OOB_P", vhdl_type::integer()));
-            iff->get_then_container()->add_stmt(
-               assign_for(at, bit_lhs, bit_rhs));
-            loop->get_container()->add_stmt(iff);
-            outer_if->get_then_container()->add_stmt(loop);
-            container->add_stmt(outer_if);
+            // range, and Verilog silently drops those: bit by bit, under a
+            // bounds guard (draw_runtime_part_store)
+            const std::string name = lhs->get_name();
+            const vhdl_type *vtype = lhs_decl->get_type();
+            vhdl_var_ref *whole = new vhdl_var_ref(name, new vhdl_type(*vtype));
+            draw_runtime_part_store(
+               proc, container, stmt, emul_blocking, lhs_decl, whole, rhs,
+               lhs->get_slice(), lhs->get_slice_width() + 1,
+               std::min(lo_t, hi_t), std::max(lo_t, hi_t),
+               [&](vhdl_expr *pos) {
+                  vhdl_var_ref *r = new vhdl_var_ref(name, new vhdl_type(*vtype));
+                  r->set_slice(pos);
+                  return r;
+               });
             return;
          }
          if (cb) {
@@ -2321,7 +3575,32 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
       vhdl_decl *decl = proc->get_scope()->get_decl(lhs->get_name());
       assign_type = decl->assignment_type();
 
-      if (assign_type == vhdl_decl::ASSIGN_NONBLOCK && emul_blocking)
+      // A signal target is deposited (:=) instead of assigned (<=) where
+      // deposits_signal says so: in an initial process at time zero (no
+      // VHDL driver to conflict with an always process driving the same
+      // signal: a deposit writes the effective value without a driver,
+      // matching Verilog's shared-driver reg semantics), once the process
+      // deposited the signal before (nvc drops a later <= on a signal that
+      // was already assigned with :=), and for every blocking assignment of
+      // a deposit_blocking process. NVC --std=2040 supports := on signals
+      // (T_DEPOSIT).
+      //
+      // Exception: an NBA with an `after` delay (`a <= #2 1;`) needs the
+      // signal-assignment semantics so the value change is scheduled,
+      // not deposited immediately.  vhdl_assign_stmt has no `after`
+      // form, so keep it as a non-blocking signal assignment.
+      vhdl_decl::assign_type_t atype = decl->assignment_type();
+      if (atype == vhdl_decl::ASSIGN_NONBLOCK && after == NULL
+          && deposits_signal(proc, lhs->get_name(), emul_blocking,
+                             ivl_lval_sig(ivl_stmt_lval(stmt, 0)))) {
+         atype = vhdl_decl::ASSIGN_BLOCK;
+         proc->mark_deposited(lhs->get_name());
+      }
+
+      // A blocking <= to a signal: a later read in this process must first
+      // let it land (emit_wait_for_0), or the shadow pass (process.cc)
+      // gives it a variable. A deposit is read back at once.
+      if (atype == vhdl_decl::ASSIGN_NONBLOCK && emul_blocking)
           proc->add_blocking_target(lhs);
 
       // A small optimisation is to expand ternary RHSs into an
@@ -2338,15 +3617,14 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
 
          emit_wait_for_0(proc, container, stmt, test);
 
-         if (!check_valid_assignment(decl->assignment_type(), proc, stmt))
+         if (!check_valid_assignment(atype, proc, stmt))
             return;
 
          vhdl_if_stmt *vhdif = new vhdl_if_stmt(test);
 
          // True part
          {
-            vhdl_abstract_assign_stmt *a =
-               assign_for(decl->assignment_type(), lhs, rhs);
+            vhdl_abstract_assign_stmt *a = assign_for(atype, lhs, rhs);
             if (after)
                a->set_after(after);
             vhdif->get_then_container()->add_stmt(a);
@@ -2354,8 +3632,7 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
 
          // False part
          {
-            vhdl_abstract_assign_stmt *a =
-               assign_for(decl->assignment_type(), lhs2, rhs2);
+            vhdl_abstract_assign_stmt *a = assign_for(atype, lhs2, rhs2);
             if (after)
                a->set_after(translate_time_expr(i_delay));
             vhdif->get_else_container()->add_stmt(a);
@@ -2363,30 +3640,6 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
 
          container->add_stmt(vhdif);
          return;
-      }
-
-      // In initial processes, use deposit (:=) instead of signal
-      // assignment (<=) for signals. This avoids creating a VHDL driver
-      // that would conflict with always processes driving the same
-      // signal. Deposit writes the effective value without a driver,
-      // matching Verilog's shared-driver reg semantics.
-      // NVC --std=2040 supports := on signals (T_DEPOSIT).
-      //
-      // Exception: an NBA with an `after` delay (`a <= #2 1;`) needs the
-      // signal-assignment semantics so the value change is scheduled,
-      // not deposited immediately.  vhdl_assign_stmt has no `after`
-      // form, so keep it as a non-blocking signal assignment.
-      vhdl_decl::assign_type_t atype = decl->assignment_type();
-      // Deposit (:=) a signal at time zero to avoid a driver that would
-      // conflict with an always block. But once a signal is deposited, keep
-      // depositing it for the rest of the process: nvc silently drops a later
-      // <= on a signal that was already assigned with := (a time-zero deposit
-      // followed by a post-wait <= would lose the later value entirely).
-      if (atype == vhdl_decl::ASSIGN_NONBLOCK && after == NULL
-          && (proc->get_scope()->initializing()
-              || proc->was_deposited(lhs->get_name()))) {
-         atype = vhdl_decl::ASSIGN_BLOCK;
-         proc->mark_deposited(lhs->get_name());
       }
 
       if (!check_valid_assignment(atype, proc, stmt))
@@ -2413,10 +3666,17 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
 
       list<vhdl_var_ref*>::iterator it;
       int width_so_far = 0;
-      for (it = lvals.begin(); it != lvals.end(); ++it) {
+      int lval_no = 0;
+      for (it = lvals.begin(); it != lvals.end(); ++it, ++lval_no) {
          vhdl_var_ref *tmp_rhs = tmp_decl->make_ref();
 
          int lval_width = (*it)->get_type()->get_width();
+         // A part of the target that ivl ignores (const_index_undefined):
+         // its bits of the value are skipped, the rest are stored
+         if (lval_store_ignored(ivl_stmt_lval(stmt, lval_no))) {
+            width_so_far += ivl_lval_width(ivl_stmt_lval(stmt, lval_no));
+            continue;
+         }
          vhdl_expr *slice_base = new vhdl_const_int(width_so_far);
          tmp_rhs->set_slice(slice_base, lval_width - 1);
 
@@ -2436,11 +3696,19 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
          const vhdl_decl *decl = proc->get_scope()->get_decl((*it)->get_name());
          assign_type = decl->assignment_type();
 
-         if (!check_valid_assignment(decl->assignment_type(), proc, stmt))
+         // Deposit or assign, as for a single target
+         vhdl_decl::assign_type_t atype = assign_type;
+         if (atype == vhdl_decl::ASSIGN_NONBLOCK && after == NULL
+             && deposits_signal(proc, (*it)->get_name(), emul_blocking,
+                                ivl_lval_sig(ivl_stmt_lval(stmt, lval_no)))) {
+            atype = vhdl_decl::ASSIGN_BLOCK;
+            proc->mark_deposited((*it)->get_name());
+         }
+
+         if (!check_valid_assignment(atype, proc, stmt))
             return;
 
-         vhdl_abstract_assign_stmt *a =
-            assign_for(decl->assignment_type(), *it, tmp_rhs);
+         vhdl_abstract_assign_stmt *a = assign_for(atype, *it, tmp_rhs);
          if (after)
             a->set_after(after);
 
@@ -2448,7 +3716,7 @@ void make_assignment(vhdl_procedural *proc, stmt_container *container,
 
          width_so_far += lval_width;
 
-         if (assign_type == vhdl_decl::ASSIGN_NONBLOCK && emul_blocking)
+         if (atype == vhdl_decl::ASSIGN_NONBLOCK && emul_blocking)
             proc->add_blocking_target(*it);
       }
    }
@@ -2464,49 +3732,24 @@ static int draw_nbassign(vhdl_procedural *proc, stmt_container *container,
 {
    assert(proc->get_scope()->allow_signal_assignment());
 
+   // An intra-assignment event control (`x <= @(posedge c) v',
+   // `x <= repeat (n) @(posedge c) v'): the value is taken now and stored
+   // when the event comes, the n-th time for repeat (n), while the process
+   // goes on. A VHDL signal assignment has a time delay (`after'), not an
+   // event one; the translation dropped the event control and stored at once
+   // (ivtest nb_ec_*: silently wrong values, or a run that never ended).
+   if (ivl_stmt_nevent(stmt) > 0) {
+      error("%s:%d: no VHDL translation for an intra-assignment event control "
+            "on a nonblocking assignment (`x <= @(...) v', "
+            "`x <= repeat (n) @(...) v')",
+            ivl_stmt_file(stmt), ivl_stmt_lineno(stmt));
+      return 1;
+   }
+
    vhdl_decl::assign_type_t ignored;
    make_assignment(proc, container, stmt, false, ignored);
 
    return 0;
-}
-
-// The $random(seed) calls in an expression whose seed is a variable, one per
-// seed variable (draw_assign advances each seed after the assignment).
-static void find_seeded_random(ivl_expr_t e, std::vector<ivl_expr_t> &out)
-{
-   if (e == NULL)
-      return;
-   switch (ivl_expr_type(e)) {
-   case IVL_EX_SFUNC:
-      if (strcmp(ivl_expr_name(e), "$random") == 0 && ivl_expr_parms(e) >= 1
-          && ivl_expr_type(ivl_expr_parm(e, 0)) == IVL_EX_SIGNAL) {
-         ivl_signal_t s = ivl_expr_signal(ivl_expr_parm(e, 0));
-         for (size_t k = 0; k < out.size(); k++)
-            if (ivl_expr_signal(ivl_expr_parm(out[k], 0)) == s)
-               return;
-         out.push_back(e);
-      }
-      return;
-   case IVL_EX_SELECT:
-   case IVL_EX_BINARY:
-      find_seeded_random(ivl_expr_oper1(e), out);
-      find_seeded_random(ivl_expr_oper2(e), out);
-      return;
-   case IVL_EX_UNARY:
-      find_seeded_random(ivl_expr_oper1(e), out);
-      return;
-   case IVL_EX_TERNARY:
-      find_seeded_random(ivl_expr_oper1(e), out);
-      find_seeded_random(ivl_expr_oper2(e), out);
-      find_seeded_random(ivl_expr_oper3(e), out);
-      return;
-   case IVL_EX_CONCAT:
-      for (unsigned i = 0; i < ivl_expr_parms(e); i++)
-         find_seeded_random(ivl_expr_parm(e, i), out);
-      return;
-   default:
-      return;
-   }
 }
 
 static int draw_assign(vhdl_procedural *proc, stmt_container *container,
@@ -2531,41 +3774,9 @@ static int draw_assign(vhdl_procedural *proc, stmt_container *container,
    vhdl_decl::assign_type_t assign_type = vhdl_decl::ASSIGN_NONBLOCK;
    bool emulate_blocking = proc->get_scope()->allow_signal_assignment();
 
+   // ($random(seed) draws and advances its seed ahead of the statement:
+   // emit_seeded_random_pre)
    make_assignment(proc, container, stmt, emulate_blocking, assign_type);
-
-   // $random(seed) advances its seed (passed by reference). The value assigned
-   // above is sv_random(seed) (emitted by translate_sfunc_random); re-apply it
-   // to the seed so the next call sees the advanced state. Emitted as a normal
-   // assignment, so it is `:=` for a variable seed and `<=` for a signal seed --
-   // no inout param needed, and it composes with any target lvalue.
-   // The call may sit inside the right-hand side (`x = $random(s) % 8'):
-   // its seed advances all the same.
-   std::vector<ivl_expr_t> seeded;
-   if (get_sv2vhdl_mode() && ivl_stmt_lvals(stmt) == 1)
-      find_seeded_random(ivl_stmt_rval(stmt), seeded);
-   for (size_t k = 0; k < seeded.size(); k++) {
-      ivl_expr_t rval = seeded[k];
-      {
-         ivl_signal_t ssig = ivl_expr_signal(ivl_expr_parm(rval, 0));
-         string sname = get_renamed_signal(ssig);
-         vhdl_decl *sdecl = proc->get_scope()->get_decl(sname);
-         if (sdecl) {
-            const vhdl_type *st = sdecl->get_type();
-            vhdl_fcall *f = new vhdl_fcall("sv_random", new vhdl_type(*st));
-            f->add_expr(new vhdl_var_ref(sname.c_str(), new vhdl_type(*st)));
-            vhdl_var_ref *seed_lhs =
-               new vhdl_var_ref(sname.c_str(), new vhdl_type(*st));
-            // Mirror make_assignment: in an initial process, deposit (:=) into
-            // a signal rather than a non-blocking <=, so the advance is visible
-            // to the next read in the same process (and avoids a driver).
-            vhdl_decl::assign_type_t satype = sdecl->assignment_type();
-            if (proc->get_scope()->initializing()
-                && satype == vhdl_decl::ASSIGN_NONBLOCK)
-               satype = vhdl_decl::ASSIGN_BLOCK;
-            container->add_stmt(assign_for(satype, seed_lhs, f));
-         }
-      }
-   }
 
    return 0;
 }
@@ -2604,6 +3815,7 @@ static int draw_delay(vhdl_procedural *proc, stmt_container *container,
    proc->added_wait_stmt();
 
    container->add_stmt(wait);
+   proc->left_time_zero();   // what follows runs after the delay
 
    // Expand the sub-statement as well
    // Often this would result in a useless `null' statement which
@@ -2640,6 +3852,18 @@ static void get_nexuses_from_expr(ivl_expr_t expr, set<ivl_nexus_t> &out)
    default:
       break;
    }
+}
+
+// Verilog's time-zero order (R6T-02): see vhdl_target.h. On unless
+// SV2VHDL_TC08=0.
+bool time_zero_order_enabled()
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *e = getenv("SV2VHDL_TC08");
+      on = (e == NULL || atoi(e) != 0);
+   }
+   return on != 0 && get_sv2vhdl_mode();
 }
 
 // The NBA wake-shadow close (draw_wait) is on unless SV2VHDL_NBA_SHADOW=0.
@@ -4170,6 +5394,9 @@ static int draw_wait(vhdl_procedural *_proc, stmt_container *container,
    vhdl_process *proc = dynamic_cast<vhdl_process*>(_proc);
    assert(proc);   // Catch not process
 
+   // What follows an event control runs once the event comes
+   proc->left_time_zero();
+
    // If this container is the top-level statement (i.e. it is the
    // first thing inside a process) then we can extract these
    // events out into the sensitivity list as long as we haven't
@@ -4202,13 +5429,29 @@ static int draw_wait(vhdl_procedural *_proc, stmt_container *container,
       // or a task) the event comes first: the statement runs once `a'
       // changes, not before it (the end-of-process wait is only the
       // top-level loop form).  Draw the body aside, place the wait first.
+      // So does a top-level `always @(a or b)' under Verilog's time-zero
+      // order (time_zero_order_enabled): vvp starts it waiting, it does
+      // not run at time zero (always_comb and always_latch, which have a
+      // time-zero trigger, still do).
+      bool wait_first = !is_top_level;
+      if (is_top_level && time_zero_order_enabled()
+          && !ivl_stmt_needs_t0_trigger(stmt)) {
+         int nany_total = 0;
+         for (int i = 0; i < nevents; i++)
+            nany_total += ivl_event_nany(ivl_stmt_events(stmt, i));
+         wait_first = nany_total > 0;
+      }
       stmt_container body_aside;
-      draw_stmt(proc, is_top_level ? container : &body_aside,
+      draw_stmt(proc, wait_first ? &body_aside : container,
                 ivl_stmt_sub_stmt(stmt), true);
 
       vhdl_wait_stmt *wait = NULL;
-      if (proc->contains_wait_stmt() || !is_top_level)
+      if (proc->contains_wait_stmt() || wait_first)
          wait = new vhdl_wait_stmt(VHDL_WAIT_ON);
+      // An event control inside the body suspends the process: it can have
+      // no sensitivity list, and its leading event control becomes a wait
+      if (wait_first)
+         proc->added_wait_stmt();
 
       for (int i = 0; i < nevents; i++) {
          ivl_event_t event = ivl_stmt_events(stmt, i);
@@ -4228,7 +5471,7 @@ static int draw_wait(vhdl_procedural *_proc, stmt_container *container,
 
       if (wait)
          container->add_stmt(wait);
-      if (!is_top_level)
+      if (wait_first)
          container->move_stmts_from(&body_aside);
    }
    else {
@@ -4460,6 +5703,8 @@ static int draw_wait(vhdl_procedural *_proc, stmt_container *container,
 
       if (proc->contains_wait_stmt() || !is_top_level) {
          container->add_stmt(new vhdl_wait_stmt(VHDL_WAIT_UNTIL, test));
+         if (!is_top_level)
+            proc->added_wait_stmt();   // as for `wait on' above
          if (icg_rewrote)
             container->move_stmts_from(&icg_prologue);
          container->move_stmts_from(&tmp_container);
@@ -5236,9 +6481,27 @@ int draw_casezx(vhdl_procedural *proc, stmt_container *container,
    return 0;
 }
 
+// A loop's body can run at any time: while it is drawn, a deposit is no
+// blocking target (vhdl_procedural::at_time_zero)
+namespace {
+struct loop_body_t {
+   vhdl_procedural *p;
+   explicit loop_body_t(vhdl_procedural *pp) : p(pp) { p->enter_loop(); }
+   ~loop_body_t() { p->leave_loop(); }
+};
+}
+
 int draw_while(vhdl_procedural *proc, stmt_container *container,
                ivl_statement_t stmt, ivl_statement_t step=0)
 {
+   loop_body_t in_loop(proc);
+
+   // A break or continue in the body (begin_loop_jumps): open the labels
+   // for both drawings of the body below
+   vhdl_labeled_loop_stmt *cont = NULL;
+   vhdl_labeled_loop_stmt *brk =
+      begin_loop_jumps(ivl_stmt_sub_stmt(stmt), cont);
+
    // Generate the body inside a temporary container before
    // generating the test
    // The reason for this is that some of the signals in the
@@ -5246,39 +6509,143 @@ int draw_while(vhdl_procedural *proc, stmt_container *container,
    // we need to generate an assignment to a constant signal)
    stmt_container tmp_container;
    int rc = draw_stmt(proc, &tmp_container, ivl_stmt_sub_stmt(stmt));
-   if (rc != 0)
+   if (rc != 0) {
+      end_loop_jumps();
       return 1;
+   }
    // When we are emitting a for as a while we need to add the step
+   // (draw_stmt, not draw_assign: what the step's expression puts ahead of
+   // it -- a $random(seed) draw -- belongs in the same container)
    if (step) {
-      rc = draw_assign(proc, &tmp_container, step);
-      if (rc != 0)
+      rc = draw_stmt(proc, &tmp_container, step);
+      if (rc != 0) {
+         end_loop_jumps();
          return rc;
+      }
    }
 
-   vhdl_expr *test = translate_expr(ivl_stmt_cond_expr(stmt));
-   if (NULL == test)
+   // The test runs before every pass, and so must what its expression puts
+   // ahead of it (a $random(seed) draw): that goes to `pre'.  ($dist_* and
+   // $value$plusargs there stay a located error: begin_conditional_eval)
+   stmt_container pre;
+   begin_conditional_eval();
+   vhdl_expr *test = translate_loop_test(ivl_stmt_cond_expr(stmt), &pre);
+   end_conditional_eval();
+   if (NULL == test) {
+      end_loop_jumps();
       return 1;
+   }
 
    // The test must be a Boolean (and std_logic and (un)signed types
    // must be explicitly cast unlike in Verilog)
    vhdl_type boolean(VHDL_TYPE_BOOLEAN);
    test = test->cast(&boolean);
 
+   if (!pre.empty())
+      return draw_while_drawn_test(proc, container, stmt, step, test, &pre,
+                                   brk, cont);
+
    emit_wait_for_0(proc, container, stmt, test);
 
    vhdl_while_stmt *loop = new vhdl_while_stmt(test);
-   draw_stmt(proc, loop->get_container(), ivl_stmt_sub_stmt(stmt));
+   draw_stmt(proc, continue_body(cont, loop->get_container()),
+             ivl_stmt_sub_stmt(stmt));
+   close_continue(cont, loop->get_container());
+   end_loop_jumps();
 
    // When we are emitting a for as a while we need to add the step
    if (step) {
-      rc = draw_assign(proc, loop->get_container(), step);
+      rc = draw_stmt(proc, loop->get_container(), step);
       if (rc != 0)
          return rc;
    }
 
    emit_wait_for_0(proc, loop->get_container(), stmt, test);
 
-   container->add_stmt(loop);
+   container->add_stmt(wrap_break(brk, loop));
+   return 0;
+}
+
+/*
+ * SystemVerilog do <body> while (<cond>): the body runs before each test,
+ *
+ *    loop
+ *       <body>
+ *       if not <cond> then exit; end if;
+ *    end loop;
+ */
+int draw_do_while(vhdl_procedural *proc, stmt_container *container,
+                  ivl_statement_t stmt)
+{
+   loop_body_t in_loop(proc);
+
+   vhdl_labeled_loop_stmt *cont = NULL;
+   vhdl_labeled_loop_stmt *brk =
+      begin_loop_jumps(ivl_stmt_sub_stmt(stmt), cont);
+
+   vhdl_loop_stmt *loop = new vhdl_loop_stmt;
+   int rc = draw_stmt(proc, continue_body(cont, loop->get_container()),
+                      ivl_stmt_sub_stmt(stmt));
+   close_continue(cont, loop->get_container());
+   end_loop_jumps();
+   if (rc != 0)
+      return rc;
+
+   begin_conditional_eval();   // the test runs after every pass
+   vhdl_expr *test = translate_expr(ivl_stmt_cond_expr(stmt));
+   end_conditional_eval();
+   if (NULL == test)
+      return 1;
+   vhdl_type boolean(VHDL_TYPE_BOOLEAN);
+   test = test->cast(&boolean);
+   emit_wait_for_0(proc, loop->get_container(), stmt, test);
+
+   vhdl_if_stmt *done = new vhdl_if_stmt(
+      new vhdl_unaryop_expr(VHDL_UNARYOP_NOT, test, vhdl_type::boolean()));
+   done->get_then_container()->add_stmt(new vhdl_exit_stmt());
+   loop->get_container()->add_stmt(done);
+
+   container->add_stmt(wrap_break(brk, loop));
+   return 0;
+}
+
+/*
+ * draw_while for a test whose expression put statements ahead of it, `pre'
+ * (a $random(seed) draw): they run before every test,
+ *
+ *    loop
+ *       <pre>
+ *       if not <test> then exit; end if;
+ *       <body> <step>
+ *    end loop;
+ *
+ * with draw_while's break/continue targets (begin_loop_jumps: `brk' and
+ * `cont', closed here by end_loop_jumps): the body goes in the continue
+ * wrapper, the step after it, and the loop in the break wrapper.
+ */
+static int draw_while_drawn_test(vhdl_procedural *proc,
+                                 stmt_container *container,
+                                 ivl_statement_t stmt, ivl_statement_t step,
+                                 vhdl_expr *test, stmt_container *pre,
+                                 vhdl_labeled_loop_stmt *brk,
+                                 vhdl_labeled_loop_stmt *cont)
+{
+   vhdl_loop_stmt *loop = new vhdl_loop_stmt;
+   stmt_container *body = loop->get_container();
+   body->move_stmts_from(pre);
+   emit_wait_for_0(proc, body, stmt, test);
+   vhdl_if_stmt *leave = new vhdl_if_stmt(
+      new vhdl_unaryop_expr(VHDL_UNARYOP_NOT, test, vhdl_type::boolean()));
+   leave->get_then_container()->add_stmt(new vhdl_exit_stmt());
+   body->add_stmt(leave);
+   int rc = draw_stmt(proc, continue_body(cont, body), ivl_stmt_sub_stmt(stmt));
+   close_continue(cont, body);
+   end_loop_jumps();
+   if (rc == 0 && step)
+      rc = draw_stmt(proc, body, step);
+   if (rc != 0)
+      return rc;
+   container->add_stmt(wrap_break(brk, loop));
    return 0;
 }
 
@@ -5295,10 +6662,19 @@ int draw_for_loop(vhdl_procedural *proc, stmt_container *container,
 int draw_forever(vhdl_procedural *proc, stmt_container *container,
                  ivl_statement_t stmt)
 {
-   vhdl_loop_stmt *loop = new vhdl_loop_stmt;
-   container->add_stmt(loop);
+   loop_body_t in_loop(proc);
 
-   draw_stmt(proc, loop->get_container(), ivl_stmt_sub_stmt(stmt));
+   vhdl_labeled_loop_stmt *cont = NULL;
+   vhdl_labeled_loop_stmt *brk =
+      begin_loop_jumps(ivl_stmt_sub_stmt(stmt), cont);
+
+   vhdl_loop_stmt *loop = new vhdl_loop_stmt;
+   container->add_stmt(wrap_break(brk, loop));
+
+   draw_stmt(proc, continue_body(cont, loop->get_container()),
+             ivl_stmt_sub_stmt(stmt));
+   close_continue(cont, loop->get_container());
+   end_loop_jumps();
 
    return 0;
 }
@@ -5310,6 +6686,11 @@ int draw_repeat(vhdl_procedural *proc, stmt_container *container,
    vhdl_expr *times = translate_expr(cond);
    if (NULL == times)
       return 1;
+
+   // The count is read once, on entry: like the tests of if/while/case, it
+   // must see a blocking assignment just made to a signal (`n = 3;
+   // repeat (n)', or a task's input argument `repeat (k)')
+   emit_wait_for_0(proc, container, stmt, times);
 
    vhdl_type integer(VHDL_TYPE_INTEGER);
    // A signed repeat count that is negative means zero iterations in Verilog;
@@ -5328,12 +6709,20 @@ int draw_repeat(vhdl_procedural *proc, stmt_container *container,
    else
       times = times->cast(&integer);
 
+   loop_body_t in_loop(proc);
+   vhdl_labeled_loop_stmt *cont = NULL;
+   vhdl_labeled_loop_stmt *brk =
+      begin_loop_jumps(ivl_stmt_sub_stmt(stmt), cont);
+
    const char *it_name = "Verilog_Repeat";
    vhdl_for_stmt *loop =
       new vhdl_for_stmt(it_name, new vhdl_const_int(1), times);
-   container->add_stmt(loop);
+   container->add_stmt(wrap_break(brk, loop));
 
-   draw_stmt(proc, loop->get_container(), ivl_stmt_sub_stmt(stmt));
+   draw_stmt(proc, continue_body(cont, loop->get_container()),
+             ivl_stmt_sub_stmt(stmt));
+   close_continue(cont, loop->get_container());
+   end_loop_jumps();
 
    return 0;
 }
@@ -5641,6 +7030,7 @@ static int draw_force(vhdl_procedural *proc, stmt_container *container,
    vhdl_var_ref *lhs = lvals.front();
    if (lval_word_statically_dead(proc, lhs))
       return 0;    // force to an out-of-range array word: lost
+   note_forced_net(ivl_lval_sig(ivl_stmt_lval(stmt, 0)));
    rhs = rhs->cast(lhs->get_type());
    container->add_stmt(new vhdl_force_stmt(lhs, rhs));
    return 0;
@@ -5659,6 +7049,7 @@ static int draw_release(vhdl_procedural *proc, stmt_container *container,
    }
    if (lval_word_statically_dead(proc, lvals.front()))
       return 0;    // release of an out-of-range array word: no-op
+   note_forced_net(ivl_lval_sig(ivl_stmt_lval(stmt, 0)));
    container->add_stmt(new vhdl_release_stmt(lvals.front()));
    return 0;
 }
@@ -5683,6 +7074,10 @@ static int draw_release(vhdl_procedural *proc, stmt_container *container,
  */
 static vhdl_procedural *g_pre_proc = NULL;
 static stmt_container *g_pre_container = NULL;
+static ivl_statement_t g_pre_stmt = NULL;      // the statement being drawn
+// True while a loop test is translated into a container of its own that
+// runs before every test (translate_loop_test)
+static bool g_pre_per_pass = false;
 
 static int draw_stmt_inner(vhdl_procedural *proc, stmt_container *container,
                            ivl_statement_t stmt, bool is_last);
@@ -5692,12 +7087,27 @@ int draw_stmt(vhdl_procedural *proc, stmt_container *container,
 {
    vhdl_procedural *save_proc = g_pre_proc;
    stmt_container *save_container = g_pre_container;
+   ivl_statement_t save_stmt = g_pre_stmt;
    g_pre_proc = proc;
    g_pre_container = container;
+   g_pre_stmt = stmt;
    int rc = draw_stmt_inner(proc, container, stmt, is_last);
    g_pre_proc = save_proc;
    g_pre_container = save_container;
+   g_pre_stmt = save_stmt;
    return rc;
+}
+
+static vhdl_expr *translate_loop_test(ivl_expr_t cond, stmt_container *pre)
+{
+   stmt_container *save = g_pre_container;
+   const bool save_per_pass = g_pre_per_pass;
+   g_pre_container = pre;
+   g_pre_per_pass = true;
+   vhdl_expr *e = translate_expr(cond);
+   g_pre_container = save;
+   g_pre_per_pass = save_per_pass;
+   return e;
 }
 
 /*
@@ -5726,6 +7136,15 @@ bool emit_value_plusargs_pre(ivl_expr_t target, vhdl_expr *(*make_fmt)(ivl_expr_
 {
    if (g_pre_proc == NULL || g_pre_container == NULL) {
       error("$value$plusargs outside a procedural statement is not supported");
+      return false;
+   }
+   if (in_conditional_eval()) {
+      // Its write would run ahead of the statement, every time: wrong when
+      // Verilog evaluates the call conditionally (?:, && / ||) or again on
+      // each pass (a loop condition)
+      error("%s:%d: $value$plusargs in a branch of ?:, an operand of && or "
+            "|| or a loop condition has no VHDL translation",
+            ivl_expr_file(target), ivl_expr_lineno(target));
       return false;
    }
    if (ivl_expr_type(target) != IVL_EX_SIGNAL) {
@@ -5768,13 +7187,187 @@ bool emit_value_plusargs_pre(ivl_expr_t target, vhdl_expr *(*make_fmt)(ivl_expr_
                                          vhdl_type::boolean());
    vhdl_if_stmt *vif = new vhdl_if_stmt(test);
    vhdl_decl::assign_type_t atype = decl->assignment_type();
-   if (g_pre_proc->get_scope()->initializing()
-       && atype == vhdl_decl::ASSIGN_NONBLOCK)
-      atype = vhdl_decl::ASSIGN_BLOCK;
-   vif->get_then_container()->add_stmt(
-      assign_for(atype, new vhdl_var_ref(name.c_str(), new vhdl_type(*t)), rhs));
+   vhdl_var_ref *target_ref = new vhdl_var_ref(name.c_str(), new vhdl_type(*t));
+   if (atype == vhdl_decl::ASSIGN_NONBLOCK) {
+      // A blocking write of the argument, as make_assignment does one
+      if (deposits_signal(g_pre_proc, name, true)) {
+         atype = vhdl_decl::ASSIGN_BLOCK;
+         g_pre_proc->mark_deposited(name);
+      }
+      else if (g_pre_proc->get_scope()->allow_signal_assignment())
+         g_pre_proc->add_blocking_target(target_ref);
+   }
+   vif->get_then_container()->add_stmt(assign_for(atype, target_ref, rhs));
    g_pre_container->add_stmt(vif);
    return true;
+}
+
+// A Verilog integer argument as vvp reads it (vpiIntVal): its low 32 bits as
+// a signed int32 (a narrower value extended by its own signedness)
+static vhdl_expr *verilog_int32(ivl_expr_t a)
+{
+   vhdl_expr *v = translate_expr(a);
+   if (v == NULL || v->get_type() == NULL)
+      return v;
+   vhdl_type integer(VHDL_TYPE_INTEGER);
+   const vhdl_type_name_t tn = v->get_type()->get_name();
+   if (tn != VHDL_TYPE_LOGIC3D_VECTOR && tn != VHDL_TYPE_LOGIC3D)
+      return v->cast(&integer);
+   const int w = ivl_expr_width(a) < 1 ? 1 : ivl_expr_width(a);
+   vhdl_expr *s32;
+   if (ivl_expr_signed(a) && w < 32) {
+      vhdl_fcall *s = new vhdl_fcall("l3d_to_signed", vhdl_type::nsigned(w));
+      s->add_expr(v);
+      s32 = s->resize(32);                       // sign-extend
+   }
+   else {
+      vhdl_fcall *u = new vhdl_fcall("l3d_to_unsigned", vhdl_type::nunsigned(w));
+      u->add_expr(v);
+      vhdl_fcall *sg = new vhdl_fcall("signed", vhdl_type::nsigned(32));
+      sg->add_expr(u->resize(32));               // zero-extend or truncate
+      s32 = sg;
+   }
+   vhdl_fcall *ti = new vhdl_fcall("To_Integer", vhdl_type::integer());
+   ti->add_expr(s32);
+   return ti;
+}
+
+// A VHDL integer as a Verilog 32-bit integer: logic3d_vector(31 downto 0)
+static vhdl_expr *int32_to_l3d(vhdl_expr *v)
+{
+   vhdl_fcall *ts = new vhdl_fcall("to_signed", vhdl_type::nsigned(32));
+   ts->add_expr(v);
+   ts->add_expr(new vhdl_const_int(32));
+   vhdl_fcall *u = new vhdl_fcall("unsigned", vhdl_type::nunsigned(32));
+   u->add_expr(ts);
+   vhdl_fcall *l3 = new vhdl_fcall("unsigned_to_l3d",
+                                   vhdl_type::logic3d_vector(31, 0));
+   l3->add_expr(u);
+   return l3;
+}
+
+/*
+ * $dist_uniform(seed, start, end), $dist_normal(seed, mean, std_dev),
+ * $dist_exponential(seed, mean), $dist_poisson(seed, mean),
+ * $dist_chi_square(seed, df), $dist_t(seed, df), $dist_erlang(seed, k, mean)
+ * (IEEE 1364-2005 17.9.2): the sv_math_pkg procedure of the same name
+ * (libsv_math.so, the standard's Annex B code that vvp runs), drawn ahead of
+ * the current statement on two process integers:
+ *
+ *    sv_dist_seed_<n> := <seed>;
+ *    dist_<kind>(sv_dist_seed_<n>, <arguments>, sv_dist_val_<n>);
+ *    <seed> := <sv_dist_seed_<n>>;     -- a blocking assignment of the seed
+ *
+ * and the call's value is sv_dist_val_<n>. The seed is an inout argument, a
+ * variable; every argument goes in as vvp reads it, a 32-bit integer.
+ */
+vhdl_expr *emit_dist_pre(ivl_expr_t e)
+{
+   static const struct { const char *name; unsigned nargs; } kinds[] = {
+      { "$dist_uniform", 3 }, { "$dist_normal", 3 },
+      { "$dist_exponential", 2 }, { "$dist_poisson", 2 },
+      { "$dist_chi_square", 2 }, { "$dist_t", 2 }, { "$dist_erlang", 3 },
+      { NULL, 0 } };
+   const char *name = ivl_expr_name(e);
+   const char *file = ivl_expr_file(e);
+   const unsigned line = ivl_expr_lineno(e);
+   unsigned nargs = 0;
+   for (int i = 0; kinds[i].name; i++)
+      if (strcmp(name, kinds[i].name) == 0)
+         nargs = kinds[i].nargs;
+   if (nargs == 0 || !get_sv2vhdl_mode()) {
+      error("No translation for system function %s", name);
+      return NULL;
+   }
+   if (ivl_expr_parms(e) != nargs) {
+      error("%s:%d: %s takes %u arguments", file, line, name, nargs);
+      return NULL;
+   }
+   if (g_pre_proc == NULL || g_pre_container == NULL) {
+      error("%s:%d: %s outside a procedural statement has no VHDL "
+            "translation", file, line, name);
+      return NULL;
+   }
+   if (in_conditional_eval()) {
+      // Its draw would run ahead of the statement, every time: wrong when
+      // Verilog evaluates the call conditionally or again on each pass
+      error("%s:%d: %s in a branch of ?:, an operand of && or || or a loop "
+            "condition has no VHDL translation", file, line, name);
+      return NULL;
+   }
+
+   // The seed: an integer variable (not a memory word or a select)
+   ivl_expr_t se = ivl_expr_parm(e, 0);
+   vhdl_decl *sdecl = NULL;
+   std::string sname;
+   if (ivl_expr_type(se) == IVL_EX_SIGNAL && ivl_expr_oper1(se) == NULL) {
+      ensure_signal_declared(ivl_expr_signal(se));   // a package variable
+      if (seen_signal_before(ivl_expr_signal(se))) {
+         sname = get_renamed_signal(ivl_expr_signal(se));
+         sdecl = g_pre_proc->get_scope()->get_decl(sname);
+      }
+   }
+   if (sdecl == NULL || sdecl->get_type() == NULL
+       || sdecl->assignment_type() == vhdl_decl::ASSIGN_CONST) {
+      error("%s:%d: the seed of %s must be an integer variable", file, line,
+            name);
+      return NULL;
+   }
+
+   vhdl_expr *seed_in = verilog_int32(se);
+   if (seed_in == NULL)
+      return NULL;
+   std::vector<vhdl_expr*> args;
+   for (unsigned i = 1; i < nargs; i++) {
+      vhdl_expr *a = verilog_int32(ivl_expr_parm(e, i));
+      if (a == NULL)
+         return NULL;
+      args.push_back(a);
+   }
+
+   static int dist_count = 0;
+   ostringstream sv, rv;
+   sv << "sv_dist_seed_" << ++dist_count;
+   rv << "sv_dist_val_" << dist_count;
+   vhdl_scope *pscope = g_pre_proc->get_scope();
+   pscope->add_decl(new vhdl_var_decl(sv.str(), vhdl_type::integer()));
+   pscope->add_decl(new vhdl_var_decl(rv.str(), vhdl_type::integer()));
+
+   vhdl_assign_stmt *in = new vhdl_assign_stmt(
+      new vhdl_var_ref(sv.str(), vhdl_type::integer()), seed_in);
+   ostringstream cs;
+   cs << name << " (" << file << ":" << line << ")";
+   in->set_comment(cs.str());
+   g_pre_container->add_stmt(in);
+
+   vhdl_pcall_stmt *call = new vhdl_pcall_stmt(name + 1);   // dist_<kind>
+   call->add_expr(new vhdl_var_ref(sv.str(), vhdl_type::integer()));
+   for (size_t i = 0; i < args.size(); i++)
+      call->add_expr(args[i]);
+   call->add_expr(new vhdl_var_ref(rv.str(), vhdl_type::integer()));
+   g_pre_container->add_stmt(call);
+
+   // The seed comes back: a blocking assignment of the variable, as
+   // make_assignment makes one
+   vhdl_var_ref *lhs = new vhdl_var_ref(sname, new vhdl_type(*sdecl->get_type()));
+   vhdl_expr *back = int32_to_l3d(new vhdl_var_ref(sv.str(), vhdl_type::integer()))
+      ->cast(sdecl->get_type());
+   vhdl_decl::assign_type_t atype = sdecl->assignment_type();
+   if (atype == vhdl_decl::ASSIGN_NONBLOCK) {
+      if (deposits_signal(g_pre_proc, sname, true)) {
+         atype = vhdl_decl::ASSIGN_BLOCK;
+         g_pre_proc->mark_deposited(sname);
+      }
+      else if (g_pre_proc->get_scope()->allow_signal_assignment())
+         g_pre_proc->add_blocking_target(lhs);
+   }
+   g_pre_container->add_stmt(assign_for(atype, lhs, back));
+
+   vhdl_expr *val = int32_to_l3d(new vhdl_var_ref(rv.str(), vhdl_type::integer()));
+   const int w = ivl_expr_width(e);
+   if (w != 32 && w >= 1)
+      return val->resize(w);
+   return val;
 }
 
 static int draw_stmt_inner(vhdl_procedural *proc, stmt_container *container,
@@ -5804,6 +7397,11 @@ static int draw_stmt_inner(vhdl_procedural *proc, stmt_container *container,
       return draw_case(proc, container, stmt, is_last);
    case IVL_ST_WHILE:
       return draw_while(proc, container, stmt);
+   case IVL_ST_DO_WHILE:
+      return draw_do_while(proc, container, stmt);
+   case IVL_ST_BREAK:
+   case IVL_ST_CONTINUE:
+      return draw_break_continue(proc, container, stmt);
    case IVL_ST_FORLOOP:
       return draw_for_loop(proc, container, stmt);
    case IVL_ST_FOREVER:
@@ -5845,4 +7443,294 @@ static int draw_stmt_inner(vhdl_procedural *proc, stmt_container *container,
             ivl_statement_type(stmt));
       return 1;
    }
+}
+
+/*
+ * Where seeded call `call' sits in the statement being drawn: in an operand
+ * Verilog may leave unevaluated (a ?: branch, the right operand of && or
+ * ||: vvp evaluates them lazily), and after a read of its own seed in
+ * Verilog's left-to-right evaluation order.  For emit_seeded_random_pre's
+ * warnings.
+ */
+namespace {
+struct seed_scan_t {
+   ivl_expr_t   call;
+   ivl_signal_t seed;
+   bool         found, cond, read_before;
+   bool         in_loop_test;   // in the test of a while/for/do-while loop
+};
+}
+
+static bool is_seeded_rng_call(ivl_expr_t e)
+{
+   if (ivl_expr_type(e) != IVL_EX_SFUNC || ivl_expr_parms(e) < 1)
+      return false;
+   const char *n = ivl_expr_name(e);
+   return strcmp(n, "$random") == 0 || strcmp(n, "$urandom") == 0;
+}
+
+static void seed_scan(ivl_expr_t e, seed_scan_t &s, bool cond)
+{
+   if (e == NULL || s.found)
+      return;
+   if (e == s.call) {
+      s.found = true;
+      s.cond = cond;
+      return;
+   }
+   switch (ivl_expr_type(e)) {
+   case IVL_EX_SIGNAL:
+      if (ivl_expr_signal(e) == s.seed)
+         s.read_before = true;
+      seed_scan(ivl_expr_oper1(e), s, cond);       // a word index
+      return;
+   case IVL_EX_BINARY: {
+      const char op = ivl_expr_opcode(e);
+      seed_scan(ivl_expr_oper1(e), s, cond);
+      seed_scan(ivl_expr_oper2(e), s, cond || op == 'a' || op == 'o');
+      return;
+   }
+   case IVL_EX_TERNARY:
+      seed_scan(ivl_expr_oper1(e), s, cond);
+      seed_scan(ivl_expr_oper2(e), s, true);
+      seed_scan(ivl_expr_oper3(e), s, true);
+      return;
+   case IVL_EX_UNARY:
+      seed_scan(ivl_expr_oper1(e), s, cond);
+      return;
+   case IVL_EX_SELECT:
+      seed_scan(ivl_expr_oper1(e), s, cond);
+      seed_scan(ivl_expr_oper2(e), s, cond);
+      return;
+   case IVL_EX_SFUNC:
+   case IVL_EX_UFUNC:
+   case IVL_EX_CONCAT:
+      for (unsigned i = 0; i < ivl_expr_parms(e); i++) {
+         // another seeded call's seed is handed over, not read here
+         if (i == 0 && is_seeded_rng_call(e))
+            continue;
+         seed_scan(ivl_expr_parm(e, i), s, cond);
+      }
+      return;
+   default:
+      return;
+   }
+}
+
+static void seed_scan_stmt(ivl_statement_t st, seed_scan_t &s)
+{
+   switch (ivl_statement_type(st)) {
+   case IVL_ST_ASSIGN:
+   case IVL_ST_ASSIGN_NB:
+      seed_scan(ivl_stmt_rval(st), s, false);
+      break;
+   case IVL_ST_STASK:
+      for (unsigned i = 0; i < ivl_stmt_parm_count(st); i++)
+         seed_scan(ivl_stmt_parm(st, i), s, false);
+      break;
+   case IVL_ST_CONDIT:
+   case IVL_ST_CASE:
+   case IVL_ST_CASER:
+   case IVL_ST_CASEX:
+   case IVL_ST_CASEZ:
+   case IVL_ST_REPEAT:
+      seed_scan(ivl_stmt_cond_expr(st), s, false);
+      break;
+   case IVL_ST_DO_WHILE:
+   case IVL_ST_WHILE:
+   case IVL_ST_FORLOOP:
+      seed_scan(ivl_stmt_cond_expr(st), s, false);
+      s.in_loop_test = s.found;
+      break;
+   case IVL_ST_DELAYX:
+      seed_scan(ivl_stmt_delay_expr(st), s, false);
+      break;
+   default:
+      break;
+   }
+}
+
+/*
+ * $random(seed) (IEEE 1364 17.9.1) and $urandom(seed) (IEEE 1800 18.13.1)
+ * draw from the caller's seed variable and leave the advanced seed in it,
+ * as vvp's rtl_dist_uniform(&seed, ...) does -- the value and the new seed
+ * differ.  Ahead of the statement being drawn:
+ *
+ *    SV_Random_<n> := sv_random_value(seed);    -- the value, 32 bits
+ *                                                -- (sv_urandom_value)
+ *    sv_urandom_seed(seed);                      -- $urandom(seed) only: the
+ *                                                -- $urandom generator keeps
+ *                                                -- the advanced seed
+ *    seed := sv_random_next(seed);               -- `<=' as a blocking
+ *                                                -- assignment would be
+ *
+ * and the call reads SV_Random_<n>; NULL after an error.  The calls of a
+ * statement draw in turn, in Verilog's left-to-right order (two calls on one
+ * seed draw two numbers), and one in a condition, a $display argument or a
+ * non-blocking assignment advances its seed as one in a blocking assignment
+ * does (draw_while draws a loop test's again before every test; a loop
+ * test drawn any other way is an error).  It used to be the glibc-constant
+ * LCG sv_random(seed), whose value was the new seed, advanced only by a
+ * blocking assignment's.  Two shapes stay approximate, each with a warning:
+ * a call Verilog may skip (a ?: branch, the right operand of && or ||)
+ * draws all the same, and a read of the seed ahead of the call in the same
+ * statement sees the advanced seed.  `call' is the call (for the warnings;
+ * NULL for one called as a task).
+ */
+static int g_seeded_random_count = 0;
+
+// A translator warning once per text (draw_while draws a loop's body twice)
+static void warn_once(const std::string &text)
+{
+   static std::set<std::string> said;
+   if (said.insert(text).second)
+      cerr << "Warning: " << text << endl;
+}
+
+vhdl_expr *emit_seeded_random_pre(const char *fname, ivl_expr_t call,
+                                  ivl_expr_t seed, bool urandom,
+                                  const char *file, unsigned line)
+{
+   if (g_pre_proc == NULL || g_pre_container == NULL) {
+      error("%s:%u: %s with a seed outside a procedural statement has no "
+            "VHDL translation", file, line, fname);
+      return NULL;
+   }
+   ivl_signal_t sig = (seed != NULL && ivl_expr_type(seed) == IVL_EX_SIGNAL
+                       && ivl_expr_oper1(seed) == NULL)
+      ? ivl_expr_signal(seed) : NULL;
+   if (sig == NULL || ivl_signal_type(sig) != IVL_SIT_REG) {
+      error("%s:%u: %s's seed must be an integer/time variable or a register",
+            file, line, fname);
+      return NULL;
+   }
+   if (ivl_signal_width(sig) < 32) {
+      error("%s:%u: %s's seed variable is less than 32 bits (%u)",
+            file, line, fname, ivl_signal_width(sig));
+      return NULL;
+   }
+   ensure_signal_declared(sig);
+   const string name = get_renamed_signal(sig);
+   vhdl_decl *decl = g_pre_proc->get_scope()->get_decl(name);
+   if (decl == NULL || decl->get_type() == NULL
+       || decl->get_type()->get_name() != VHDL_TYPE_LOGIC3D_VECTOR) {
+      error("%s:%u: no VHDL translation for %s with seed %s (not a "
+            "logic3d_vector variable here)", file, line, fname,
+            ivl_signal_basename(sig));
+      return NULL;
+   }
+   const vhdl_type *st = decl->get_type();
+   vhdl_decl::assign_type_t atype = decl->assignment_type();
+   if (atype == vhdl_decl::ASSIGN_NONBLOCK
+       && !g_pre_proc->get_scope()->allow_signal_assignment()) {
+      error("%s:%u: %s's seed %s is a module variable, which a function "
+            "cannot assign in VHDL", file, line, fname,
+            ivl_signal_basename(sig));
+      return NULL;
+   }
+   if (atype == vhdl_decl::ASSIGN_CONST) {
+      // A function's input, a constant in VHDL: shadowed by a variable, as
+      // make_assign_lhs shadows one an assignment writes
+      const string shadow_name = name + "_Shadow";
+      vhdl_var_decl *shadow = new vhdl_var_decl(shadow_name, st);
+      shadow->set_initial(new vhdl_var_ref(name, st));
+      g_pre_proc->get_scope()->add_decl(shadow);
+      rename_signal(sig, shadow_name);
+      return emit_seeded_random_pre(fname, call, seed, urandom, file, line);
+   }
+
+   ostringstream where;
+   where << fname << "(" << ivl_signal_basename(sig) << ") at " << file
+         << ":" << line;
+   seed_scan_t sc = { call, sig, false, false, false, false };
+   if (call != NULL && g_pre_stmt != NULL)
+      seed_scan_stmt(g_pre_stmt, sc);
+   if (sc.in_loop_test && !g_pre_per_pass) {
+      // Ahead of the statement, the draw would run once, not before every
+      // test
+      error("%s: %s in the test of this loop has no VHDL translation (draw "
+            "into a variable before the loop and at the end of its body)",
+            where.str().c_str(), fname);
+      return NULL;
+   }
+
+   // The value: a read that waits for an earlier `<=' to the seed
+   vhdl_fcall *value = new vhdl_fcall(urandom ? "sv_urandom_value"
+                                              : "sv_random_value",
+                                      vhdl_type::logic3d_vector(31, 0));
+   value->add_expr(new vhdl_var_ref(name.c_str(), new vhdl_type(*st)));
+   if (g_pre_stmt != NULL)
+      emit_wait_for_0(g_pre_proc, g_pre_container, g_pre_stmt, value);
+   ostringstream tn;
+   tn << "SV_Random_" << g_seeded_random_count++;
+   vhdl_var_decl *tmp = new vhdl_var_decl(tn.str(),
+                                          vhdl_type::logic3d_vector(31, 0));
+   g_pre_proc->get_scope()->add_decl(tmp);
+   vhdl_assign_stmt *draw = new vhdl_assign_stmt(tmp->make_ref(), value);
+   draw->set_comment(where.str());
+   g_pre_container->add_stmt(draw);
+
+   if (urandom) {
+      vhdl_pcall_stmt *pc = new vhdl_pcall_stmt("sv_urandom_seed");
+      pc->add_expr(new vhdl_var_ref(name.c_str(), new vhdl_type(*st)));
+      g_pre_container->add_stmt(pc);
+   }
+
+   // The advanced seed, written as a blocking assignment is
+   vhdl_var_ref *lhs = new vhdl_var_ref(name.c_str(), new vhdl_type(*st));
+   vhdl_fcall *next = new vhdl_fcall("sv_random_next", new vhdl_type(*st));
+   next->add_expr(new vhdl_var_ref(name.c_str(), new vhdl_type(*st)));
+   if (atype == vhdl_decl::ASSIGN_NONBLOCK) {
+      // make_assignment's discipline: deposited (and read back at once) where
+      // deposits_signal says so, else a `<=' later reads wait for
+      if (deposits_signal(g_pre_proc, name, true)) {
+         atype = vhdl_decl::ASSIGN_BLOCK;
+         g_pre_proc->mark_deposited(name);
+      }
+      else
+         g_pre_proc->add_blocking_target(lhs);
+   }
+   g_pre_container->add_stmt(assign_for(atype, lhs, next));
+
+   // (worded for bin/iverilog-sv2ghdl, which repeats a "not translated"
+   // warning under vamos, where --vamos-strict makes it an error)
+   if (sc.found && sc.cond)
+      warn_once(where.str() + " is not translated faithfully: Verilog "
+                "evaluates it only when its ?:, && or || operand is taken, "
+                "the translation always draws and advances "
+                + string(ivl_signal_basename(sig)));
+   if (sc.found && sc.read_before)
+      warn_once(where.str() + " is not translated faithfully: the statement "
+                "reads " + string(ivl_signal_basename(sig)) + " ahead of the "
+                "call, and the translation reads it already advanced");
+   return tmp->make_ref();
+}
+
+// `$random(seed);', `$urandom;' -- a system function called as a task
+// (iverilog: "Calling system function $random() as a task"): vvp still
+// draws, so the seed, or the design-wide generator, advances
+static int draw_stask_random(vhdl_procedural *proc, stmt_container *container,
+                             ivl_statement_t stmt)
+{
+   const char *name = ivl_stmt_name(stmt);
+   const bool urandom = strcmp(name, "$urandom") == 0;
+   ivl_expr_t seed = ivl_stmt_parm_count(stmt) >= 1 ? ivl_stmt_parm(stmt, 0)
+                                                    : NULL;
+   if (seed != NULL)
+      return emit_seeded_random_pre(name, NULL, seed, urandom,
+                                    ivl_stmt_file(stmt),
+                                    ivl_stmt_lineno(stmt)) ? 0 : 1;
+   ostringstream tn;
+   tn << "SV_Random_" << g_seeded_random_count++;
+   vhdl_var_decl *tmp = new vhdl_var_decl(tn.str(), vhdl_type::integer());
+   proc->get_scope()->add_decl(tmp);
+   vhdl_assign_stmt *a = new vhdl_assign_stmt(
+      tmp->make_ref(),
+      new vhdl_fcall(urandom ? "sv_urandom" : "random", vhdl_type::integer()));
+   ostringstream c;
+   c << name << " at " << ivl_stmt_file(stmt) << ":" << ivl_stmt_lineno(stmt)
+     << ", its value dropped";
+   a->set_comment(c.str());
+   container->add_stmt(a);
+   return 0;
 }

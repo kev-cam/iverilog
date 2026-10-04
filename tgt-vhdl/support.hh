@@ -38,7 +38,8 @@ enum support_function_t {
    SF_SIGNED_TO_LOGIC,
    SF_UNSIGNED_TO_LOGIC,
    SF_TIME_FIELD,
-   SF_REM_SIGNED
+   SF_REM_SIGNED,
+   SF_REAL_G
 };
 
 class support_function : public vhdl_function {

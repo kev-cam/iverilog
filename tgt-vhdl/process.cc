@@ -25,6 +25,7 @@
 
 #include <iostream>
 #include <cassert>
+#include <cstring>
 #include <sstream>
 #include <algorithm>
 #include <vector>
@@ -70,20 +71,70 @@ struct WriteInfo {
    unsigned slice_width = 0;
 };
 
-// Does this body suspend on its own, via an explicit wait at the top level of
-// the process? If not, the process is driven by a sensitivity list whose
-// implicit wait sits at the END of the body -- see the seed placement below.
-// Only a top-level wait counts: one buried in a branch might not be reached on
-// every iteration, so a loop around the body could still spin.
-static bool body_has_toplevel_wait(stmt_container *body)
+// One blocking target that shadow_blocking_targets gave a variable: the
+// signal, its shadow, and the statically written slice its commit covers
+// (none: the whole signal)
+struct ShadowEntry {
+   std::string sig, var;
+   const vhdl_type *type;
+   bool sliced;
+   int64_t slice;
+   unsigned slice_width;
+};
+
+// `v_sig := sig;' -- the shadow reads the signal
+static vhdl_seq_stmt *shadow_seed(const ShadowEntry &s)
 {
-   stmt_container::stmt_list_t &stmts = body->get_stmts();
+   return new vhdl_assign_stmt(new vhdl_var_ref(s.var, new vhdl_type(*s.type)),
+                               new vhdl_var_ref(s.sig, new vhdl_type(*s.type)));
+}
+
+// `sig(slice) <= v_sig(slice);' -- the signal takes the shadow's value
+static vhdl_seq_stmt *shadow_commit(const ShadowEntry &s)
+{
+   vhdl_var_ref *lhs = new vhdl_var_ref(s.sig, new vhdl_type(*s.type));
+   vhdl_var_ref *rhs = new vhdl_var_ref(s.var, new vhdl_type(*s.type));
+   if (s.sliced) {
+      lhs->set_slice(new vhdl_const_int(s.slice), s.slice_width);
+      rhs->set_slice(new vhdl_const_int(s.slice), s.slice_width);
+   }
+   return new vhdl_nbassign_stmt(lhs, rhs);
+}
+
+// Every wait in `c', and in the statements nested in it, but `lead': the
+// commits go before it -- the process's writes become visible when it
+// suspends -- and the seeds after it, unless it is `trail' (the wait that
+// ends the body: the next pass starts with the seeds at the top). A shadow
+// re-reads its signal after every suspension: another process may have
+// written it meanwhile, and this process's own commit has landed by then.
+static void shadow_around_waits(stmt_container *c,
+                                const std::vector<ShadowEntry> &sh,
+                                const vhdl_seq_stmt *lead,
+                                const vhdl_seq_stmt *trail)
+{
+   stmt_container::stmt_list_t &stmts = c->get_stmts();
    for (stmt_container::stmt_list_t::iterator it = stmts.begin();
         it != stmts.end(); ++it) {
-      if (dynamic_cast<vhdl_wait_stmt*>(*it))
-         return true;
+      if (dynamic_cast<vhdl_wait_stmt*>(*it) == NULL) {
+         std::vector<stmt_container*> subs;
+         (*it)->get_sub_containers(subs);
+         for (stmt_container *sub : subs)
+            shadow_around_waits(sub, sh, lead, trail);
+         continue;
+      }
+      if (*it == lead)
+         continue;
+      for (size_t k = 0; k < sh.size(); k++)
+         stmts.insert(it, shadow_commit(sh[k]));
+      if (*it == trail)
+         continue;
+      stmt_container::stmt_list_t::iterator next = it;
+      ++next;
+      for (size_t k = 0; k < sh.size(); k++)
+         stmts.insert(next, shadow_seed(sh[k]));
+      it = next;
+      --it;   // the last seed: the loop moves on to `next'
    }
-   return false;
 }
 
 // Evaluate a compile-time-constant slice expression (int literals composed
@@ -542,8 +593,8 @@ static void shadow_blocking_targets(vhdl_process *vhdl_proc, vhdl_entity *ent)
    vhdl_scope *proc_scope = vhdl_proc->get_scope();
    vhdl_scope *arch_scope = ent->get_arch()->get_scope();
 
-   // `v_sig := sig;` seeds, hoisted out of the body loop below.
-   std::list<vhdl_seq_stmt*> seeds;
+   // The shadowed targets: their seeds and commits are placed below
+   std::vector<ShadowEntry> shadows;
 
    for (std::set<std::string>::const_iterator tit = targets.begin();
         tit != targets.end(); ++tit) {
@@ -570,19 +621,15 @@ static void shadow_blocking_targets(vhdl_process *vhdl_proc, vhdl_entity *ent)
       // rename every ref, commit sig <= v — sole-driver assumption, the
       // same contract as the NBA whole-signal fallback.
       bool whole_signal = false;
-      vhdl_expr *commit_lhs_slice = NULL;
-      vhdl_expr *commit_rhs_slice = NULL;
+      bool sliced = false;
+      int64_t slice_base = 0;
       if (info.ambiguous)
          whole_signal = true;
       else if (info.slice) {
-         commit_lhs_slice = clone_slice(info.slice);
-         commit_rhs_slice = clone_slice(info.slice);
-         if (commit_lhs_slice == NULL || commit_rhs_slice == NULL) {
-            delete commit_lhs_slice;
-            delete commit_rhs_slice;
-            commit_lhs_slice = commit_rhs_slice = NULL;
+         if (const_value_of(info.slice, slice_base))
+            sliced = true;
+         else
             whole_signal = true;
-         }
       }
       if (whole_signal) {
          vhdl_var_set_t rmw_reads, rmw_writes;
@@ -627,43 +674,9 @@ static void shadow_blocking_targets(vhdl_process *vhdl_proc, vhdl_entity *ent)
       // emit as `:=` rather than `<=`.
       mark_var_assigns(body, var_name);
 
-      // Seed the shadow: `v_sig := sig;`. Collected here and emitted ONCE
-      // before the body loop (see below) rather than prepended into the body.
-      {
-         vhdl_var_ref *init_lhs =
-            new vhdl_var_ref(var_name, new vhdl_type(*src_type));
-         vhdl_var_ref *init_rhs =
-            new vhdl_var_ref(sig_name, new vhdl_type(*src_type));
-         seeds.push_back(new vhdl_assign_stmt(init_lhs, init_rhs));
-      }
-
-      // Append `sig(slice) <= v_sig(slice);` just before the trailing
-      // wait_on (or at end if no trailing wait).
-      {
-         vhdl_var_ref *lhs =
-            new vhdl_var_ref(sig_name, new vhdl_type(*src_type));
-         if (commit_lhs_slice)
-            lhs->set_slice(commit_lhs_slice, info.slice_width);
-         vhdl_var_ref *rhs =
-            new vhdl_var_ref(var_name, new vhdl_type(*src_type));
-         if (commit_rhs_slice)
-            rhs->set_slice(commit_rhs_slice, info.slice_width);
-         vhdl_nbassign_stmt *commit = new vhdl_nbassign_stmt(lhs, rhs);
-
-         stmt_container::stmt_list_t &stmts = body->get_stmts();
-         stmt_container::stmt_list_t::iterator wait_pos = stmts.end();
-         for (stmt_container::stmt_list_t::iterator it = stmts.begin();
-              it != stmts.end(); ++it) {
-            vhdl_wait_stmt *w = dynamic_cast<vhdl_wait_stmt*>(*it);
-            if (w && (w->get_type() == VHDL_WAIT_ON
-                      || w->get_type() == VHDL_WAIT_INDEF))
-               wait_pos = it;
-         }
-         if (wait_pos != stmts.end())
-            stmts.insert(wait_pos, commit);
-         else
-            stmts.push_back(commit);
-      }
+      ShadowEntry se = { sig_name, var_name, src_type, sliced, slice_base,
+                         info.slice_width };
+      shadows.push_back(se);
    }
 
    // wait_for_0 stmts are no longer needed: blocking-read semantics are
@@ -671,44 +684,62 @@ static void shadow_blocking_targets(vhdl_process *vhdl_proc, vhdl_entity *ent)
    // without a delta cycle.
    remove_wait_for_0(body);
 
-   // Where the seed goes depends on how the process suspends.
-   //
-   // A process that suspends on its OWN explicit wait (`always #10 clk = ~clk`
-   // -> `wait for 10 ms;`) re-runs its body from the top immediately after the
-   // trailing `sig <= v_sig;` -- in the SAME delta, before that update has
-   // settled. A seed at the top then re-reads the pre-write value, clobbers the
-   // shadow, and the next write is a no-op: the clock toggled only every OTHER
-   // period. For these, seeding is INITIALISATION, so hoist it out and loop the
-   // body -- the standard idiom:
-   //
-   //   process is variable v_clk : logic3d; begin
-   //     v_clk := clk;
-   //     loop  wait for 10 ms;  v_clk := not v_clk;  clk <= v_clk;  end loop;
-   //   end process;
-   //
-   // The shadow then just carries the last written value across iterations,
-   // which is what a blocking-assignment target should do.
-   //
-   // A process with a SENSITIVITY LIST has no wait of its own: its implicit
-   // wait is at the END of the body. It therefore does genuinely suspend before
-   // re-running, so a seed at the top reads a settled value and is correct --
-   // and wrapping its body in a loop would trap it so the implicit wait were
-   // never reached, spinning forever. Keep the seed at the top for those.
-   if (!seeds.empty()) {
-      if (body_has_toplevel_wait(body)) {
-         vhdl_loop_stmt *lp = new vhdl_loop_stmt;
-         lp->get_container()->move_stmts_from(body);  // body (incl. commits) -> loop
-         for (std::list<vhdl_seq_stmt*>::iterator it = seeds.begin();
-              it != seeds.end(); ++it)
-            body->add_stmt(*it);
-         body->add_stmt(lp);
-      }
-      else {
-         for (std::list<vhdl_seq_stmt*>::iterator it = seeds.begin();
-              it != seeds.end(); ++it)
-            body->prepend_stmt(*it);
-      }
+   if (shadows.empty())
+      return;
+
+   // Seeds (`v_sig := sig;') and commits (`sig <= v_sig;') go where the
+   // process suspends: its writes become visible when it suspends, and a
+   // shadow re-reads its signal after every suspension -- another process
+   // may have written the signal meanwhile, and this process's own commit
+   // has landed by then (a seed read once, before the first pass, missed
+   // every other process's write for good).
+   //  - A process with a sensitivity list has no wait of its own: its
+   //    implicit wait is at the END of the body, so a pass is seeds at the
+   //    top, the body, commits at the end.
+   //  - One that starts with its wait (`wait until rising_edge(clk)', `wait
+   //    on a' for an `always @(a)' that waits for its first event) re-runs
+   //    its body from the top right after the last pass's commits: its
+   //    seeds go after that leading wait, its commits at the end.
+   //  - One that ends with its wait (`wait on a, b'): commits before it,
+   //    seeds at the top.
+   //  - Any other wait (one in the middle of the body, or nested): commits
+   //    before it, seeds after it.
+   //  - One with neither a sensitivity list nor a wait at either end
+   //    starts its next pass straight after the last statement, without
+   //    suspending: the commits at the end have not landed, so seeds at the
+   //    top would read the values from before them. Its seeds initialise
+   //    the shadows once, ahead of a loop around the body; a shadow then
+   //    carries its value from one pass to the next.
+   stmt_container::stmt_list_t &stmts = body->get_stmts();
+   const vhdl_seq_stmt *lead = NULL, *trail = NULL;
+   if (!stmts.empty() && dynamic_cast<vhdl_wait_stmt*>(stmts.front()))
+      lead = stmts.front();
+   if (!stmts.empty() && stmts.back() != lead
+       && dynamic_cast<vhdl_wait_stmt*>(stmts.back()))
+      trail = stmts.back();
+   bool seed_once = lead == NULL && trail == NULL
+                    && vhdl_proc->get_sensitivity().empty();
+
+   shadow_around_waits(body, shadows, lead, trail);
+
+   if (trail == NULL)
+      for (size_t k = 0; k < shadows.size(); k++)
+         stmts.push_back(shadow_commit(shadows[k]));
+
+   if (seed_once) {
+      vhdl_loop_stmt *pass = new vhdl_loop_stmt;
+      pass->get_container()->move_stmts_from(body);
+      for (size_t k = 0; k < shadows.size(); k++)
+         body->add_stmt(shadow_seed(shadows[k]));
+      body->add_stmt(pass);
+      return;
    }
+
+   stmt_container::stmt_list_t::iterator pos = stmts.begin();
+   if (lead != NULL)
+      ++pos;   // just after the leading wait
+   for (size_t k = 0; k < shadows.size(); k++)
+      stmts.insert(pos, shadow_seed(shadows[k]));
 }
 
 // ---------------------------------------------------------------------------
@@ -1495,6 +1526,126 @@ static std::string get_process_name(ivl_process_t proc)
 // need to know which process they are in (an automatic task's callers)
 static ivl_process_t g_active_ivl_process = NULL;
 
+// The `wait for 0 ns' at the start of each initial block (Verilog's
+// time-zero order, generate_vhdl_process), and whether any initial block
+// assigns a signal at time zero
+static std::vector<std::pair<vhdl_process*, vhdl_wait_stmt*> > g_t0_waits;
+static bool g_t0_deposits = false;
+
+/*
+ * Once every process is drawn (vhdl.cc): the time-zero waits stay only in a
+ * design whose initial blocks assign a signal at time zero -- the events
+ * the processes that waited first must see. A design whose initial blocks
+ * only read at time zero reads in the first delta, before the other
+ * processes' time-zero signal assignments land, as vvp's initial threads
+ * do (ivtest vhdl_loop: a VHDL dut's `counter <= 1' at time zero is not
+ * seen by a read at time zero). All or none: the waits keep the initial
+ * blocks in their order (two that resume at one time print in source order).
+ */
+void settle_time_zero_waits()
+{
+   if (!g_t0_deposits) {
+      for (size_t k = 0; k < g_t0_waits.size(); k++) {
+         g_t0_waits[k].first->get_container()->get_stmts().remove(
+            g_t0_waits[k].second);
+         delete g_t0_waits[k].second;
+      }
+   }
+   g_t0_waits.clear();
+   g_t0_deposits = false;
+}
+
+// An SV variable declaration initializer (`logic a = 1;'): iverilog makes it
+// an initial process that vvp runs before every other one ($init), so no
+// process sees it as an event
+static bool is_var_init_process(ivl_process_t proc)
+{
+   for (unsigned i = 0; i < ivl_process_attr_cnt(proc); i++) {
+      ivl_attribute_t a = ivl_process_attr_val(proc, i);
+      if (a != NULL && strcmp(a->key, "_ivl_schedule_init") == 0)
+         return true;
+   }
+   return false;
+}
+
+// Whether running `s' can suspend the process: a delay, an event control
+// (@, wait), here or in a task it calls. (iverilog has already rewritten a
+// blocking assignment with an intra-assignment delay, `a = #d b', as
+// `tmp = b; #d a = tmp;'.)
+static bool stmt_suspends(ivl_statement_t s, std::set<ivl_scope_t> &tasks_seen)
+{
+   if (s == NULL)
+      return false;
+   switch (ivl_statement_type(s)) {
+   case IVL_ST_DELAY:
+   case IVL_ST_DELAYX:
+   case IVL_ST_WAIT:
+      return true;
+   case IVL_ST_BLOCK:
+   case IVL_ST_FORK:
+   case IVL_ST_FORK_JOIN_ANY:
+   case IVL_ST_FORK_JOIN_NONE:
+      for (unsigned i = 0; i < ivl_stmt_block_count(s); i++)
+         if (stmt_suspends(ivl_stmt_block_stmt(s, i), tasks_seen))
+            return true;
+      return false;
+   case IVL_ST_CONDIT:
+      return stmt_suspends(ivl_stmt_cond_true(s), tasks_seen)
+         || stmt_suspends(ivl_stmt_cond_false(s), tasks_seen);
+   case IVL_ST_CASE:
+   case IVL_ST_CASER:
+   case IVL_ST_CASEX:
+   case IVL_ST_CASEZ:
+      for (unsigned i = 0; i < ivl_stmt_case_count(s); i++)
+         if (stmt_suspends(ivl_stmt_case_stmt(s, i), tasks_seen))
+            return true;
+      return false;
+   case IVL_ST_FORLOOP:
+      return stmt_suspends(ivl_stmt_init_stmt(s), tasks_seen)
+         || stmt_suspends(ivl_stmt_sub_stmt(s), tasks_seen)
+         || stmt_suspends(ivl_stmt_step_stmt(s), tasks_seen);
+   case IVL_ST_WHILE:
+   case IVL_ST_DO_WHILE:
+   case IVL_ST_FOREVER:
+   case IVL_ST_REPEAT:
+      return stmt_suspends(ivl_stmt_sub_stmt(s), tasks_seen);
+   case IVL_ST_UTASK:
+      {
+         ivl_scope_t t = ivl_stmt_call(s);
+         if (t == NULL || !tasks_seen.insert(t).second)
+            return false;
+         return stmt_suspends(ivl_scope_def(t), tasks_seen);
+      }
+   default:
+      return false;
+   }
+}
+
+// Whether an always process suspends anywhere but at the event control that
+// starts each pass (`always @(...) body', which draw_wait turns into the
+// process's sensitivity list, or one wait at the top or the end of the
+// process). A leading event control is the process statement itself, or
+// the first statement of an unscoped block that is (draw_wait counts both
+// as the top level).
+static bool always_suspends_inside(ivl_statement_t stmt)
+{
+   std::set<ivl_scope_t> seen;
+   if (ivl_statement_type(stmt) == IVL_ST_WAIT)
+      return stmt_suspends(ivl_stmt_sub_stmt(stmt), seen);
+   if (ivl_statement_type(stmt) == IVL_ST_BLOCK
+       && ivl_stmt_block_scope(stmt) == NULL
+       && ivl_stmt_block_count(stmt) > 0
+       && ivl_statement_type(ivl_stmt_block_stmt(stmt, 0)) == IVL_ST_WAIT) {
+      if (stmt_suspends(ivl_stmt_sub_stmt(ivl_stmt_block_stmt(stmt, 0)), seen))
+         return true;
+      for (unsigned i = 1; i < ivl_stmt_block_count(stmt); i++)
+         if (stmt_suspends(ivl_stmt_block_stmt(stmt, i), seen))
+            return true;
+      return false;
+   }
+   return stmt_suspends(stmt, seen);
+}
+
 /*
  * Convert a Verilog process to VHDL and add it to the architecture
  * of the given entity.
@@ -1516,16 +1667,70 @@ static int generate_vhdl_process(vhdl_entity *ent, ivl_process_t proc)
       (ivl_process_type(proc) == IVL_PR_INITIAL);
 
    ivl_statement_t stmt = ivl_process_stmt(proc);
+
+   // A Verilog process runs from one suspension to the next without
+   // yielding: its blocking assignments are visible at once to its own
+   // reads, and to the other processes when it suspends. An initial or
+   // final process, and an always process that suspends inside its body,
+   // get that by depositing (:=) every blocking assignment to a signal
+   // (stmt.cc, deposits_signal); the `<=' they had before needed a `wait
+   // for 0 ns' ahead of each later read, and so yielded in mid-process. The
+   // other always processes suspend only at the end of a pass, where
+   // shadow_blocking_targets commits the variables that shadow their
+   // blocking targets (it cannot serve a body that suspends inside: it
+   // commits only at the end).
+   if (get_sv2vhdl_mode()
+       && (ivl_process_type(proc) == IVL_PR_INITIAL
+           || ivl_process_type(proc) == IVL_PR_FINAL
+           || always_suspends_inside(stmt)))
+      vhdl_proc->set_deposit_blocking();
+
+   // ... except at time zero: until an initial block first suspends, a read
+   // of what it deposited waits a delta first, as before, so the nets fed
+   // by its deposits have settled. Verilog would read those nets not yet
+   // updated -- x at time zero, which compares as unknown (ivtest pr307a: a
+   // continuous `in1 + in2' compared with its blocking twin passes on x),
+   // where the translation reads an x by its value bits and finds a
+   // mismatch. After its first suspension, an unsettled net holds its
+   // previous value, as in Verilog, and nothing yields.
+   if (get_sv2vhdl_mode() && ivl_process_type(proc) == IVL_PR_INITIAL)
+      vhdl_proc->set_time_zero();
+   // (Plain -tvhdl mode keeps the `wait for 0 ns' before every read of a
+   // blocking target, a deposited one too: it has none of the above.)
+   if (!get_sv2vhdl_mode())
+      vhdl_proc->set_deposits_are_targets();
+
+   // Verilog's time-zero order (time_zero_order_enabled): an initial block
+   // runs once every process has reached its first wait -- vvp starts a
+   // combinational always block first -- so its time-zero assignments are
+   // events to them.
+   vhdl_wait_stmt *t0_wait = NULL;
+   if (ivl_process_type(proc) == IVL_PR_INITIAL && time_zero_order_enabled()
+       && !is_var_init_process(proc)) {
+      t0_wait = new vhdl_wait_stmt(VHDL_WAIT_FOR0);
+      t0_wait->set_comment("Every process reaches its first wait first");
+      vhdl_proc->get_container()->add_stmt(t0_wait);
+   }
+
    int rc = draw_stmt(vhdl_proc, vhdl_proc->get_container(), stmt);
    if (rc != 0)
       return rc;
+
+   // ... which only a design whose initial blocks assign signals at time
+   // zero needs: see settle_time_zero_waits
+   if (t0_wait != NULL) {
+      g_t0_waits.push_back(std::make_pair(vhdl_proc, t0_wait));
+      if (vhdl_proc->deposits_at_time_zero())
+         g_t0_deposits = true;
+   }
 
    // Replace each blocking-target signal with a process-local variable
    // shadow so we can drop the `wait for 0 ns;` statements that would
    // otherwise commit intermediate values and drive delta-cycle livelock
    // on self-sensitive always-comb blocks.  Only applied to non-initial
    // processes (initial blocks have different semantics and are emitted
-   // as deposit-style assignments anyway).
+   // as deposit-style assignments anyway), and not to a process that
+   // deposits its blocking assignments (see above).
    // Waitless edge-triggered (always_ff-style) processes defer both passes
    // to merge_edge_processes_in_all_entities(): same-edge blocks assigning a
    // common signal are first composed into one process so the signal keeps
@@ -1536,12 +1741,14 @@ static int generate_vhdl_process(vhdl_entity *ent, ivl_process_t proc)
       // read `wait for 0 ns` (deleted by shadow_blocking_targets) becomes a
       // guarded sensitised process first, so it gets the NBA deferral and
       // takes part in the merge like any other always_ff.
-      promote_wait_until_edge_form(vhdl_proc);
+      if (!vhdl_proc->deposit_blocking())
+         promote_wait_until_edge_form(vhdl_proc);
       if (is_mergeable_edge_process(vhdl_proc))
          deferred = true;
       else {
          strip_local_vars_from_sensitivity(vhdl_proc);
-         shadow_blocking_targets(vhdl_proc, ent);
+         if (!vhdl_proc->deposit_blocking())
+            shadow_blocking_targets(vhdl_proc, ent);
          nba_defer_commits(vhdl_proc, ent);
       }
    }
@@ -1561,7 +1768,19 @@ static int generate_vhdl_process(vhdl_entity *ent, ivl_process_t proc)
 
    if (is_initial && !is_empty) {
       vhdl_wait_stmt *wait = new vhdl_wait_stmt();
-      vhdl_proc->get_container()->add_stmt(wait);
+      if (get_sv2vhdl_mode()) {
+         // `loop wait; end loop;': nvc can resume a process from `wait;'
+         // when it waited on a fixed set of signals before (`wait (c)'
+         // drawn as `wait on' in a loop) and one of them changes later --
+         // its persistent wait-set entries outlive that wait. A bare
+         // `wait;' then ran the whole initial body again (ivtest pr710:
+         // the run never ended). The loop only waits again.
+         vhdl_loop_stmt *forever = new vhdl_loop_stmt;
+         forever->get_container()->add_stmt(wait);
+         vhdl_proc->get_container()->add_stmt(forever);
+      }
+      else
+         vhdl_proc->get_container()->add_stmt(wait);
    }
 
    // An always-process whose body collapsed to only null statements
@@ -1681,6 +1900,29 @@ static int generate_analog_call(vhdl_entity *ent, ivl_process_t proc,
    return 0;
 }
 
+// A final block that only closes or flushes files ($fclose, $fflush): the end
+// of the run does both itself (the sv2vhdl runtime flushes every file it opened
+// and the files close when nvc exits), so leaving the block out is faithful.
+// vhdlpp writes one for each VHDL file object (`final $fclose(f)'; ivtest
+// vhdl_textio_write).
+static bool final_only_closes_files(ivl_statement_t stmt)
+{
+   switch (ivl_statement_type(stmt)) {
+   case IVL_ST_NOOP:
+      return true;
+   case IVL_ST_BLOCK:
+      for (unsigned i = 0; i < ivl_stmt_block_count(stmt); i++)
+         if (!final_only_closes_files(ivl_stmt_block_stmt(stmt, i)))
+            return false;
+      return true;
+   case IVL_ST_STASK:
+      return strcmp(ivl_stmt_name(stmt), "$fclose") == 0
+         || strcmp(ivl_stmt_name(stmt), "$fflush") == 0;
+   default:
+      return false;
+   }
+}
+
 extern "C" int draw_process(ivl_process_t proc, void *)
 {
    ivl_scope_t scope = ivl_process_scope(proc);
@@ -1717,6 +1959,19 @@ extern "C" int draw_process(ivl_process_t proc, void *)
       return generate_analog_call(ent, proc, scope);
    }
 
+   // A SystemVerilog final block runs when the simulation ends (at $finish,
+   // or when nothing is left to do). A VHDL process has no such point: drawn
+   // as an initial block, it ran at time 0 (`final $display(n)' printed the
+   // value n had at the start, silently).
+   if (get_sv2vhdl_mode() && ivl_process_type(proc) == IVL_PR_FINAL) {
+      if (final_only_closes_files(ivl_process_stmt(proc)))
+         return 0;
+      error("%s:%d: no VHDL translation for a final block: a VHDL process cannot "
+            "run when the simulation ends (it would run at time 0)",
+            ivl_process_file(proc), ivl_process_lineno(proc));
+      return 1;
+   }
+
    // For initial processes, extract any leading assignments that occur
    // before the first delay/wait/event and apply them as signal
    // declaration defaults. This avoids creating an extra VHDL driver
@@ -1726,7 +1981,10 @@ extern "C" int draw_process(ivl_process_t proc, void *)
    // The remaining statements (after the first wait) are still
    // generated as a process. If the initial only has prefix
    // assignments and nothing else, the process is suppressed entirely.
-   if (ivl_process_type(proc) == IVL_PR_INITIAL) {
+   // (Under Verilog's time-zero order, only an SV variable initializer is
+   // hoisted: an initial block's time-zero assignments are events.)
+   if (ivl_process_type(proc) == IVL_PR_INITIAL
+       && (!time_zero_order_enabled() || is_var_init_process(proc))) {
       ivl_statement_t stmt = ivl_process_stmt(proc);
       std::vector<init_assign_t> assigns;
       // Check for time-zero-only case first
@@ -1802,6 +2060,221 @@ ivl_process_t get_active_ivl_process()
 }
 
 /*
+ * Named-block locals shared between processes. A local of a named block
+ * (`always @(posedge clk) begin : blk reg [7:0] t; ... end') is a variable
+ * of its process (draw_block): another process that names it (`blk.t'), or
+ * waits on it, cannot reach it there -- nvc stopped the analysis with "no
+ * visible declaration", unless that other process happened to be drawn
+ * first. Before any process is drawn, every such local referenced outside
+ * its own process becomes an architecture signal instead
+ * (hoist_block_local, scope.cc), which its process then assigns as it
+ * assigns any signal. A local only its own process uses stays a variable.
+ */
+namespace {
+struct proc_refs_t {
+   std::set<ivl_scope_t> owned;      // named-block scopes inside the process
+   std::set<ivl_signal_t> sigs;      // signals it reads, writes or waits on
+   std::set<ivl_scope_t> tasks;      // tasks it calls (inlined in it)
+};
+}
+
+static std::set<ivl_signal_t> g_shared_block_locals;
+
+static void refs_expr(ivl_expr_t e, proc_refs_t &r)
+{
+   if (e == NULL)
+      return;
+   switch (ivl_expr_type(e)) {
+   case IVL_EX_SIGNAL:
+      r.sigs.insert(ivl_expr_signal(e));
+      refs_expr(ivl_expr_oper1(e), r);       // a word index
+      return;
+   case IVL_EX_SELECT:
+   case IVL_EX_BINARY:
+      refs_expr(ivl_expr_oper1(e), r);
+      refs_expr(ivl_expr_oper2(e), r);
+      return;
+   case IVL_EX_UNARY:
+      refs_expr(ivl_expr_oper1(e), r);
+      return;
+   case IVL_EX_TERNARY:
+      refs_expr(ivl_expr_oper1(e), r);
+      refs_expr(ivl_expr_oper2(e), r);
+      refs_expr(ivl_expr_oper3(e), r);
+      return;
+   case IVL_EX_CONCAT:
+   case IVL_EX_SFUNC:
+   case IVL_EX_UFUNC:
+   case IVL_EX_ARRAY_PATTERN:
+      for (unsigned i = 0; i < ivl_expr_parms(e); i++)
+         refs_expr(ivl_expr_parm(e, i), r);
+      return;
+   default:
+      return;
+   }
+}
+
+static void refs_nexus(ivl_nexus_t nex, proc_refs_t &r)
+{
+   if (nex == NULL)
+      return;
+   for (unsigned i = 0; i < ivl_nexus_ptrs(nex); i++) {
+      ivl_signal_t s = ivl_nexus_ptr_sig(ivl_nexus_ptr(nex, i));
+      if (s != NULL)
+         r.sigs.insert(s);
+   }
+}
+
+static void refs_stmt(ivl_statement_t s, proc_refs_t &r)
+{
+   if (s == NULL)
+      return;
+   switch (ivl_statement_type(s)) {
+   case IVL_ST_ASSIGN:
+   case IVL_ST_ASSIGN_NB:
+   case IVL_ST_CASSIGN:
+   case IVL_ST_FORCE:
+   case IVL_ST_DEASSIGN:
+   case IVL_ST_RELEASE:
+      for (unsigned i = 0; i < ivl_stmt_lvals(s); i++) {
+         ivl_lval_t lv = ivl_stmt_lval(s, i);
+         if (ivl_lval_sig(lv) != NULL)
+            r.sigs.insert(ivl_lval_sig(lv));
+         refs_expr(ivl_lval_idx(lv), r);
+         refs_expr(ivl_lval_part_off(lv), r);
+      }
+      if (ivl_statement_type(s) != IVL_ST_DEASSIGN
+          && ivl_statement_type(s) != IVL_ST_RELEASE)
+         refs_expr(ivl_stmt_rval(s), r);
+      if (ivl_statement_type(s) == IVL_ST_ASSIGN
+          || ivl_statement_type(s) == IVL_ST_ASSIGN_NB)
+         refs_expr(ivl_stmt_delay_expr(s), r);
+      return;
+   case IVL_ST_BLOCK:
+   case IVL_ST_FORK:
+   case IVL_ST_FORK_JOIN_ANY:
+   case IVL_ST_FORK_JOIN_NONE:
+      if (ivl_stmt_block_scope(s) != NULL)
+         r.owned.insert(ivl_stmt_block_scope(s));
+      for (unsigned i = 0; i < ivl_stmt_block_count(s); i++)
+         refs_stmt(ivl_stmt_block_stmt(s, i), r);
+      return;
+   case IVL_ST_CONDIT:
+      refs_expr(ivl_stmt_cond_expr(s), r);
+      refs_stmt(ivl_stmt_cond_true(s), r);
+      refs_stmt(ivl_stmt_cond_false(s), r);
+      return;
+   case IVL_ST_CASE:
+   case IVL_ST_CASER:
+   case IVL_ST_CASEX:
+   case IVL_ST_CASEZ:
+      refs_expr(ivl_stmt_cond_expr(s), r);
+      for (unsigned i = 0; i < ivl_stmt_case_count(s); i++) {
+         refs_expr(ivl_stmt_case_expr(s, i), r);
+         refs_stmt(ivl_stmt_case_stmt(s, i), r);
+      }
+      return;
+   case IVL_ST_WHILE:
+   case IVL_ST_DO_WHILE:
+   case IVL_ST_REPEAT:
+      refs_expr(ivl_stmt_cond_expr(s), r);
+      refs_stmt(ivl_stmt_sub_stmt(s), r);
+      return;
+   case IVL_ST_FOREVER:
+   case IVL_ST_DELAY:
+      refs_stmt(ivl_stmt_sub_stmt(s), r);
+      return;
+   case IVL_ST_DELAYX:
+      refs_expr(ivl_stmt_delay_expr(s), r);
+      refs_stmt(ivl_stmt_sub_stmt(s), r);
+      return;
+   case IVL_ST_FORLOOP:
+      refs_stmt(ivl_stmt_init_stmt(s), r);
+      refs_expr(ivl_stmt_cond_expr(s), r);
+      refs_stmt(ivl_stmt_step_stmt(s), r);
+      refs_stmt(ivl_stmt_sub_stmt(s), r);
+      return;
+   case IVL_ST_WAIT:
+      for (unsigned i = 0; i < ivl_stmt_nevent(s); i++) {
+         ivl_event_t ev = ivl_stmt_events(s, i);
+         for (unsigned j = 0; j < ivl_event_nany(ev); j++)
+            refs_nexus(ivl_event_any(ev, j), r);
+         for (unsigned j = 0; j < ivl_event_npos(ev); j++)
+            refs_nexus(ivl_event_pos(ev, j), r);
+         for (unsigned j = 0; j < ivl_event_nneg(ev); j++)
+            refs_nexus(ivl_event_neg(ev, j), r);
+      }
+      refs_stmt(ivl_stmt_sub_stmt(s), r);
+      return;
+   case IVL_ST_STASK:
+      for (unsigned i = 0; i < ivl_stmt_parm_count(s); i++)
+         refs_expr(ivl_stmt_parm(s, i), r);
+      return;
+   case IVL_ST_UTASK:
+      {
+         // Inlined into the process: its blocks are the process's own
+         ivl_scope_t t = ivl_stmt_call(s);
+         if (t != NULL && r.tasks.insert(t).second)
+            refs_stmt(ivl_scope_def(t), r);
+      }
+      return;
+   default:
+      return;
+   }
+}
+
+static bool is_block_scope(ivl_scope_t sc)
+{
+   return sc != NULL && (ivl_scope_type(sc) == IVL_SCT_BEGIN
+                         || ivl_scope_type(sc) == IVL_SCT_FORK);
+}
+
+extern "C" int scan_shared_block_locals(ivl_process_t proc, void *)
+{
+   ivl_scope_t scope = ivl_process_scope(proc);
+   if (!is_default_scope_instance(scope) || ivl_process_analog(proc))
+      return 0;
+   proc_refs_t r;
+   refs_stmt(ivl_process_stmt(proc), r);
+   // A local of a block of another process
+   for (std::set<ivl_signal_t>::const_iterator it = r.sigs.begin();
+        it != r.sigs.end(); ++it) {
+      ivl_scope_t ss = ivl_signal_scope(*it);
+      if (is_block_scope(ss) && r.owned.count(ss) == 0)
+         g_shared_block_locals.insert(*it);
+   }
+   // A local of one of this process's blocks that a net reads (a
+   // continuous assignment, a port): its nexus joins more than itself
+   for (std::set<ivl_scope_t>::const_iterator it = r.owned.begin();
+        it != r.owned.end(); ++it) {
+      for (unsigned i = 0; i < ivl_scope_sigs(*it); i++) {
+         ivl_signal_t sig = ivl_scope_sig(*it, i);
+         if (ivl_signal_array_count(sig) > 1)
+            continue;
+         ivl_nexus_t nex = ivl_signal_nex(sig, 0);
+         if (nex == NULL)
+            continue;
+         for (unsigned k = 0; k < ivl_nexus_ptrs(nex); k++) {
+            ivl_nexus_ptr_t p = ivl_nexus_ptr(nex, k);
+            if (ivl_nexus_ptr_sig(p) != sig) {
+               g_shared_block_locals.insert(sig);
+               break;
+            }
+         }
+      }
+   }
+   return 0;
+}
+
+void hoist_shared_block_locals()
+{
+   for (std::set<ivl_signal_t>::const_iterator it =
+           g_shared_block_locals.begin();
+        it != g_shared_block_locals.end(); ++it)
+      hoist_block_local(*it);
+}
+
+/*
  * Comb-cone fusion. The per-gate/per-LPM draws emit ONE PROCESS PER
  * INTERMEDIATE (`process (all) is begin tmp <= expr; end`), so logic
  * depth becomes delta-cycle count and every level re-wakes the whole
@@ -1821,6 +2294,27 @@ ivl_process_t get_active_ivl_process()
  * Multi-defined names and cycle members are left as-is (Kahn survivors
  * only). Kill-switch: SV2VHDL_NO_FUSE=1.
  */
+/*
+ * Nets a force or a release names (draw_force, draw_release), by their
+ * VHDL home and name. A fused cone deposits its members, and nvc gives a
+ * force or release on a deposited net its Verilog effect by re-running the
+ * cone that deposits it -- a cone it records on the cone's first run. When
+ * that run happened before any input had changed (an initial block that
+ * starts a delta late, under Verilog's time-zero order), nothing was
+ * recorded: the forced value never reached the nets the cone computes from
+ * it, and a release left the net forced (ivtest pr2849783, pr3368642). Such
+ * a net keeps its own continuous assignment, a VHDL driver that force and
+ * release act on as VHDL defines.
+ */
+static std::set<std::pair<const vhdl_scope*, std::string> > g_forced_nets;
+
+void note_forced_net(ivl_signal_t sig)
+{
+   if (sig != NULL && seen_signal_before(sig))
+      g_forced_nets.insert(std::make_pair(find_scope_for_signal(sig),
+                                          get_renamed_signal(sig)));
+}
+
 void fuse_comb_processes(vhdl_entity *ent)
 {
    vhdl_arch *arch = ent->get_arch();
@@ -1860,6 +2354,10 @@ void fuse_comb_processes(vhdl_entity *ent)
          if (d != NULL && d->is_resolved())
             continue;
       }
+      // A forced or released net keeps its driver (see g_forced_nets)
+      if (g_forced_nets.count(std::make_pair(
+             (const vhdl_scope*)arch->get_scope(), ca->get_lhs()->get_name())))
+         continue;
       member_t m = { ca, ca->get_lhs()->get_name(), NULL };
       cand.push_back(m);
       def_count[m.def]++;

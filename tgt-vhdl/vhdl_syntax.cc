@@ -61,6 +61,11 @@ void vhdl_scope::add_forward_decl(vhdl_decl *decl)
    decls_.push_front(decl);
 }
 
+void vhdl_scope::remove_decl(vhdl_decl *decl)
+{
+   decls_.remove(decl);
+}
+
 vhdl_decl *vhdl_scope::get_decl(const std::string &name) const
 {
    decl_list_t::const_iterator it;
@@ -705,6 +710,15 @@ bool vhdl_port_decl::is_readable() const
    return mode_ != VHDL_PORT_OUT && mode_ != VHDL_PORT_BUFFER;
 }
 
+void vhdl_verbatim_decl::emit(std::ostream &of, int level) const
+{
+   for (size_t i = 0; i < lines_.size(); i++) {
+      if (i > 0)
+         newline(of, level);
+      of << lines_[i];
+   }
+}
+
 void vhdl_var_decl::emit(std::ostream &of, int level) const
 {
    of << "variable " << name_ << " : ";
@@ -875,6 +889,14 @@ void vhdl_var_ref::slice_element(vhdl_expr *s, int w)
    else if (tname == VHDL_TYPE_UNSIGNED || tname == VHDL_TYPE_SIGNED)
       type_ = (w > 0) ? new vhdl_type(tname, w) : vhdl_type::std_logic();
    // a scalar element stays a scalar
+}
+
+bool vhdl_var_ref::extra_slices_constant() const
+{
+   for (auto &extra : extra_slices_)
+      if (dynamic_cast<vhdl_const_int*>(extra.first) == NULL)
+         return false;
+   return true;
 }
 
 void vhdl_var_ref::find_vars(vhdl_var_set_t& read)
@@ -1684,7 +1706,7 @@ void vhdl_for_stmt::find_vars(vhdl_var_set_t& read,
                               vhdl_var_set_t& write)
 {
    from_->find_vars(read);
-   to_->find_vars(write);
+   to_->find_vars(read);    // both bounds are read (a repeat count, say)
 
    vhdl_loop_stmt::find_vars(read, write);
 }

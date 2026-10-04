@@ -482,6 +482,104 @@ bool tran_vp_copy_needs_warning(vhdl_scope *sc, ivl_switch_t sw)
 static void emit_tri_pull(vhdl_arch *arch, vhdl_var_ref *ref, char pull);
 
 /*
+ * A tran primitive (tran, tranif0/1, rtran...) on a bit- or part-select,
+ * `tran t1(bus[2], w)': the core joins the select to a 1-bit temporary of
+ * its own by a part-select tran (IVL_SW_TRAN_VP, the temporary its side b)
+ * and the primitive's terminal to the temporary.  If `nexus' is such a
+ * temporary -- one core temporary of the switches' scope and nothing on it
+ * but that part-select tran's side b and the terminals of other switches
+ * of the scope -- return the part-select tran and set `temp'.
+ */
+static ivl_switch_t tran_select_temp(ivl_nexus_t nexus, ivl_signal_t &temp)
+{
+   ivl_switch_t vp = NULL;
+   bool prim = false;
+   temp = NULL;
+   for (unsigned i = 0; i < ivl_nexus_ptrs(nexus); i++) {
+      ivl_nexus_ptr_t p = ivl_nexus_ptr(nexus, i);
+      ivl_signal_t s = ivl_nexus_ptr_sig(p);
+      ivl_switch_t w = ivl_nexus_ptr_switch(p);
+      if (s != NULL) {
+         if (!ivl_signal_local(s) || temp != NULL)
+            return NULL;
+         temp = s;
+      }
+      else if (w != NULL) {
+         if (ivl_switch_type(w) == IVL_SW_TRAN_VP) {
+            if (ivl_switch_b(w) != nexus || vp != NULL)
+               return NULL;
+            vp = w;
+         }
+         else if (ivl_switch_a(w) == nexus || ivl_switch_b(w) == nexus)
+            prim = true;
+         else
+            return NULL;              // a tranif's enable
+      }
+      else
+         return NULL;
+   }
+   if (vp == NULL || !prim || temp == NULL
+       || ivl_signal_scope(temp) != ivl_switch_scope(vp))
+      return NULL;
+   for (unsigned i = 0; i < ivl_nexus_ptrs(nexus); i++) {
+      ivl_switch_t w = ivl_nexus_ptr_switch(ivl_nexus_ptr(nexus, i));
+      if (w != NULL && ivl_switch_scope(w) != ivl_switch_scope(vp))
+         return NULL;
+   }
+   return vp;
+}
+
+/*
+ * Make such a temporary (tran_select_temp) an alias of the select,
+ *
+ *    alias tmp_ivl_10 is bus_sig(2);
+ *
+ * so the primitive joins the vector element itself, both ways: it was a
+ * signal fed by a one-way copy of the element (draw_one_switch, with a
+ * "connected one way only" warning), so what the primitive's other side
+ * drove never reached the vector.  True when it did.  When the vector is a
+ * port of the module, or not a logic3d_vector, the copy and its warning stay.
+ */
+static bool alias_tran_select_temp(ivl_nexus_t nexus)
+{
+   if (!get_sv2vhdl_mode())
+      return false;
+   ivl_signal_t temp;
+   ivl_switch_t vp = tran_select_temp(nexus, temp);
+   if (vp == NULL || !is_default_scope_instance(ivl_switch_scope(vp)))
+      return false;
+   vhdl_scope *sc = find_scope_for_signal(temp);
+   if (sc == NULL)
+      return false;
+   const string tname = get_renamed_signal(temp);
+   vhdl_decl *old = sc->get_decl(tname);
+   if (old == NULL || dynamic_cast<vhdl_signal_decl*>(old) == NULL)
+      return false;
+   // tran_vp_alias's own conditions, checked first (it warns when it fails,
+   // and draw_one_switch warns about the copy that is left), and a signal of
+   // the architecture: the resolver joins a switch to a port of the module
+   // only on the module's side (what drives the port from outside does not
+   // reach the switch), so a port's element keeps the copy, which at least
+   // carries the outside value to the switch, and its warning
+   unsigned off;
+   vhdl_var_ref *a = nexus_to_var_ref(sc, tran_vp_vector(vp, off));
+   vhdl_decl *adecl = sc->get_decl(a->get_name());
+   if (adecl == NULL || adecl->get_type() == NULL
+       || adecl->get_type()->get_name() != VHDL_TYPE_LOGIC3D_VECTOR
+       || dynamic_cast<const vhdl_port_decl*>(adecl) != NULL)
+      return false;
+   const unsigned part = ivl_switch_part(vp);
+   const vhdl_type *type = part > 1 ? vhdl_type::logic3d_vector(part - 1, 0)
+                                    : vhdl_type::logic3d();
+   vhdl_decl *al = tran_vp_alias(sc, vp, tname, type);
+   if (al == NULL)
+      return false;
+   sc->remove_decl(old);
+   sc->add_decl(al);
+   return true;
+}
+
+/*
  * Generates VHDL code to fully represent a nexus.
  */
 void draw_nexus(ivl_nexus_t nexus)
@@ -772,6 +870,11 @@ void draw_nexus(ivl_nexus_t nexus)
       }
    }
 
+   // A tran primitive on a bit- or part-select: its temporary is the select
+   // itself, an alias, which needs no default of its own (the vector's
+   // nexus has its own)
+   const bool select_alias = alias_tran_select_temp(nexus);
+
    // sv2vhdl mode: a tri1/tri0 net is pulled whether or not something else
    // drives it (draw_constant_drivers places the pull)
    if (get_sv2vhdl_mode()) {
@@ -805,9 +908,10 @@ void draw_nexus(ivl_nexus_t nexus)
       if (st == IVL_SIT_TRI || st == IVL_SIT_UWIRE)
          priv->const_driver = new vhdl_const_real(0.0);
    }
-   else if (ndrivers == 0
-            || (get_sv2vhdl_mode() && ndrivers == npassive
-                && priv->const_driver == NULL && !nexus_is_real(nexus))) {
+   else if (!select_alias
+            && (ndrivers == 0
+                || (get_sv2vhdl_mode() && ndrivers == npassive
+                    && priv->const_driver == NULL && !nexus_is_real(nexus)))) {
       // (a joined net's tri0/tri1 value is its pull's, not a constant's)
       const bool joined = ndrivers != 0;
       char def = 0;
@@ -1304,11 +1408,11 @@ static bool input_driven_inside(ivl_signal_t sig);
 // inout port (or an input port declared inout, input_driven_inside). This is
 // the bidirectional/mixed-signal model -- direction is advisory; the net
 // itself is a resolved meeting point.
-static bool net_needs_resolution(ivl_signal_t sig)
+static bool net_needs_resolution(ivl_signal_t sig, unsigned word = 0)
 {
    if (!get_sv2vhdl_mode())
       return false;
-   ivl_nexus_t nex = ivl_signal_nex(sig, 0);
+   ivl_nexus_t nex = ivl_signal_nex(sig, word);
    if (nex == NULL)
       return false;
    int nptrs = ivl_nexus_ptrs(nex);
@@ -1346,6 +1450,76 @@ static bool net_needs_resolution(ivl_signal_t sig)
    if (pulled)
       drivers++;
    return drivers >= 2;
+}
+
+/*
+ * The initial value of a vector net with bits that nothing drives: those
+ * bits read z, as in Verilog. A net driven only through constant part
+ * selects (`assign w[1] = 1'b0', a pull on w[0], a child output on w[3:2])
+ * gets drivers for those bits only, so an unresolved signal kept its initial
+ * x in the others (vvp zz0z, the translation xx0x), and a net with no driver
+ * at all read x. The undriven bits start, and stay, z:
+ *    signal w : logic3d_vector(3 downto 0) := (3 => L3D_Z, 2 => L3D_Z, 0 => L3D_Z, others => L3D_X);
+ * NULL (keep the default) for anything else: a net with a full-width driver
+ * (a gate, an assign, a constant, a child output, a switch), a part select at
+ * a run-time base, a pulled (tri0/tri1) or analog net, a memory.
+ */
+static vhdl_expr *undriven_bits_initial(ivl_signal_t sig, const vhdl_type *t)
+{
+   if (!get_sv2vhdl_mode() || ivl_signal_type(sig) == IVL_SIT_REG
+       || ivl_signal_type(sig) == IVL_SIT_TRI0
+       || ivl_signal_type(sig) == IVL_SIT_TRI1
+       || ivl_signal_type(sig) == IVL_SIT_UWIRE
+       || ivl_signal_discipline(sig) != NULL
+       || ivl_signal_array_count(sig) != 1
+       || ivl_signal_data_type(sig) != IVL_VT_LOGIC
+       || t == NULL || t->get_name() != VHDL_TYPE_LOGIC3D_VECTOR)
+      return NULL;
+   const unsigned width = ivl_signal_width(sig);
+   ivl_nexus_t nex = ivl_signal_nex(sig, 0);
+   if (nex == NULL || width < 1)
+      return NULL;
+   std::vector<bool> driven(width, false);
+   const int nptrs = ivl_nexus_ptrs(nex);
+   for (int i = 0; i < nptrs; i++) {
+      ivl_nexus_ptr_t ptr = ivl_nexus_ptr(nex, i);
+      ivl_net_logic_t log = ivl_nexus_ptr_log(ptr);
+      if (log && ivl_logic_pin(log, 0) == nex)
+         return NULL;
+      if (ivl_nexus_ptr_con(ptr) || ivl_nexus_ptr_switch(ptr))
+         return NULL;
+      ivl_signal_t s2 = ivl_nexus_ptr_sig(ptr);
+      if (s2 && s2 != sig && ivl_signal_port(s2) != IVL_SIP_NONE
+          && ivl_signal_port(s2) != IVL_SIP_INPUT)
+         return NULL;                  // a child's output or inout
+      ivl_lpm_t lpm = ivl_nexus_ptr_lpm(ptr);
+      if (lpm == NULL || ivl_lpm_q(lpm) != nex)
+         continue;
+      if (ivl_lpm_type(lpm) != IVL_LPM_PART_PV || ivl_lpm_data(lpm, 1) != NULL)
+         return NULL;
+      const unsigned base = ivl_lpm_base(lpm);
+      for (unsigned b = base; b < base + ivl_lpm_width(lpm) && b < width; b++)
+         driven[b] = true;
+   }
+   ostringstream ss;
+   ss << "(";
+   bool any_driven = false, any_undriven = false;
+   for (unsigned b = 0; b < width; b++) {
+      if (driven[b]) {
+         any_driven = true;
+         continue;
+      }
+      if (any_undriven)
+         ss << ", ";
+      ss << b << " => L3D_Z";
+      any_undriven = true;
+   }
+   if (!any_undriven)
+      return NULL;
+   if (!any_driven)
+      return new vhdl_var_ref("(others => L3D_Z)", new vhdl_type(*t));
+   ss << ", others => L3D_X)";
+   return new vhdl_var_ref(ss.str(), new vhdl_type(*t));
 }
 
 // Is scope `s' the scope `anc' or inside it?
@@ -1870,6 +2044,116 @@ static string port_formal_name(ivl_signal_t to)
    return make_safe_name(to);
 }
 
+/*
+ * A word read at a run-time index outside a Verilog array gives x (0.0 for a
+ * real array), where a VHDL index stops the run. sv2vhdl mode reads such a
+ * word through a function declared with the array's type:
+ *
+ *    impure function <type>_Rd (m : <type>; i : Integer) return <element> is
+ *       variable <type>_Rd_Result : <element>;
+ *    begin
+ *       if i >= 0 and i <= <count-1> then <type>_Rd_Result := m(i);
+ *       else <type>_Rd_Result := <x>; end if;
+ *       return <type>_Rd_Result;
+ *    end function;
+ *
+ * (translate_signal; the memory goes in as an argument, so a process that
+ * shadows it passes its shadow). A store outside the array is dropped, as
+ * vvp drops it (make_assignment).
+ */
+static std::set<std::string> g_word_read_types;
+
+bool has_word_read(const std::string &array_type_name)
+{
+   return g_word_read_types.count(array_type_name) > 0;
+}
+
+static void declare_word_read(vhdl_scope *arch_scope,
+                              const std::string &type_name,
+                              const vhdl_type *array_type,
+                              const vhdl_type *elem, int hi)
+{
+   vhdl_expr *x;
+   switch (elem->get_name()) {
+   case VHDL_TYPE_LOGIC3D_VECTOR:
+      x = new vhdl_var_ref("(others => L3D_X)", new vhdl_type(*elem));
+      break;
+   case VHDL_TYPE_LOGIC3D:
+      x = new vhdl_var_ref("L3D_X", vhdl_type::logic3d());
+      break;
+   case VHDL_TYPE_REAL:
+      x = new vhdl_const_real(0.0);
+      break;
+   default:
+      return;     // no read function: such words index directly
+   }
+
+   const std::string fname = type_name + "_Rd";
+   const std::string result = fname + "_Result";
+   vhdl_function *f = new vhdl_function(fname.c_str(), new vhdl_type(*elem));
+   f->add_param(new vhdl_param_decl("m", new vhdl_type(*array_type)));
+   f->add_param(new vhdl_param_decl("i", vhdl_type::integer()));
+   f->get_scope()->add_decl(new vhdl_var_decl(result, new vhdl_type(*elem)));
+
+   vhdl_binop_expr *in_range =
+      new vhdl_binop_expr(VHDL_BINOP_AND, vhdl_type::boolean());
+   in_range->add_expr(new vhdl_binop_expr(
+      new vhdl_var_ref("i", vhdl_type::integer()), VHDL_BINOP_GEQ,
+      new vhdl_const_int(0), vhdl_type::boolean()));
+   in_range->add_expr(new vhdl_binop_expr(
+      new vhdl_var_ref("i", vhdl_type::integer()), VHDL_BINOP_LEQ,
+      new vhdl_const_int(hi), vhdl_type::boolean()));
+   vhdl_if_stmt *iff = new vhdl_if_stmt(in_range);
+   vhdl_var_ref *word = new vhdl_var_ref("m", new vhdl_type(*array_type));
+   word->set_slice(new vhdl_var_ref("i", vhdl_type::integer()));
+   iff->get_then_container()->add_stmt(new vhdl_assign_stmt(
+      new vhdl_var_ref(result, new vhdl_type(*elem)), word));
+   iff->get_else_container()->add_stmt(new vhdl_assign_stmt(
+      new vhdl_var_ref(result, new vhdl_type(*elem)), x));
+   f->get_container()->add_stmt(iff);
+   f->set_comment("A word read outside the array is x, as in Verilog");
+
+   arch_scope->add_decl(f);
+   g_word_read_types.insert(type_name);
+}
+
+/*
+ * A named-block local another process names (process.cc,
+ * scan_shared_block_locals): an architecture signal of the block's module,
+ * <block>_<local> (made unique), instead of a variable of its process.
+ */
+void hoist_block_local(ivl_signal_t sig)
+{
+   if (seen_signal_before(sig))
+      return;
+   ivl_scope_t block = ivl_signal_scope(sig);
+   ivl_scope_t mod = block;
+   while (mod != NULL && ivl_scope_type(mod) != IVL_SCT_MODULE)
+      mod = ivl_scope_parent(mod);
+   if (mod == NULL)
+      return;
+   vhdl_entity *ent = find_entity(mod);
+   if (ent == NULL)
+      return;
+   vhdl_scope *ascope = ent->get_arch()->get_scope();
+   std::string name = string(ivl_scope_basename(block)) + "_" + make_safe_name(sig);
+   for (std::string::size_type i = 0; i < name.size(); i++)
+      if (!isalnum((unsigned char)name[i]) && name[i] != '_')
+         name[i] = '_';
+   std::string::size_type p;
+   while ((p = name.find("__")) != std::string::npos)
+      name.erase(p, 1);
+   avoid_name_collision(name, ascope);
+   vhdl_signal_decl *decl = new vhdl_signal_decl(name, vhdl_type_for_signal(sig));
+   ostringstream ss;
+   ss << "Local of " << ivl_scope_name(block) << " that another process names ("
+      << ivl_signal_file(sig) << ":" << ivl_signal_lineno(sig) << ")";
+   decl->set_comment(ss.str());
+   ascope->add_decl(decl);
+   remember_signal(sig, ascope);
+   rename_signal(sig, name);
+}
+
 static void declare_one_signal(vhdl_entity *ent, ivl_signal_t sig,
    ivl_scope_t scope)
 {
@@ -1950,10 +2234,23 @@ static void declare_one_signal(vhdl_entity *ent, ivl_signal_t sig,
       int lsb = 0;
       int msb = ivl_signal_array_count(sig) - 1;
 
-      const vhdl_type *array_type =
+      vhdl_type *array_type =
          vhdl_type::array_of(base_type, type_name, msb, lsb);
+      // A memory of nets one of whose words has several drivers (assigns
+      // with strengths, ivtest pr1703346): resolved elements, as a vector
+      // net with several drivers is resolved
+      if (ivl_signal_type(sig) != IVL_SIT_REG)
+         for (unsigned w = 0; w <= (unsigned)msb; w++)
+            if (net_needs_resolution(sig, w)) {
+               array_type->set_resolved_elements();
+               break;
+            }
       vhdl_decl *array_decl = new vhdl_type_decl(type_name, array_type);
       ent->get_arch()->get_scope()->add_decl(array_decl);
+
+      if (get_sv2vhdl_mode())
+         declare_word_read(ent->get_arch()->get_scope(), type_name,
+                           array_type, base_type, msb);
 
       sig_type = new vhdl_type(*array_type);
    }
@@ -1981,6 +2278,8 @@ static void declare_one_signal(vhdl_entity *ent, ivl_signal_t sig,
          // combine through l3d_resolve.
          if (net_needs_resolution(sig))
             decl->set_resolved(true);
+         else if (vhdl_expr *z = undriven_bits_initial(sig, sig_type))
+            decl->set_initial(z);
 
          ostringstream ss;
          if (ivl_signal_local(sig)) {
@@ -2701,6 +3000,19 @@ int draw_function_in_entity(ivl_scope_t scope, vhdl_entity *ent)
    if (ent->get_arch()->get_scope()->have_declared(funcname))
       return 0;
 
+   // A SystemVerilog void function has no result port (ivl_scope_port gives
+   // NULL for it), and a VHDL function must return a value: drawing it
+   // crashed the translation in ivl (ivl_signal_data_type: Assertion `net'
+   // failed; ivtest function10). Say where it is instead.
+   for (unsigned i = 0; i < ivl_scope_ports(scope); i++) {
+      if (ivl_scope_port(scope, i) == NULL) {
+         error("%s:%u: no VHDL translation for the void function %s: write it "
+               "as a task", ivl_scope_def_file(scope), ivl_scope_def_lineno(scope),
+               ivl_scope_tname(scope));
+         return 1;
+      }
+   }
+
    // The return type is worked out from the output port
    vhdl_function *func = new vhdl_function(funcname, NULL);
 
@@ -3141,6 +3453,18 @@ extern "C" int draw_constant_drivers(ivl_scope_t scope, void *)
                       || it->drive1 != IVL_DR_STRONG)
                      any_nonstrong = true;
                const unsigned sig_w = ivl_signal_width(sig);
+               // The word of an unpacked array that nexus_to_var_ref
+               // selected (`m(j)'): its strength buffers carry the word in
+               // their labels, one set per word (`cd<n>w<j>...'), and drive
+               // that word's bits, m(j)(b) (they drove m(b), a whole word,
+               // under one label per bit that every word repeated)
+               std::string word_tag;
+               if (vhdl_const_int *wi =
+                      dynamic_cast<vhdl_const_int*>(ref->get_slice())) {
+                  ostringstream ws;
+                  ws << "w" << wi->get_value();
+                  word_tag = ws.str();
+               }
                int cd_n = 0;
                for (list<const_drv_t>::iterator it = all.begin();
                     it != all.end(); ++it, ++cd_n) {
@@ -3149,7 +3473,8 @@ extern "C" int draw_constant_drivers(ivl_scope_t scope, void *)
                   if (get_sv2vhdl_mode() && sig_w == 1
                       && any_nonstrong) {
                      ostringstream bs;
-                     bs << "cd" << cd_n << "_" << ivl_signal_basename(sig);
+                     bs << "cd" << cd_n << word_tag << "_"
+                        << ivl_signal_basename(sig);
                      emit_strength_buf(ent->get_arch(), dref, it->expr,
                                        it->drive1, it->drive0,
                                        bs.str().c_str());
@@ -3169,9 +3494,12 @@ extern "C" int draw_constant_drivers(ivl_scope_t scope, void *)
                      for (unsigned b = 0; b < sig_w; b++) {
                         vhdl_var_ref *bref =
                            nexus_to_var_ref(arch_scope, nex);
-                        bref->set_slice(new vhdl_const_int(b));
+                        if (bref->get_slice() != NULL)
+                           bref->slice_element(new vhdl_const_int(b));
+                        else
+                           bref->set_slice(new vhdl_const_int(b));
                         ostringstream bs;
-                        bs << "cd" << cd_n << "b" << b << "_"
+                        bs << "cd" << cd_n << word_tag << "b" << b << "_"
                            << ivl_signal_basename(sig);
                         emit_strength_buf(ent->get_arch(), bref,
                                           new vhdl_const_bit(it->bits[b]),
@@ -3389,6 +3717,46 @@ static string verilog_relative_path(ivl_scope_t scope)
    return path;
 }
 
+// The label of every module instance statement drawn, by the entity whose
+// architecture holds it and the instance's Verilog path relative to that
+// module (verilog_relative_path): the same for every instance of the parent
+// module, drawn once
+static std::map<std::pair<const vhdl_entity*, string>, string> g_inst_labels;
+
+static ivl_scope_t module_above(ivl_scope_t s)
+{
+   for (s = ivl_scope_parent(s);
+        s != NULL && ivl_scope_type(s) != IVL_SCT_MODULE;
+        s = ivl_scope_parent(s))
+      ;
+   return s;
+}
+
+/*
+ * The VHDL instance path of module instance `inst' below its design root,
+ * as 'PATH_NAME writes it after the root: ":<label>:...:<label>:", lower
+ * case (":" for a root). False when an instance on the way has no recorded
+ * label.
+ */
+bool instance_vhdl_path(ivl_scope_t inst, std::string &path)
+{
+   string p = ":";
+   for (ivl_scope_t s = inst; ; ) {
+      ivl_scope_t parent = module_above(s);
+      if (parent == NULL)
+         break;
+      const vhdl_entity *pe = find_entity(parent);
+      std::map<std::pair<const vhdl_entity*, string>, string>::const_iterator it =
+         g_inst_labels.find(std::make_pair(pe, verilog_relative_path(s)));
+      if (pe == NULL || it == g_inst_labels.end())
+         return false;
+      p = ":" + lowercase(it->second) + p;
+      s = parent;
+   }
+   path = p;
+   return true;
+}
+
 extern "C" int draw_hierarchy(ivl_scope_t scope, void *_parent)
 {
    if (ivl_scope_type(scope) == IVL_SCT_MODULE && _parent) {
@@ -3467,6 +3835,9 @@ extern "C" int draw_hierarchy(ivl_scope_t scope, void *_parent)
 
       // Record the finalized label for icg2en guard-path emission
       icg2en_note_label(scope, inst_name);
+      // ... and for %m in a module instantiated more than once
+      g_inst_labels[std::make_pair((const vhdl_entity*)parent_ent,
+                                   verilog_relative_path(scope))] = inst_name;
 
       vhdl_comp_inst *inst =
          new vhdl_comp_inst(inst_name.c_str(), ent->get_name().c_str());

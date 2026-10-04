@@ -92,11 +92,17 @@ public:
    static vhdl_type *type_for(int width, bool issigned,
                               int lsb=0, bool unresolved=false);
    static vhdl_type *array_of(vhdl_type *b, const std::string &n, int m, int l);
+
+   // An array whose elements are nets with several drivers (a memory of
+   // wires): its type declaration takes the resolved logic3d element
+   // subtype, so each element's drivers combine
+   void set_resolved_elements() { resolved_elems_ = true; }
 protected:
    vhdl_type_name_t name_;
    int msb_, lsb_;
    vhdl_type *base_;   // Array base type for VHDL_TYPE_ARRAY
    std::string array_name_; // Type name for the array `type array_name_ is ...'
+   bool resolved_elems_ = false;
 };
 
 #endif

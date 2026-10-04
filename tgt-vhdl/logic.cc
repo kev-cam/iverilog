@@ -677,6 +677,37 @@ static bool nexus_has_strength(ivl_nexus_t nex)
    return false;
 }
 
+// A variable's value, or a strong constant, with nothing else driving it:
+// never a weak code (a variable stores none, stmt.cc variable_value), so a
+// vector continuous assignment of it needs no l3d_strengthen
+static bool nexus_never_weak(ivl_nexus_t nex)
+{
+   bool var = false, con = false;
+   for (unsigned i = 0; i < ivl_nexus_ptrs(nex); i++) {
+      ivl_nexus_ptr_t p = ivl_nexus_ptr(nex, i);
+      ivl_signal_t s = ivl_nexus_ptr_sig(p);
+      if (s != NULL) {
+         if (ivl_signal_type(s) == IVL_SIT_REG)
+            var = true;
+         continue;
+      }
+      if (ivl_nexus_ptr_switch(p) != NULL)
+         return false;
+      const ivl_drive_t d0 = ivl_nexus_ptr_drive0(p);
+      const ivl_drive_t d1 = ivl_nexus_ptr_drive1(p);
+      if (ivl_nexus_ptr_con(p) != NULL
+          && (d0 == IVL_DR_STRONG || d0 == IVL_DR_SUPPLY)
+          && (d1 == IVL_DR_STRONG || d1 == IVL_DR_SUPPLY)) {
+         con = true;
+         continue;
+      }
+      // anything else on it but a load (an input pin: HiZ both ways)
+      if (d0 != IVL_DR_HiZ || d1 != IVL_DR_HiZ)
+         return false;
+   }
+   return var || con;
+}
+
 /*
  * Emit a concurrent signal assignment with optional strength comment.
  */
@@ -687,14 +718,16 @@ static void default_logic(vhdl_arch *arch, ivl_net_logic_t log)
 
    vhdl_expr *rhs = translate_logic_inputs(arch->get_scope(), log);
 
-   // BUFZ copy from a strength-bearing scalar net: normalize the weak
-   // alphabet codes to driven ones (the assign's strength is its own).
+   // BUFZ copy from a strength-bearing net: normalize the weak alphabet
+   // codes to driven ones (the assign's strength is its own).
    // A continuous assignment (the non-transparent BUFZ) drives its own
    // strength whatever its input carries, and a net can turn weak after
    // translation (the AMS cut's BIDIR A2D on an inout pad is weak while
    // nothing else drives it; its marker bufif1 here is strong), so a
-   // scalar logic3d BUFZ always re-strengthens -- an identity on strong
-   // values.  The transparent BUFT (port buffers) keeps the old gate.
+   // logic3d BUFZ always re-strengthens -- an identity on strong values;
+   // a vector one bit by bit (it kept the L3D_H/L codes of a weak bus,
+   // which lost to a strong driver of the net it drives).  The
+   // transparent BUFT (port buffers) keeps the old gate.
    const ivl_logic_t ltype = ivl_logic_type(log);
    if (is_sv2vhdl_mode() && (ltype == IVL_LO_BUFZ || ltype == IVL_LO_BUFT)
        && ivl_logic_width(log) == 1
@@ -703,6 +736,17 @@ static void default_logic(vhdl_arch *arch, ivl_net_logic_t log)
                && rhs->get_type()->get_name() == VHDL_TYPE_LOGIC3D))) {
       vhdl_fcall *st =
          new vhdl_fcall("l3d_strengthen", vhdl_type::logic3d());
+      st->add_expr(rhs);
+      rhs = st;
+   }
+   else if (is_sv2vhdl_mode() && (ltype == IVL_LO_BUFZ || ltype == IVL_LO_BUFT)
+            && ivl_logic_width(log) > 1
+            && rhs != NULL && rhs->get_type() != NULL
+            && rhs->get_type()->get_name() == VHDL_TYPE_LOGIC3D_VECTOR
+            && ((ltype == IVL_LO_BUFZ && !nexus_never_weak(ivl_logic_pin(log, 1)))
+                || nexus_has_strength(ivl_logic_pin(log, 1)))) {
+      vhdl_fcall *st =
+         new vhdl_fcall("l3d_strengthen", new vhdl_type(*rhs->get_type()));
       st->add_expr(rhs);
       rhs = st;
    }
@@ -818,6 +862,35 @@ void draw_logic(vhdl_arch *arch, ivl_net_logic_t log)
 }
 
 /*
+ * A switch terminal: the signal on its nexus -- or, when that is an alias of
+ * a vector element (a tran on a bit-select: scope.cc alias_tran_select_temp),
+ * the element itself, bus_sig(2).  nvc's port map names an alias actual by
+ * the alias, which the resolver plugin cannot look up, so the switch's net
+ * was left unresolved; the element is a net the kernel solver joins (its
+ * per-element member).  For a switch `width' bits wide (an array of
+ * switches: draw_one_switch), bit `k' of the terminal.
+ */
+static vhdl_var_ref *switch_terminal_ref(vhdl_scope *scope, ivl_nexus_t nex,
+                                         unsigned k = 0, unsigned width = 1)
+{
+   vhdl_var_ref *r = nexus_to_var_ref(scope, nex);
+   vhdl_alias_decl *al =
+      dynamic_cast<vhdl_alias_decl*>(scope->get_decl(r->get_name()));
+   if (al != NULL && al->get_width() == width) {
+      vhdl_decl *td = scope->get_decl(al->get_target());
+      if (td != NULL && td->get_type() != NULL) {
+         vhdl_var_ref *t =
+            new vhdl_var_ref(al->get_target(), new vhdl_type(*td->get_type()));
+         t->set_slice(new vhdl_const_int(al->get_offset() + k));
+         return t;
+      }
+   }
+   if (width > 1)
+      r->set_slice(new vhdl_const_int(k));
+   return r;
+}
+
+/*
  * Emit a sv2vhdl entity instantiation for a single switch.
  */
 static void draw_one_switch(vhdl_arch *arch, ivl_switch_t sw)
@@ -875,44 +948,65 @@ static void draw_one_switch(vhdl_arch *arch, ivl_switch_t sw)
       return;
    }
 
-   string inst_name = make_inst_name(
-      scoped_basename(ivl_switch_basename(sw), ivl_switch_scope(sw)).c_str(),
-      entity_name);
-   vhdl_entity_inst *inst = new vhdl_entity_inst(
-      inst_name.c_str(), "sv2vhdl", entity_name, arch_name);
-
+   // An array of switches, `tranif1 t[3:0] (a, b, en)', reaches the target
+   // as one switch as wide as the array (ivl_switch_width; a scalar enable
+   // replicated to that width): one instance per bit, on bit k of each
+   // terminal and of the enable.  (One instance took the whole vectors on its
+   // scalar ports: no switch at all, or nvc stopped at elaboration.)
+   const unsigned width = ivl_switch_width(sw);
+   const unsigned nbits = get_sv2vhdl_mode() && width > 1 ? width : 1;
    vhdl_scope *scope = arch->get_scope();
-
-   // Port A
-   inst->map_port("a", nexus_to_var_ref(scope, ivl_switch_a(sw)));
-
-   // Port B
-   inst->map_port("b", nexus_to_var_ref(scope, ivl_switch_b(sw)));
-
-   // Enable (ctrl) for conditional tran.  The formal is std_logic; a
-   // logic3d actual must go through the lossless package conversion --
-   // a bare association byte-reinterprets in STD_MX mode, which maps
-   // the weak codes L/H to 'U'/'X' and latches the switch into X the
-   // moment the net rests on its keeper value.
-   if (has_enable) {
-      vhdl_expr *en = readable_ref(scope, ivl_switch_enable(sw));
-      if (en->get_type() != NULL
-          && en->get_type()->get_name() == VHDL_TYPE_LOGIC3D) {
-         vhdl_fcall *conv =
-            new vhdl_fcall("to_std_logic", vhdl_type::std_logic());
-         conv->add_expr(en);
-         en = conv;
+   for (unsigned k = 0; k < nbits; k++) {
+      string base =
+         scoped_basename(ivl_switch_basename(sw), ivl_switch_scope(sw));
+      if (nbits > 1) {
+         ostringstream bs;
+         bs << base << "_bit" << k;
+         base = bs.str();
       }
-      inst->map_port("ctrl", en);
+      string inst_name = make_inst_name(base.c_str(), entity_name);
+      vhdl_entity_inst *inst = new vhdl_entity_inst(
+         inst_name.c_str(), "sv2vhdl", entity_name, arch_name);
+
+      // Port A
+      inst->map_port("a", switch_terminal_ref(scope, ivl_switch_a(sw), k, nbits));
+
+      // Port B
+      inst->map_port("b", switch_terminal_ref(scope, ivl_switch_b(sw), k, nbits));
+
+      // Enable (ctrl) for conditional tran.  The formal is std_logic; a
+      // logic3d actual must go through the lossless package conversion --
+      // a bare association byte-reinterprets in STD_MX mode, which maps
+      // the weak codes L/H to 'U'/'X' and latches the switch into X the
+      // moment the net rests on its keeper value.
+      if (has_enable) {
+         vhdl_var_ref *er = readable_ref(scope, ivl_switch_enable(sw));
+         vhdl_expr *en = er;
+         const bool vec = er->get_type() != NULL
+            && er->get_type()->get_name() == VHDL_TYPE_LOGIC3D_VECTOR;
+         if (nbits > 1 && vec)
+            er->set_slice(new vhdl_const_int(k));
+         if ((nbits > 1 && vec)
+             || (er->get_type() != NULL
+                 && er->get_type()->get_name() == VHDL_TYPE_LOGIC3D)) {
+            vhdl_fcall *conv =
+               new vhdl_fcall("to_std_logic", vhdl_type::std_logic());
+            conv->add_expr(er);
+            en = conv;
+         }
+         inst->map_port("ctrl", en);
+      }
+
+      // Source location comment
+      ostringstream ss;
+      ss << "Generated from " << entity_name << " at "
+         << ivl_switch_file(sw) << ":" << ivl_switch_lineno(sw);
+      if (nbits > 1)
+         ss << ", bit " << k << " of " << nbits;
+      inst->set_comment(ss.str());
+
+      arch->add_stmt(inst);
    }
-
-   // Source location comment
-   ostringstream ss;
-   ss << "Generated from " << entity_name << " at "
-      << ivl_switch_file(sw) << ":" << ivl_switch_lineno(sw);
-   inst->set_comment(ss.str());
-
-   arch->add_stmt(inst);
 }
 
 void draw_switches(vhdl_arch *arch, ivl_scope_t scope)

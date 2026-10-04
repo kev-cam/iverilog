@@ -130,6 +130,27 @@ const std::string &get_renamed_signal(ivl_signal_t sig)
    return g_known_signals[sig].renamed;
 }
 
+// The homes push_signal_home replaced, per signal, last first
+static std::map<ivl_signal_t, std::vector<signal_defn_t> > g_signal_homes;
+
+void push_signal_home(ivl_signal_t sig, const std::string &renamed,
+                      vhdl_scope *scope)
+{
+   assert(seen_signal_before(sig));
+   g_signal_homes[sig].push_back(g_known_signals[sig]);
+   signal_defn_t defn = { renamed, scope };
+   g_known_signals[sig] = defn;
+}
+
+void pop_signal_home(ivl_signal_t sig)
+{
+   std::map<ivl_signal_t, std::vector<signal_defn_t> >::iterator it =
+      g_signal_homes.find(sig);
+   assert(it != g_signal_homes.end() && !it->second.empty());
+   g_known_signals[sig] = it->second.back();
+   it->second.pop_back();
+}
+
 // TODO: Can we dispose of this???
 // -> This is only used in logic.cc to get the type of a signal connected
 //    to a logic device -> we should be able to get this from the nexus
@@ -573,4 +594,33 @@ bool is_default_scope_instance(ivl_scope_t s)
 {
    return find(g_default_scopes.begin(), g_default_scopes.end(), s)
       != g_default_scopes.end();
+}
+
+namespace {
+struct same_type_walk_t {
+   ivl_scope_t like;
+   std::vector<ivl_scope_t> *out;
+};
+}
+
+// Module instances sit in modules and in generate scopes
+extern "C" int same_type_walk(ivl_scope_t s, void *arg)
+{
+   same_type_walk_t *w = static_cast<same_type_walk_t*>(arg);
+   const ivl_scope_type_t t = ivl_scope_type(s);
+   if (t == IVL_SCT_MODULE && same_scope_type_name(s, w->like))
+      w->out->push_back(s);
+   if (t == IVL_SCT_MODULE || t == IVL_SCT_GENERATE)
+      ivl_scope_children(s, same_type_walk, arg);
+   return 0;
+}
+
+void same_type_instances(ivl_scope_t s, std::vector<ivl_scope_t> &out)
+{
+   ivl_scope_t *roots;
+   unsigned nroots;
+   ivl_design_roots(get_vhdl_design(), &roots, &nroots);
+   same_type_walk_t w = { s, &out };
+   for (unsigned i = 0; i < nroots; i++)
+      same_type_walk(roots[i], &w);
 }

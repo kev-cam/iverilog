@@ -80,6 +80,9 @@ public:
    const std::string &get_name() const { return name_; }
    void set_name(const std::string &name) { name_ = name; }
    void set_slice(vhdl_expr *s, int w=0);
+   // A new expression for the slice set_slice set (an array word's index):
+   // the type and width stay
+   void replace_slice(vhdl_expr *s) { slice_ = s; }
    vhdl_expr *get_slice() const { return slice_; }
    unsigned get_slice_width() const { return slice_width_; }
    // Bit/part-select of an array element that set_slice already picked:
@@ -98,6 +101,9 @@ public:
       { return extra_slices_.empty() ? NULL : extra_slices_.back().first; }
    void set_last_extra(vhdl_expr *s, int w)
       { extra_slices_.back() = std::make_pair(s, w); }
+   // Every select slice_element / add_extra_slice appended is at a constant
+   // offset (none: true)
+   bool extra_slices_constant() const;
    void find_vars(vhdl_var_set_t& read);
 private:
    std::string name_;
@@ -860,6 +866,21 @@ public:
    assign_type_t assignment_type() const { return ASSIGN_BLOCK; }
 };
 
+/*
+ * Declarations given as VHDL text, one line per element of `lines' (a
+ * function the translator writes out whole); `name' is the name it
+ * declares, for have_declared.
+ */
+class vhdl_verbatim_decl : public vhdl_decl {
+public:
+   vhdl_verbatim_decl(const std::string& name,
+                      const std::vector<std::string> &lines)
+      : vhdl_decl(name, NULL), lines_(lines) {}
+   void emit(std::ostream &of, int level) const;
+private:
+   std::vector<std::string> lines_;
+};
+
 
 /*
  * A signal declaration in architecture.
@@ -893,6 +914,9 @@ public:
         width_(width) {}
    void emit(std::ostream &of, int level) const;
    assign_type_t assignment_type() const { return ASSIGN_NONBLOCK; }
+   const std::string &get_target() const { return target_; }
+   unsigned get_offset() const { return offset_; }
+   unsigned get_width() const { return width_; }
 private:
    std::string target_;
    unsigned offset_, width_;
@@ -1011,6 +1035,9 @@ public:
 
    void add_decl(vhdl_decl *decl);
    void add_forward_decl(vhdl_decl *decl);
+   // Take `decl' out of this scope: a declaration that another of the same
+   // name replaces (a core temporary made an alias: draw_nexus)
+   void remove_decl(vhdl_decl *decl);
    vhdl_decl *get_decl(const std::string &name) const;
    bool have_declared(const std::string &name) const;
    bool name_collides(const std::string& name) const;
@@ -1066,9 +1093,45 @@ public:
    // its later assignments must also deposit -- nvc drops a <= that follows a
    // := on the same signal, so a time-zero deposit + a post-wait <= would make
    // the later value silently vanish.
-   void mark_deposited(const std::string& name) { deposited_.insert(name); }
+   // (At time zero a deposit is also a blocking target: see set_time_zero;
+   // and always in plain -tvhdl mode, see set_deposits_are_targets.)
+   void mark_deposited(const std::string& name)
+   {
+      deposited_.insert(name);
+      if (time_zero_)
+         deposits_at_time_zero_ = true;
+      if (at_time_zero() || deposits_are_targets_)
+         blocking_targets_.insert(name);
+   }
+   // Plain -tvhdl mode (no sv2vhdl): a deposit is a blocking target like a
+   // signal assignment, so a later read waits a delta, as it always has
+   void set_deposits_are_targets() { deposits_are_targets_ = true; }
+   // Whether the process deposits a signal before its first suspension
+   bool deposits_at_time_zero() const { return deposits_at_time_zero_; }
    bool was_deposited(const std::string& name) const
       { return deposited_.count(name) > 0; }
+
+   // Every blocking assignment to a signal in this process deposits (:=):
+   // the process reads the new value at once and never yields to make it
+   // visible (see deposits_signal in stmt.cc). Set for an initial or final
+   // process and for an always process that suspends inside its body;
+   // the other always processes shadow their blocking targets instead
+   // (process.cc, shadow_blocking_targets).
+   void set_deposit_blocking() { deposit_blocking_ = true; }
+   bool deposit_blocking() const { return deposit_blocking_; }
+
+   // The statements being drawn run at time zero only: an initial process's
+   // straight-line code before its first suspension (a delay, an event
+   // control), outside any loop. There a deposit is still a blocking target,
+   // so a later read waits a delta and reads the nets fed by it settled (see
+   // deposits_signal in stmt.cc); the first suspension or loop ends it.
+   void set_time_zero() { time_zero_ = true; }
+   bool at_time_zero() const { return time_zero_ && loop_depth_ == 0; }
+   void left_time_zero()
+      { time_zero_ = false; if (deposit_blocking_) blocking_targets_.clear(); }
+   void enter_loop()
+      { loop_depth_++; if (deposit_blocking_) blocking_targets_.clear(); }
+   void leave_loop() { loop_depth_--; }
 
    // ICG2EN wake-shadow close: async trigger signals whose events can land
    // while this process sits at the NBA `wait for 0 ns` (off every pending
@@ -1100,6 +1163,17 @@ protected:
 
    // Signals deposited (:=) in this process (see mark_deposited).
    std::set<std::string> deposited_;
+
+   // See set_deposit_blocking.
+   bool deposit_blocking_ = false;
+
+   // See set_time_zero.
+   bool time_zero_ = false;
+   int loop_depth_ = 0;
+   bool deposits_at_time_zero_ = false;
+
+   // See set_deposits_are_targets.
+   bool deposits_are_targets_ = false;
 
    // ICG2EN wake-shadow entries (see add_icg2en_shadow).
    std::list<icg2en_shadow_t> icg2en_shadow_;

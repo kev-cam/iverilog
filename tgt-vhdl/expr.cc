@@ -129,7 +129,7 @@ static vhdl_expr *translate_string(ivl_expr_t e)
  * A reference to a signal in an expression. It's assumed that the
  * signal has already been defined elsewhere.
  */
-static vhdl_var_ref *translate_signal(ivl_expr_t e)
+static vhdl_expr *translate_signal(ivl_expr_t e)
 {
    ivl_signal_t sig = ivl_expr_signal(e);
 
@@ -195,6 +195,20 @@ static vhdl_var_ref *translate_signal(ivl_expr_t e)
                return new vhdl_var_ref(ss.str().c_str(),
                                        vhdl_type::logic3d_vector(w - 1, 0));
             }
+         }
+         // A run-time index can fall outside the array too: read through
+         // the array type's bounds-safe reader (scope.cc, declare_word_read),
+         // declared next to the array in its own architecture
+         const vhdl_type *at = decl->get_type();
+         vhdl_entity *here = get_active_entity();
+         if (ci == NULL && at != NULL && at->get_name() == VHDL_TYPE_ARRAY
+             && at->get_base() != NULL && has_word_read(at->get_string())
+             && here != NULL && here->get_arch()->get_scope() == scope) {
+            vhdl_fcall *rd = new vhdl_fcall((at->get_string() + "_Rd").c_str(),
+                                            new vhdl_type(*at->get_base()));
+            rd->add_expr(ref);
+            rd->add_expr(ioff);
+            return rd;
          }
       }
 
@@ -545,7 +559,15 @@ static vhdl_expr *translate_binary(ivl_expr_t e)
    if (NULL == lhs)
       return NULL;
 
+   // && and || evaluate their right operand only when the left one does not
+   // decide the result
+   const bool short_circuit =
+      ivl_expr_opcode(e) == 'a' || ivl_expr_opcode(e) == 'o';
+   if (short_circuit)
+      begin_conditional_eval();
    vhdl_expr *rhs = translate_expr(ivl_expr_oper2(e));
+   if (short_circuit)
+      end_conditional_eval();
    if (NULL == rhs) {
       delete lhs;
       return NULL;
@@ -606,8 +628,9 @@ static vhdl_expr *translate_binary(ivl_expr_t e)
       case 'G': cf = "l3d_ge_s"; break;
       case '/': vf = "l3d_div_s"; break;
       case '%':
-         // Verilog's % takes the dividend's sign (VHDL rem); sv2vhdl's
-         // l3d_mod_s is VHDL mod (the divisor's sign), so a support function
+         // Verilog's % takes the dividend's sign (VHDL rem): a support
+         // function (sv2vhdl's l3d_mod_s was VHDL mod, the divisor's sign,
+         // before round 6)
          require_support_function(SF_REM_SIGNED);
          vf = support_function::function_name(SF_REM_SIGNED);
          break;
@@ -891,6 +914,30 @@ static vhdl_expr *translate_select(ivl_expr_t e)
          return NULL;
 
       vhdl_var_ref *from_var_ref = dynamic_cast<vhdl_var_ref*>(from);
+      // A memory word read through its bounds-safe reader (translate_signal):
+      // select from the word as from any vector, through the bounds-safe
+      // bit/part readers
+      ivl_expr_t o1 = ivl_expr_oper1(e);
+      if (NULL == from_var_ref && get_sv2vhdl_mode()
+          && dynamic_cast<vhdl_fcall*>(from) != NULL
+          && ivl_expr_type(o1) == IVL_EX_SIGNAL
+          && ivl_signal_array_count(ivl_expr_signal(o1)) > 0
+          && ivl_expr_oper1(o1) != NULL
+          && from->get_type() != NULL
+          && from->get_type()->get_name() == VHDL_TYPE_LOGIC3D_VECTOR) {
+         const int w = ivl_expr_width(e);
+         vhdl_fcall *f;
+         if (w == 1)
+            f = new vhdl_fcall("l3d_bit_read", vhdl_type::logic3d());
+         else
+            f = new vhdl_fcall("l3d_part_read",
+                               vhdl_type::logic3d_vector(w - 1, 0));
+         f->add_expr(from);
+         f->add_expr(index_to_integer(o2, base));
+         if (w != 1)
+            f->add_expr(new vhdl_const_int(w));
+         return f;
+      }
       if (NULL == from_var_ref) {
          // We can't directly select bits from something that's not
          // a variable reference in VHDL, but we can emulate the
@@ -1057,8 +1104,9 @@ static vhdl_expr *translate_ufunc(ivl_expr_t e)
    vhdl_entity *parent_ent = find_entity(parentscope);
    if (parent_ent == NULL) {
       parent_ent = get_active_entity();
-      if (parent_ent != NULL)
-         draw_function_in_entity(defscope, parent_ent);
+      // a function it cannot draw (a void one) has said why already
+      if (parent_ent != NULL && draw_function_in_entity(defscope, parent_ent) != 0)
+         return NULL;
    }
    assert(parent_ent);
 
@@ -1094,6 +1142,25 @@ static vhdl_expr *translate_ufunc(ivl_expr_t e)
    return fcall;
 }
 
+// See begin_conditional_eval (vhdl_target.h)
+static int g_conditional_eval = 0;
+
+void begin_conditional_eval()
+{
+   g_conditional_eval++;
+}
+
+void end_conditional_eval()
+{
+   assert(g_conditional_eval > 0);
+   g_conditional_eval--;
+}
+
+bool in_conditional_eval()
+{
+   return g_conditional_eval > 0;
+}
+
 static vhdl_expr *translate_ternary(ivl_expr_t e)
 {
    support_function_t sf;
@@ -1109,8 +1176,10 @@ static vhdl_expr *translate_ternary(ivl_expr_t e)
    require_support_function(sf);
 
    vhdl_expr *test = translate_expr(ivl_expr_oper1(e));
+   begin_conditional_eval();   // Verilog evaluates only one branch
    vhdl_expr *true_part = translate_expr(ivl_expr_oper2(e));
    vhdl_expr *false_part = translate_expr(ivl_expr_oper3(e));
+   end_conditional_eval();
    if (!test || !true_part || !false_part)
       return NULL;
 
@@ -1285,7 +1354,7 @@ static vhdl_expr *unsupported_sfunc_const(ivl_expr_t e, long value)
 
 /*
  * The IEEE 1364 generator behind an unseeded $random (17.9.1, "an internal
- * seed"): sv_math_pkg's `random', the VHPIDIRECT sv_random entry -- vvp's
+ * seed"): sv_math_pkg's `random', plain VHDL (no foreign library) -- vvp's
  * rtl_dist_uniform(&seed, INT_MIN, INT_MAX) on one design-wide seed, so a
  * testbench draws vvp's (and VCS's) numbers.  An int32, two's complement.
  */
@@ -1330,22 +1399,18 @@ static vhdl_expr *rng_to_l3d(vhdl_expr *v32, int w)
    return l3;
 }
 
-// $urandom's 32-bit value: vvp draws it with the same algorithm offset by
-// 2^31, i.e. the $random draw with bit 31 flipped.
+// $urandom's 32-bit value: vvp draws it from a generator of its own, a second
+// design-wide seed apart from $random's (sv_math_pkg's sv_urandom, which
+// returns the unsigned value's 32 bits as an integer; $urandom_range draws
+// from it too).
 static vhdl_expr *rng_urandom32()
 {
+   vhdl_fcall *ts = new vhdl_fcall("to_signed", vhdl_type::nsigned(32));
+   ts->add_expr(new vhdl_fcall("sv_urandom", new vhdl_type(VHDL_TYPE_INTEGER)));
+   ts->add_expr(new vhdl_const_int(32));
    vhdl_fcall *u = new vhdl_fcall("unsigned", vhdl_type::nunsigned(32));
-   u->add_expr(rng_draw_signed32());
-   vhdl_fcall *one = new vhdl_fcall("to_unsigned", vhdl_type::nunsigned(32));
-   one->add_expr(new vhdl_const_int(1));
-   one->add_expr(new vhdl_const_int(32));
-   vhdl_fcall *msb = new vhdl_fcall("shift_left", vhdl_type::nunsigned(32));
-   msb->add_expr(one);
-   msb->add_expr(new vhdl_const_int(31));
-   vhdl_fcall *x = new vhdl_fcall("\"xor\"", vhdl_type::nunsigned(32));
-   x->add_expr(u);
-   x->add_expr(msb);
-   return x;
+   u->add_expr(ts);
+   return u;
 }
 
 // A $urandom_range bound (an int unsigned) as unsigned(31 downto 0), via
@@ -1371,67 +1436,53 @@ static vhdl_expr *rng_bound(ivl_expr_t a)
 /*
  * $urandom_range(maxval [, minval]) (IEEE 1800 18.13.2): a value in
  * [minval, maxval], the bounds swapped when maxval < minval; minval
- * defaults to 0.  lo + (draw mod (hi - lo + 1)) in 33-bit unsigned
- * arithmetic, so the full 32-bit range works too.
+ * defaults to 0.  vvp's numbers: sv_math_pkg's sv_urandom_range is vvp's
+ * urandom(maxval, minval) -- rtl_dist_uniform on the bounds, from the
+ * $urandom generator, no draw when the bounds are equal -- on the
+ * bounds' 32 bits, each translated once.  (lo + (draw mod span), which
+ * this was, kept the range but not vvp's numbers.)
  */
 static vhdl_expr *rng_urandom_range(ivl_expr_t e)
 {
    ivl_expr_t amax = ivl_expr_parm(e, 0);
    ivl_expr_t amin = ivl_expr_parms(e) >= 2 ? ivl_expr_parm(e, 1) : NULL;
-   vhdl_expr *b[6];
-   for (int i = 0; i < 6; i++) {
-      b[i] = rng_bound((i % 2) ? amin : amax);
-      if (b[i] == NULL)
+   vhdl_fcall *f = new vhdl_fcall("sv_urandom_range",
+                                  new vhdl_type(VHDL_TYPE_INTEGER));
+   ivl_expr_t bound[2] = { amax, amin };
+   for (int i = 0; i < 2; i++) {
+      vhdl_expr *b = rng_bound(bound[i]);
+      if (b == NULL)
          return NULL;
+      // the unsigned bound's 32 bits as an integer
+      vhdl_fcall *s = new vhdl_fcall("signed", vhdl_type::nsigned(32));
+      s->add_expr(b);
+      vhdl_fcall *n = new vhdl_fcall("to_integer",
+                                     new vhdl_type(VHDL_TYPE_INTEGER));
+      n->add_expr(s);
+      f->add_expr(n);
    }
-   // lo/hi of the bounds, each widened to 33 bits
-   vhdl_expr *ext[3];
-   const char *mm[3] = { "minimum", "maximum", "minimum" };
-   for (int i = 0; i < 3; i++) {
-      vhdl_fcall *m = new vhdl_fcall(mm[i], vhdl_type::nunsigned(32));
-      m->add_expr(b[2 * i]);
-      m->add_expr(b[2 * i + 1]);
-      vhdl_fcall *r = new vhdl_fcall("resize", vhdl_type::nunsigned(33));
-      r->add_expr(m);
-      r->add_expr(new vhdl_const_int(33));
-      ext[i] = r;
-   }
-   vhdl_fcall *diff = new vhdl_fcall("\"-\"", vhdl_type::nunsigned(33));
-   diff->add_expr(ext[1]);
-   diff->add_expr(ext[0]);
-   vhdl_fcall *span = new vhdl_fcall("\"+\"", vhdl_type::nunsigned(33));
-   span->add_expr(diff);
-   span->add_expr(new vhdl_const_int(1));
-   vhdl_fcall *d33 = new vhdl_fcall("resize", vhdl_type::nunsigned(33));
-   d33->add_expr(rng_urandom32());
-   d33->add_expr(new vhdl_const_int(33));
-   vhdl_fcall *off = new vhdl_fcall("\"mod\"", vhdl_type::nunsigned(33));
-   off->add_expr(d33);
-   off->add_expr(span);
-   vhdl_fcall *sum = new vhdl_fcall("\"+\"", vhdl_type::nunsigned(33));
-   sum->add_expr(ext[2]);
-   sum->add_expr(off);
-   vhdl_fcall *r32 = new vhdl_fcall("resize", vhdl_type::nunsigned(32));
-   r32->add_expr(sum);
-   r32->add_expr(new vhdl_const_int(32));
-   return rng_to_l3d(r32, ivl_expr_width(e));
+   vhdl_fcall *ts = new vhdl_fcall("to_signed", vhdl_type::nsigned(32));
+   ts->add_expr(f);
+   ts->add_expr(new vhdl_const_int(32));
+   vhdl_fcall *u = new vhdl_fcall("unsigned", vhdl_type::nunsigned(32));
+   u->add_expr(ts);
+   return rng_to_l3d(u, ivl_expr_width(e));
 }
 
 vhdl_expr *translate_sfunc_random(ivl_expr_t e)
 {
-   // sv2vhdl mode: $random(seed) -> sv_random(seed), a deterministic seeded
-   // value. The seed update (seed = sv_random(seed)) is emitted by draw_assign,
-   // so this stays a plain function (VHDL functions can't have inout params)
-   // and composes with any lvalue and a signal- or variable-class seed.
+   // sv2vhdl mode: $random(seed) draws vvp's value from the caller's seed
+   // and advances the seed, both ahead of the statement
+   // (emit_seeded_random_pre); the call reads the value drawn, an int32
    if (get_sv2vhdl_mode() && ivl_expr_parms(e) >= 1) {
-      vhdl_expr *seed = translate_expr(ivl_expr_parm(e, 0));
-      if (seed) {
-         const int w = ivl_expr_width(e);
-         vhdl_fcall *f = new vhdl_fcall("sv_random",
-                                        vhdl_type::logic3d_vector(w - 1, 0));
-         f->add_expr(seed);
-         return f;
-      }
+      vhdl_expr *v = emit_seeded_random_pre("$random", e, ivl_expr_parm(e, 0),
+                                            false, ivl_expr_file(e),
+                                            ivl_expr_lineno(e));
+      if (v == NULL)
+         return NULL;
+      vhdl_fcall *s = new vhdl_fcall("l3d_to_signed", vhdl_type::nsigned(32));
+      s->add_expr(v);
+      return rng_to_l3d(s, ivl_expr_width(e));
    }
    // Unseeded: the internal-seed generator (vvp's numbers)
    if (get_sv2vhdl_mode() && ivl_expr_parms(e) == 0)
@@ -1440,9 +1491,10 @@ vhdl_expr *translate_sfunc_random(ivl_expr_t e)
 }
 
 /*
- * SystemVerilog $urandom / $urandom_range (sv2vhdl mode), on the same
- * internal-seed generator as $random.  $urandom(seed) -- a caller-held
- * seed -- has no translation: it is replaced by 0, and said so.
+ * SystemVerilog $urandom / $urandom_range (sv2vhdl mode), on vvp's second
+ * design-wide seed (sv_urandom), apart from $random's.  $urandom(seed)
+ * draws from the caller's seed, advances it, and hands it to that
+ * generator, as vvp's urandom() does (emit_seeded_random_pre).
  */
 static vhdl_expr *translate_sfunc_urandom(ivl_expr_t e)
 {
@@ -1456,13 +1508,26 @@ static vhdl_expr *translate_sfunc_urandom(ivl_expr_t e)
       }
       return rng_urandom_range(e);
    }
-   if (ivl_expr_parms(e) >= 1)
-      return unsupported_sfunc_const(e, 0);
+   if (ivl_expr_parms(e) >= 1) {
+      vhdl_expr *v = emit_seeded_random_pre("$urandom", e, ivl_expr_parm(e, 0),
+                                            true, ivl_expr_file(e),
+                                            ivl_expr_lineno(e));
+      if (v == NULL)
+         return NULL;
+      vhdl_fcall *u = new vhdl_fcall("l3d_to_unsigned", vhdl_type::nunsigned(32));
+      u->add_expr(v);
+      return rng_to_l3d(u, ivl_expr_width(e));
+   }
    return rng_to_l3d(rng_urandom32(), ivl_expr_width(e));
 }
 
+// fileio.cc: $fopen, $fopenr, $fopenw, $fopena on the sv2vhdl runtime
+vhdl_expr *fileio_fopen(ivl_expr_t e);
+
 vhdl_expr *translate_sfunc_fopen(ivl_expr_t e)
 {
+   if (get_sv2vhdl_mode())
+      return fileio_fopen(e);
    return unsupported_sfunc_const(e, 0);
 }
 
@@ -1559,12 +1624,15 @@ vhdl_expr *translate_sfunc(ivl_expr_t e)
       return translate_sfunc_simtime(e);
    else if (strcmp(name, "$random") == 0)
       return translate_sfunc_random(e);
-   else if (strcmp(name, "$fopen") == 0)
+   else if (strcmp(name, "$fopen") == 0 || strcmp(name, "$fopenr") == 0
+            || strcmp(name, "$fopenw") == 0 || strcmp(name, "$fopena") == 0)
       return translate_sfunc_fopen(e);
    else if (strcmp(name, "$get_val") == 0)
       return translate_sfunc_get_val(e);
    else if (strcmp(name, "$urandom") == 0 || strcmp(name, "$urandom_range") == 0)
       return translate_sfunc_urandom(e);
+   else if (strncmp(name, "$dist_", 6) == 0)
+      return emit_dist_pre(e);   // the draw is a statement (stmt.cc)
    else if (strcmp(name, "$size") == 0) {
       // SystemVerilog queue.size() -> ring-buffer (tail - head). Return it as a
       // logic3d_vector of the expression width so it composes with the logic3d

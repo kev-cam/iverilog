@@ -147,8 +147,14 @@ std::string vhdl_type::get_type_decl_string() const
       {
          std::ostringstream ss;
          ss << "array (" << msb_ << " downto "
-            << lsb_ << ") of "
-            << base_->get_decl_string();
+            << lsb_ << ") of ";
+         if (resolved_elems_ && base_->get_name() == VHDL_TYPE_LOGIC3D)
+            ss << "resolved_logic3d";
+         else if (resolved_elems_
+                  && base_->get_name() == VHDL_TYPE_LOGIC3D_VECTOR)
+            ss << "resolved_" << base_->get_decl_string();
+         else
+            ss << base_->get_decl_string();
          return ss.str();
       }
    default:
@@ -163,7 +169,8 @@ void vhdl_type::emit(std::ostream &of, int) const
 
 vhdl_type::vhdl_type(const vhdl_type &other)
    : vhdl_element(other), name_(other.name_),
-     msb_(other.msb_), lsb_(other.lsb_), array_name_(other.array_name_)
+     msb_(other.msb_), lsb_(other.lsb_), array_name_(other.array_name_),
+     resolved_elems_(other.resolved_elems_)
 {
    if (other.base_ != NULL)
       base_ = new vhdl_type(*other.base_);

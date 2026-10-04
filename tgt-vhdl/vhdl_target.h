@@ -27,6 +27,24 @@ void draw_switches(vhdl_arch *arch, ivl_scope_t scope);
 vhdl_expr *translate_expr(ivl_expr_t e);
 bool emit_value_plusargs_pre(ivl_expr_t target, vhdl_expr *(*make_fmt)(ivl_expr_t),
                              ivl_expr_t fmt);
+// $dist_* (stmt.cc): the draw goes ahead of the current statement; returns
+// the call's value
+vhdl_expr *emit_dist_pre(ivl_expr_t e);
+// An expression Verilog evaluates conditionally or repeatedly -- a branch of
+// ?:, the right operand of && or ||, a loop condition -- is translated between
+// these two (expr.cc): a system function whose side effect becomes a
+// statement ahead of the current one ($dist_*'s seed, $value$plusargs's
+// variable) cannot be translated there, and says so.
+void begin_conditional_eval();
+void end_conditional_eval();
+bool in_conditional_eval();
+// $random(seed) / $urandom(seed) (stmt.cc): ahead of the statement being drawn,
+// draw from the seed variable and advance it as vvp does; the value drawn, a
+// 32-bit logic3d_vector (NULL after an error).  `call' is the call (NULL when
+// it is called as a task)
+vhdl_expr *emit_seeded_random_pre(const char *fname, ivl_expr_t call,
+                                  ivl_expr_t seed, bool urandom,
+                                  const char *file, unsigned line);
 vhdl_expr *translate_time_expr(ivl_expr_t e);
 
 std::string nexus_to_signal_basename(ivl_nexus_t nex);
@@ -96,5 +114,44 @@ ivl_process_t get_active_ivl_process();
 
 bool is_hoisted_signal(ivl_signal_t sig);
 void clear_hoisted_signal(ivl_signal_t sig);
+
+// Whether the array type of that name has its bounds-safe word reader,
+// <type>_Rd(memory, index) (scope.cc, declare_word_read)
+bool has_word_read(const std::string &array_type_name);
+
+// Verilog's time-zero order (stmt.cc; off with SV2VHDL_TC08=0): an `always
+// @(a or b)' (any-edge events, no time-zero trigger) waits for its first event, as
+// vvp starts it; an initial block runs after every process has reached its
+// first wait, and is not hoisted into declaration initial values, so its
+// time-zero assignments are events (an SV variable initializer stays
+// hoisted: no event).
+bool time_zero_order_enabled();
+// Once every process is drawn: drop the initial blocks' time-zero waits when
+// no initial block assigns a signal at time zero (process.cc)
+void settle_time_zero_waits();
+
+// Named-block locals another process names: found before the processes are
+// drawn (process.cc) and declared as architecture signals (scope.cc)
+extern "C" int scan_shared_block_locals(ivl_process_t proc, void *);
+void hoist_shared_block_locals();
+void hoist_block_local(ivl_signal_t sig);
+
+// A net that a force or a release names (stmt.cc): its continuous
+// assignment keeps its own driver instead of joining a fused comb cone
+// (process.cc, fuse_comb_processes)
+void note_forced_net(ivl_signal_t sig);
+
+// %m (stmt.cc): the Verilog name of the active scope, a string expression --
+// a constant, or, in a module instantiated more than once, the instance's
+// name found at run time from the entity's 'PATH_NAME (SV_Hier_Name);
+// declare_hier_names, once every process is drawn, declares SV_Hier_Name in
+// each architecture that uses it. instance_vhdl_path (scope.cc): a module
+// instance's VHDL path below its design root, ":<label>:...:<label>:".
+vhdl_expr *hier_name_expr();
+void declare_hier_names();
+// The processes that write each variable, before any process is drawn
+// (stmt.cc): a nonblocking assignment of its only writer lands as an NBA
+extern "C" int census_writers(ivl_process_t p, void *);
+bool instance_vhdl_path(ivl_scope_t inst, std::string &path);
 
 #endif /* #ifndef INC_VHDL_TARGET_H */

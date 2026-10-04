@@ -25,6 +25,7 @@
 
 #include <iosfwd>
 #include <string>
+#include <vector>
 
 class vhdl_scope;
 class vhdl_entity;
@@ -36,6 +37,11 @@ void rename_signal(ivl_signal_t sig, const std::string &renamed);
 vhdl_scope *find_scope_for_signal(ivl_signal_t sig);
 const std::string &get_renamed_signal(ivl_signal_t sig);
 ivl_signal_t find_signal_named(const std::string &name, const vhdl_scope *scope);
+// Give a seen signal another VHDL home for a while (a process's own copy of
+// an automatic task's variable), and give it back
+void push_signal_home(ivl_signal_t sig, const std::string &renamed,
+                      vhdl_scope *scope);
+void pop_signal_home(ivl_signal_t sig);
 
 // Manage the set of VHDL entities
 void remember_entity(vhdl_entity *ent, ivl_scope_t scope);
@@ -71,6 +77,9 @@ std::string active_hier_name();
 // Manage mapping of scopes to a single VHDL entity
 bool is_default_scope_instance(ivl_scope_t s);
 bool seen_this_scope_type(ivl_scope_t s);
+// Every module instance of the design that shares `s''s VHDL entity (its
+// scope type), `s' included, in design order
+void same_type_instances(ivl_scope_t s, std::vector<ivl_scope_t> &out);
 
 // sv2vhdl mode flag
 void set_sv2vhdl_mode(bool mode);

@@ -51,6 +51,7 @@ const char *support_function::function_name(support_function_t type)
    case SF_UNSIGNED_TO_LOGIC:   return "Unsigned_To_Logic";
    case SF_TIME_FIELD:          return "Verilog_Time_Field";
    case SF_REM_SIGNED:          return "Verilog_Rem_S";
+   case SF_REAL_G:              return "Verilog_Real_G";
    default:
       assert(false);
    }
@@ -85,6 +86,7 @@ vhdl_type *support_function::function_type(support_function_t type)
    case SF_LOGIC_TO_INTEGER:
       return vhdl_type::integer();
    case SF_TIME_FIELD:
+   case SF_REAL_G:
       return vhdl_type::string();
    case SF_REM_SIGNED:
       return new vhdl_type(VHDL_TYPE_LOGIC3D_VECTOR);
@@ -241,11 +243,47 @@ void support_function::emit(std::ostream &of, int level) const
          << nl_string(indent(level))
          << "end if;";
       break;
+   case SF_REAL_G:
+      // vvp's bare real: C's %#g (sys_display.c; %g only under -compatible),
+      // 2.5 -> 2.50000, 1e20 -> 1.00000e+20. nvc's to_string(real, fmt)
+      // refuses the '#' flag, so as C does it: the exponent X of %.5e (after
+      // its rounding) picks %.5e when X < -4 or X >= 6, else %.<5-X>f.
+      of << "(R : real) return string is" << nl_string(indent(level))
+         << "constant E : string := to_string(R, \"%.5e\");"
+         << nl_string(indent(level))
+         << "variable P, X : integer;" << nl_string(indent(level))
+         << "variable Neg : boolean := false;" << nl_string(level)
+         << "begin" << nl_string(indent(level))
+         << "P := E'high;" << nl_string(indent(level))
+         << "while P > E'low and E(P) /= 'e' loop" << nl_string(indent(indent(level)))
+         << "P := P - 1;" << nl_string(indent(level))
+         << "end loop;" << nl_string(indent(level))
+         << "if E(P) /= 'e' then" << nl_string(indent(indent(level)))
+         << "return E;  -- inf, nan" << nl_string(indent(level))
+         << "end if;" << nl_string(indent(level))
+         << "X := 0;" << nl_string(indent(level))
+         << "for K in P + 1 to E'high loop" << nl_string(indent(indent(level)))
+         << "if E(K) = '-' then" << nl_string(indent(indent(indent(level))))
+         << "Neg := true;" << nl_string(indent(indent(level)))
+         << "elsif E(K) >= '0' and E(K) <= '9' then"
+         << nl_string(indent(indent(indent(level))))
+         << "X := X * 10 + (character'pos(E(K)) - character'pos('0'));"
+         << nl_string(indent(indent(level)))
+         << "end if;" << nl_string(indent(level))
+         << "end loop;" << nl_string(indent(level))
+         << "if Neg then" << nl_string(indent(indent(level)))
+         << "X := -X;" << nl_string(indent(level))
+         << "end if;" << nl_string(indent(level))
+         << "if X < -4 or X >= 6 then" << nl_string(indent(indent(level)))
+         << "return E;" << nl_string(indent(level))
+         << "end if;" << nl_string(indent(level))
+         << "return to_string(R, \"%.\" & integer'image(5 - X) & \"f\");";
+      break;
    case SF_REM_SIGNED:
       // Verilog's signed %: the remainder takes the DIVIDEND's sign (VHDL
-      // rem); a % 0 is all x. (sv2vhdl's l3d_mod_s uses VHDL mod, whose
-      // result takes the divisor's sign: -7 % 3 gave 2 where Verilog gives
-      // -1.) Value planes only, as l3d_div_s.
+      // rem); a % 0 is all x. (sv2vhdl's l3d_mod_s used VHDL mod before
+      // round 6, whose result takes the divisor's sign: -7 % 3 gave 2 where
+      // Verilog gives -1.) Value planes only, as l3d_div_s.
       of << "(A, B : logic3d_vector) return logic3d_vector is"
          << nl_string(indent(level))
          << "variable R : logic3d_vector(A'range) := (others => L3D_X);"

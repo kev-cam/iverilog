@@ -116,8 +116,17 @@ extern "C" int target_design(ivl_design_t des)
 
    // Only generate processes if there were no errors generating entities
    // (otherwise the necessary information won't be present)
-   if (0 == g_errors)
+   if (0 == g_errors) {
+      // A named-block local that another process names becomes an
+      // architecture signal before any process is drawn (process.cc)
+      ivl_design_process(des, scan_shared_block_locals, NULL);
+      hoist_shared_block_locals();
+      // Which processes write each variable (stmt.cc deposits_signal)
+      ivl_design_process(des, census_writers, NULL);
       ivl_design_process(des, draw_process, NULL);
+      settle_time_zero_waits();
+      declare_hier_names();
+   }
 
    // Same-edge always blocks assigning a common signal become one process
    // (a Verilog variable has one driver); also runs the deferred NBA and

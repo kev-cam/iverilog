@@ -47,6 +47,8 @@ LDFLAGS = @LDFLAGS@
 
 O = vhdl.o state.o vhdl_element.o vhdl_type.o vhdl_syntax.o scope.o process.o \
     stmt.o expr.o lpm.o support.o cast.o logic.o
+# the file I/O system tasks and functions ($fopen family, $fdisplay ...)
+O += fileio.o
 
 all: dep vhdl.tgt vhdl.conf vhdl-s.conf
 
