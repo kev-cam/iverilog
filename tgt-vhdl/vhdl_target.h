@@ -61,6 +61,8 @@ void ensure_signal_declared(ivl_signal_t sig);
 // Emit a function scope's VHDL function into a specific entity (used to draw
 // package functions on demand into whichever entity first calls them).
 int draw_function_in_entity(ivl_scope_t scope, vhdl_entity *ent);
+// A SystemVerilog void function (no result port): drawn and called like a task
+bool is_void_function(ivl_scope_t scope);
 // The VHDL name of a function scope: its Verilog name plus the flattening
 // suffix of an enclosing generate block (see scope.cc).
 std::string vhdl_function_name(ivl_scope_t fscope);

@@ -3000,17 +3000,16 @@ int draw_function_in_entity(ivl_scope_t scope, vhdl_entity *ent)
    if (ent->get_arch()->get_scope()->have_declared(funcname))
       return 0;
 
-   // A SystemVerilog void function has no result port (ivl_scope_port gives
-   // NULL for it), and a VHDL function must return a value: drawing it
-   // crashed the translation in ivl (ivl_signal_data_type: Assertion `net'
-   // failed; ivtest function10). Say where it is instead.
-   for (unsigned i = 0; i < ivl_scope_ports(scope); i++) {
-      if (ivl_scope_port(scope, i) == NULL) {
-         error("%s:%u: no VHDL translation for the void function %s: write it "
-               "as a task", ivl_scope_def_file(scope), ivl_scope_def_lineno(scope),
-               ivl_scope_tname(scope));
-         return 1;
-      }
+   // A void function is drawn as a task (draw_task, is_void_function) and
+   // inlined at its call sites; a VHDL function must return a value, and
+   // drawing one here crashed ivl (ivl_signal_data_type: Assertion `net'
+   // failed). Only an on-demand caller that mistook it for a value function
+   // can get here.
+   if (is_void_function(scope)) {
+      error("%s:%u: the void function %s is used as a value",
+            ivl_scope_def_file(scope), ivl_scope_def_lineno(scope),
+            ivl_scope_tname(scope));
+      return 1;
    }
 
    // The return type is worked out from the output port
@@ -3121,9 +3120,24 @@ static int draw_function(ivl_scope_t scope, ivl_scope_t parent)
    return draw_function_in_entity(scope, ent);
 }
 
+// A SystemVerilog void function: no result port (ivl_scope_port gives NULL
+// for it). ivl lowers a call to one as IVL_ST_UTASK, exactly like a task, so
+// it is translated as one: its variables declared here and its body inlined
+// at each call site (draw_utask). A VHDL function could not take it, as it
+// must return a value (ivtest function10).
+bool is_void_function(ivl_scope_t scope)
+{
+   if (ivl_scope_type(scope) != IVL_SCT_FUNCTION)
+      return false;
+   for (unsigned i = 0; i < ivl_scope_ports(scope); i++)
+      if (ivl_scope_port(scope, i) == NULL)
+         return true;
+   return ivl_scope_ports(scope) == 0;
+}
+
 static int draw_task(ivl_scope_t scope, ivl_scope_t parent)
 {
-   assert(ivl_scope_type(scope) == IVL_SCT_TASK);
+   assert(ivl_scope_type(scope) == IVL_SCT_TASK || is_void_function(scope));
 
    // Find the containing entity
    vhdl_entity *ent = find_entity(parent);
@@ -3343,12 +3357,12 @@ extern "C" int draw_functions(ivl_scope_t scope, void *_parent)
       return 0;
 
    ivl_scope_t parent = static_cast<ivl_scope_t>(_parent);
-   if (ivl_scope_type(scope) == IVL_SCT_FUNCTION) {
-      if (draw_function(scope, parent) != 0)
+   if (ivl_scope_type(scope) == IVL_SCT_TASK || is_void_function(scope)) {
+      if (draw_task(scope, parent) != 0)
          return 1;
    }
-   else if (ivl_scope_type(scope) == IVL_SCT_TASK) {
-      if (draw_task(scope, parent) != 0)
+   else if (ivl_scope_type(scope) == IVL_SCT_FUNCTION) {
+      if (draw_function(scope, parent) != 0)
          return 1;
    }
 
