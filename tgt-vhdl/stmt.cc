@@ -807,6 +807,19 @@ vhdl_expr *build_display_text(vhdl_procedural *proc,
                            text->add_expr(f);
                            l3d_dec = true;
                         }
+                        else if (tn == VHDL_TYPE_STD_LOGIC
+                                 || tn == VHDL_TYPE_STD_ULOGIC) {
+                           // 1-bit value under %d: "1"/"0"/"x"/"z" in the
+                           // requested field (%Nd), not std_logic'image
+                           long field_w = fw_spec >= 0 ? fw_spec
+                                        : ld_zero ? 0 : 1;
+                           vhdl_fcall *f = new vhdl_fcall("sv_dstr",
+                                                          vhdl_type::string());
+                           f->add_expr(base);
+                           f->add_expr(new vhdl_const_int((int)field_w));
+                           text->add_expr(f);
+                           l3d_dec = true;
+                        }
                      }
                      // sv2vhdl mode: %s of a logic3d value renders the packed
                      // 8-bit ASCII (Verilog %s), not the raw aggregate image.
@@ -931,6 +944,43 @@ vhdl_expr *build_display_text(vhdl_procedural *proc,
             if (sgn) fw += 1;
             vhdl_fcall *conv = new vhdl_fcall("to_std_logic_vector",
                vhdl_type::std_logic_vector(hi, lo));
+            conv->add_expr(base);
+            vhdl_fcall *f = new vhdl_fcall(
+               sgn ? "sv_dstr_signed" : "sv_dstr", vhdl_type::string());
+            f->add_expr(conv);
+            f->add_expr(new vhdl_const_int(fw));
+            text->add_expr(f);
+         }
+         else if (bt && (bt->get_name() == VHDL_TYPE_STD_LOGIC
+                         || bt->get_name() == VHDL_TYPE_STD_ULOGIC)) {
+            // A 1-bit value (a bit-select, a scalar net or reg): Verilog
+            // prints 1, 0, x or z; std_logic'image gave '1' (quoted, 'U'
+            // for unknown) -- the bitsel and mux2 golds carried that.
+            vhdl_fcall *f = new vhdl_fcall("sv_dstr", vhdl_type::string());
+            f->add_expr(base);
+            text->add_expr(f);
+         }
+         else if (bt && (bt->get_name() == VHDL_TYPE_UNSIGNED
+                         || bt->get_name() == VHDL_TYPE_SIGNED)
+                  && !base->constant()) {
+            // A vector in a std_logic design: the same %d rendering as the
+            // logic3d case above -- right-justified to the operand's
+            // max-magnitude width ("  1" for an 8-bit value, as vvp prints
+            // it; integer'image(to_integer(..)) gave "1", simple_gen gold).
+            int w = ivl_expr_width(net); if (w < 1) w = 1;
+            const bool sgn = bt->get_name() == VHDL_TYPE_SIGNED;
+            int magbits = sgn ? w - 1 : w; if (magbits < 0) magbits = 0;
+            int fw;
+            if (magbits >= 64) fw = 20;
+            else {
+               unsigned long long mv =
+                  magbits ? ((1ULL << magbits) - 1ULL) : 0ULL;
+               fw = 1;
+               while (mv >= 10) { mv /= 10; fw++; }
+            }
+            if (sgn) fw += 1;
+            vhdl_fcall *conv = new vhdl_fcall("std_logic_vector",
+               vhdl_type::std_logic_vector(bt->get_msb(), bt->get_lsb()));
             conv->add_expr(base);
             vhdl_fcall *f = new vhdl_fcall(
                sgn ? "sv_dstr_signed" : "sv_dstr", vhdl_type::string());

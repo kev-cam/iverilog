@@ -2390,6 +2390,7 @@ static void declare_signals(vhdl_entity *ent, ivl_scope_t scope)
    // port map binding.  Fall back to signal-table order if anything goes
    // wrong (unusual port declarations, concatenated ports, etc.)
    bool used_port_order = false;
+   std::set<ivl_signal_t> declared;
    if (ivl_scope_type(scope) == IVL_SCT_MODULE) {
       const unsigned nports = ivl_scope_mod_module_ports(scope);
       if (nports > 0) {
@@ -2404,6 +2405,7 @@ static void declare_signals(vhdl_entity *ent, ivl_scope_t scope)
                if (ivl_signal_port(sig) != IVL_SIP_NONE
                    && strcmp(ivl_signal_basename(sig), pname) == 0) {
                   declare_one_signal(ent, sig, scope);
+                  declared.insert(sig);
                   matched++;
                   break;
                }
@@ -2412,13 +2414,18 @@ static void declare_signals(vhdl_entity *ent, ivl_scope_t scope)
          used_port_order = (matched > 0);
       }
    }
-   if (!used_port_order) {
-      for (int i = 0; i < nsigs; i++) {
-         ivl_signal_t sig = ivl_scope_sig(scope, i);
-         if (ivl_signal_port(sig) != IVL_SIP_NONE)
-            declare_one_signal(ent, sig, scope);
-      }
+   // Port signals the name pass did not reach: every port when the pass was
+   // not used, and otherwise the members of a port expression that is not a
+   // plain signal name -- `module d(.a({b, c}), d)' names port `a' but the
+   // signals are b and c (contrib8.2), and `in[7:0]' in a port list names
+   // part of a signal (port-test2). Leaving them undeclared made the later
+   // passes (draw_constant_drivers) hit get_renamed_signal's assertion.
+   for (int i = 0; i < nsigs; i++) {
+      ivl_signal_t sig = ivl_scope_sig(scope, i);
+      if (ivl_signal_port(sig) != IVL_SIP_NONE && !declared.count(sig))
+         declare_one_signal(ent, sig, scope);
    }
+   (void)used_port_order;
 
    for (int i = 0; i < nsigs; i++) {
       ivl_signal_t sig = ivl_scope_sig(scope, i);

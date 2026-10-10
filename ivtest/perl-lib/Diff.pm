@@ -106,12 +106,15 @@ sub diff {
             sub normalize_vhdl_line {
                 my $line = shift;
                 $line =~ s/\r\n$/\n/;
+                # Both simulators print exactly one blank after the last
+                # colon; keep any further blanks -- they are the message's
+                # own (Verilog %d right-justifies: "  1" for an 8-bit value).
                 # GHDL: file.vhd:42:5:@0ms:(report note): MESSAGE
-                if ($line =~ /:\(report \w+\):\s*(.*)/) {
+                if ($line =~ /:\(report \w+\): ?(.*)/) {
                     return "$1\n";
                 }
                 # NVC: ** Note: 0ms+0: MESSAGE
-                if ($line =~ /\*\* (?:Note|Warning|Error|Failure):\s*\S+:\s*(.*)/) {
+                if ($line =~ /\*\* (?:Note|Warning|Error|Failure): \S+: ?(.*)/) {
                     return "$1\n";
                 }
                 return $line;
@@ -123,6 +126,7 @@ sub diff {
             while (my $l = <LOG>) {
                 next if $l =~ m/^\s+Process\s/;  # NVC context line
                 next if $l =~ m/^\s+Function\s/; # NVC warning context
+                next if $l =~ m/^\s+Procedure\s/; # NVC context (sv_display_pkg)
                 next if $l =~ m/^(==|\*\*)\d+(==|\*\*)/; # valgrind
                 push @log_lines, $l;
             }
